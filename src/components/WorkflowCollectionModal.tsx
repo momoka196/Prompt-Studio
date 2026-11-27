@@ -220,7 +220,11 @@ const CardThumbnailPreview: React.FC<{
   return (
     <button
       type="button"
-      onClick={() => onOpenLightbox(card.id)}
+      onClick={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        onOpenLightbox(card.id);
+      }}
       title="点击查看大图（保留原图画质）"
       className="group relative w-[84px] h-[104px] rounded-[9px] overflow-hidden border border-[#E0E0E6] bg-[#FAFAFC] shrink-0 cursor-zoom-in focus:outline-none focus:ring-2 focus:ring-[#7C5CFC]/50"
     >
@@ -425,6 +429,9 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   const bodyScrollRef = useRef<HTMLDivElement | null>(null);
   const batchToolbarRef = useRef<HTMLDivElement | null>(null);
   const cardGridRef = useRef<HTMLDivElement | null>(null);
+  const lastBatchClickedIdRef = useRef<string | null>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   const draftPreviewUrlRef = useRef<string | undefined>(undefined);
   const tombstonesRef = useRef<Record<string, DeletedCardTombstone>>(
     loadDeletedCardTombstones()
@@ -609,9 +616,63 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     return filteredCards.slice(start, start + pageSize);
   }, [filteredCards, safePage, pageSize]);
 
+  const scopedCardsRef = useRef<WorkflowCollectionCard[]>(scopedCards);
+  scopedCardsRef.current = scopedCards;
+  const filteredCardsRef = useRef<WorkflowCollectionCard[]>(filteredCards);
+  filteredCardsRef.current = filteredCards;
+  const pagedCardsRef = useRef<WorkflowCollectionCard[]>(pagedCards);
+  pagedCardsRef.current = pagedCards;
+
+  const scopedCardIdsKey = useMemo(
+    () => scopedCards.map((c) => c.id).join('\u0000'),
+    [scopedCards]
+  );
+
+  const goToPage = useCallback(
+    (nextPage: number) => {
+      const clamped = Math.max(1, Math.min(totalPages, nextPage));
+      setPage(clamped);
+      bodyScrollRef.current?.scrollTo({ top: 0, behavior: 'auto' });
+    },
+    [totalPages]
+  );
+
+  const toggleCardSelectionInBatch = useCallback(
+    (cardId: string, shiftKey = false) => {
+      const currentPaged = pagedCardsRef.current;
+      const prevAnchorId = lastBatchClickedIdRef.current;
+      if (shiftKey && prevAnchorId && prevAnchorId !== cardId) {
+        const anchorIdx = currentPaged.findIndex((c) => c.id === prevAnchorId);
+        const targetIdx = currentPaged.findIndex((c) => c.id === cardId);
+        if (anchorIdx >= 0 && targetIdx >= 0) {
+          const start = Math.min(anchorIdx, targetIdx);
+          const end = Math.max(anchorIdx, targetIdx);
+          setSelectedCardIds((prev) => {
+            const next = new Set(prev);
+            for (let i = start; i <= end; i += 1) {
+              next.add(currentPaged[i].id);
+            }
+            return next;
+          });
+          lastBatchClickedIdRef.current = cardId;
+          return;
+        }
+      }
+      setSelectedCardIds((prev) => {
+        const next = new Set(prev);
+        if (next.has(cardId)) next.delete(cardId);
+        else next.add(cardId);
+        return next;
+      });
+      lastBatchClickedIdRef.current = cardId;
+    },
+    []
+  );
+
   useEffect(() => {
     setPage(1);
     setConfirmBulkDelete(false);
+    lastBatchClickedIdRef.current = null;
   }, [debouncedSearch, activeTagFilter, privateView, pageSize]);
 
   useEffect(() => {
@@ -620,10 +681,13 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     }
   }, [page, totalPages]);
 
+  // 仅依赖卡片 ID 集合字符串，避免因 workflowCards 内容更新导致全量数组引用变动触发无效重算
   useEffect(() => {
+    const validIds = new Set(
+      scopedCardIdsKey ? scopedCardIdsKey.split('\u0000') : []
+    );
     setSelectedCardIds((prev) => {
       if (prev.size === 0) return prev;
-      const validIds = new Set(scopedCards.map((c) => c.id));
       let changed = false;
       const next = new Set<string>();
       for (const id of prev) {
@@ -632,7 +696,10 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       }
       return changed ? next : prev;
     });
-  }, [scopedCards]);
+    if (lastBatchClickedIdRef.current && !validIds.has(lastBatchClickedIdRef.current)) {
+      lastBatchClickedIdRef.current = null;
+    }
+  }, [scopedCardIdsKey]);
 
   useEffect(() => {
     setConfirmBulkDelete(false);
@@ -656,30 +723,36 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       setLightboxCardId(null);
       setBatchSelectMode(false);
       setSelectedCardIds(new Set());
+      lastBatchClickedIdRef.current = null;
       clearCardImageCache();
-      return;
     }
+  }, [open]);
+
+  // 通过 Ref 读取 filteredCards 与 onClose，避免 workflowCards 更新时反复卸载/重绑 window 监听
+  useEffect(() => {
+    if (!open) return;
     const onKeyDown = (e: KeyboardEvent) => {
+      const currentFiltered = filteredCardsRef.current;
       if (lightboxCardId) {
         if (e.key === 'Escape') {
           e.preventDefault();
           setLightboxCardId(null);
           return;
         }
-        if (e.key === 'ArrowLeft' && filteredCards.length > 1) {
+        if (e.key === 'ArrowLeft' && currentFiltered.length > 1) {
           e.preventDefault();
-          const curIdx = filteredCards.findIndex((c) => c.id === lightboxCardId);
+          const curIdx = currentFiltered.findIndex((c) => c.id === lightboxCardId);
           const prevIdx =
-            curIdx <= 0 ? filteredCards.length - 1 : curIdx - 1;
-          setLightboxCardId(filteredCards[prevIdx].id);
+            curIdx <= 0 ? currentFiltered.length - 1 : curIdx - 1;
+          setLightboxCardId(currentFiltered[prevIdx].id);
           return;
         }
-        if (e.key === 'ArrowRight' && filteredCards.length > 1) {
+        if (e.key === 'ArrowRight' && currentFiltered.length > 1) {
           e.preventDefault();
-          const curIdx = filteredCards.findIndex((c) => c.id === lightboxCardId);
+          const curIdx = currentFiltered.findIndex((c) => c.id === lightboxCardId);
           const nextIdx =
-            curIdx < 0 || curIdx >= filteredCards.length - 1 ? 0 : curIdx + 1;
-          setLightboxCardId(filteredCards[nextIdx].id);
+            curIdx < 0 || curIdx >= currentFiltered.length - 1 ? 0 : curIdx + 1;
+          setLightboxCardId(currentFiltered[nextIdx].id);
           return;
         }
         return;
@@ -689,13 +762,13 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         if (editingCardId) {
           setEditingCardId(null);
         } else {
-          onClose();
+          onCloseRef.current();
         }
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [open, editingCardId, lightboxCardId, filteredCards, onClose]);
+  }, [open, editingCardId, lightboxCardId]);
 
   const openFineTuner = useCallback((card: WorkflowCollectionCard, initialTab: 'positive' | 'negative' = 'positive') => {
     setEditingCardId(card.id);
@@ -717,7 +790,11 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   }, []);
 
   const commitCards = useCallback(
-    (next: WorkflowCollectionCard[]) => {
+    (next: WorkflowCollectionCard[], sourceEvent?: React.SyntheticEvent) => {
+      if (sourceEvent) {
+        sourceEvent.preventDefault();
+        sourceEvent.stopPropagation();
+      }
       const safeNext =
         deletedIdsSessionRef.current.size > 0
           ? next.filter((c) => !deletedIdsSessionRef.current.has(c.id))
@@ -973,7 +1050,14 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     [enqueueFolderIo]
   );
 
-  const handleSyncScopedCardsToFolder = async (cardsOverride?: WorkflowCollectionCard[]) => {
+  const handleSyncScopedCardsToFolder = async (
+    cardsOverride?: WorkflowCollectionCard[],
+    sourceEvent?: React.SyntheticEvent
+  ) => {
+    if (sourceEvent) {
+      sourceEvent.preventDefault();
+      sourceEvent.stopPropagation();
+    }
     const dirHandle = boundDirHandleRef.current;
     if (!dirHandle) {
       await handleSelectLocalFolder();
@@ -989,7 +1073,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       });
       return;
     }
-    const targetCards = (cardsOverride ?? scopedCards).filter(
+    const targetCards = (cardsOverride ?? scopedCardsRef.current).filter(
       (c) => !deletedIdsSessionRef.current.has(c.id)
     );
     if (targetCards.length === 0) {
@@ -1408,7 +1492,14 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     }
   };
 
-  const handleToggleCardPrivate = (cardId: string) => {
+  const handleToggleCardPrivate = (
+    cardId: string,
+    e?: React.SyntheticEvent
+  ) => {
+    if (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
     const target = cardsRef.current.find((c) => c.id === cardId);
     if (!target) return;
     const nextPrivate = !target.isPrivate;
@@ -1422,7 +1513,8 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         };
         updated.contentFingerprint = computeCardContentFingerprint(updated);
         return updated;
-      })
+      }),
+      e
     );
     if (res.ok) {
       setSelectedCardIds((prev) => {
@@ -1580,7 +1672,15 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   }, [enqueueFolderIo]);
 
   const performDeleteCards = useCallback(
-    (cardsToDelete: WorkflowCollectionCard[], isBulk: boolean) => {
+    (
+      cardsToDelete: WorkflowCollectionCard[],
+      isBulk: boolean,
+      sourceEvent?: React.SyntheticEvent
+    ) => {
+      if (sourceEvent) {
+        sourceEvent.preventDefault();
+        sourceEvent.stopPropagation();
+      }
       const uniqueNewTargets = cardsToDelete.filter(
         (c) => !deletedIdsSessionRef.current.has(c.id)
       );
@@ -1643,6 +1743,9 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         }
         return changed ? next : prev;
       });
+      if (lastBatchClickedIdRef.current && targetIdSet.has(lastBatchClickedIdRef.current)) {
+        lastBatchClickedIdRef.current = null;
+      }
       if (isBulk) {
         setConfirmBulkDelete(false);
       }
@@ -1651,7 +1754,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
       // 立即从 cardsRef / IndexedDB workflow_cards / localStorage 中彻底移除
       const nextCards = cardsRef.current.filter((c) => !targetIdSet.has(c.id));
-      commitCards(nextCards);
+      commitCards(nextCards, sourceEvent);
 
       // 立即移除同步状态索引中的已删条目
       setFolderIndexMap((prev) => {
@@ -1730,15 +1833,24 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     cardId: string,
     e?: React.MouseEvent<HTMLButtonElement>
   ) => {
-    e?.preventDefault();
-    e?.stopPropagation();
+    if (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
     if (deletedIdsSessionRef.current.has(cardId)) return;
     const target = cardsRef.current.find((c) => c.id === cardId);
     if (!target) return;
-    performDeleteCards([target], false);
+    performDeleteCards([target], false, e);
   };
 
-  const handleBulkTogglePrivate = (makePrivate: boolean) => {
+  const handleBulkTogglePrivate = (
+    makePrivate: boolean,
+    e?: React.SyntheticEvent
+  ) => {
+    if (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
     if (selectedCardIds.size === 0) return;
     const now = Date.now();
     const targetIds = new Set(
@@ -1757,7 +1869,8 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         };
         updated.contentFingerprint = computeCardContentFingerprint(updated);
         return updated;
-      })
+      }),
+      e
     );
     if (res.ok) {
       setImportNotice({
@@ -1771,7 +1884,11 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     }
   };
 
-  const handleBulkAddTags = () => {
+  const handleBulkAddTags = (e?: React.SyntheticEvent) => {
+    if (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
     const tagsToAdd = parseTagsInput(batchTagInput);
     if (selectedCardIds.size === 0 || tagsToAdd.length === 0) return;
     const now = Date.now();
@@ -1792,7 +1909,8 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         };
         updated.contentFingerprint = computeCardContentFingerprint(updated);
         return updated;
-      })
+      }),
+      e
     );
     if (res.ok) {
       setBatchTagInput('');
@@ -1803,9 +1921,11 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     }
   };
 
-  const handleBulkDeleteSelected = (e?: React.MouseEvent<HTMLButtonElement>) => {
-    e?.preventDefault();
-    e?.stopPropagation();
+  const handleBulkDeleteSelected = (e?: React.SyntheticEvent) => {
+    if (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
     if (selectedCardIds.size === 0) return;
     const targets = cardsRef.current.filter(
       (c) =>
@@ -1818,7 +1938,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       setConfirmBulkDelete(false);
       return;
     }
-    performDeleteCards(targets, true);
+    performDeleteCards(targets, true, e);
   };
 
   const handleDownloadCardOriginalImage = async (card: WorkflowCollectionCard) => {
@@ -2628,7 +2748,8 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
           </div>
         </header>
 
-        {/* 主体区 */}
+        {/* 主体区 + 浮动删除状态包裹层（确保常驻底部工具栏与分页栏始终贴底免上拉） */}
+        <div className="relative flex-1 min-h-0 flex flex-col overflow-hidden">
         <div
           ref={bodyScrollRef}
           className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden p-3.5 sm:p-5 space-y-3.5"
@@ -3289,10 +3410,13 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
                 <button
                   type="button"
-                  onClick={() => {
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
                     setBatchSelectMode((v) => !v);
                     setSelectedCardIds(new Set());
                     setConfirmBulkDelete(false);
+                    lastBatchClickedIdRef.current = null;
                   }}
                   className={`min-h-[38px] px-3.5 py-1.5 inline-flex items-center gap-1.5 rounded-[10px] border text-[12px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
                     batchSelectMode
@@ -3303,6 +3427,42 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                   <CheckSquare className="w-4 h-4" />
                   <span>{batchSelectMode ? '退出批量整理' : '批量整理'}</span>
                 </button>
+
+                {totalPages > 1 && (
+                  <div className="inline-flex items-center gap-1 rounded-[9px] border border-[#E0E0E6] bg-white px-1.5 h-[36px] text-[11.5px] text-[#4C5264] tabular-nums">
+                    <button
+                      type="button"
+                      disabled={safePage <= 1}
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        goToPage(safePage - 1);
+                      }}
+                      title="上一页"
+                      aria-label="上一页"
+                      className="w-6 h-6 inline-flex items-center justify-center rounded-[6px] hover:bg-[#F4F2FF] hover:text-[#6B48F5] disabled:opacity-35 cursor-pointer"
+                    >
+                      <ChevronLeft className="w-3.5 h-3.5" />
+                    </button>
+                    <span className="px-1 font-mono text-[11px]">
+                      {safePage}/{totalPages}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={safePage >= totalPages}
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        goToPage(safePage + 1);
+                      }}
+                      title="下一页"
+                      aria-label="下一页"
+                      className="w-6 h-6 inline-flex items-center justify-center rounded-[6px] hover:bg-[#F4F2FF] hover:text-[#6B48F5] disabled:opacity-35 cursor-pointer"
+                    >
+                      <ChevronRight className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                )}
               </div>
 
               <div className="flex flex-wrap items-center gap-2.5">
@@ -3430,184 +3590,11 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
               )}
             </div>
 
-            {/* 批量整理操作条（放大按钮热区 + 拉开间距 + 危险删除视觉隔离与二次确认） */}
             {batchSelectMode && (
-              <div
-                ref={batchToolbarRef}
-                className="rounded-[13px] border border-[#DDD8FA] bg-white px-3.5 sm:px-4 py-3 flex flex-col gap-3 shadow-[0_2px_10px_rgba(124,92,252,0.06)]"
-              >
-                {/* 顶部选区控制与退出按钮 */}
-                <div className="flex flex-wrap items-center justify-between gap-2.5 pb-2.5 border-b border-[#EFEFF4]">
-                  <div className="flex flex-wrap items-center gap-2.5">
-                    <span className="inline-flex items-center min-h-[38px] px-3 rounded-[9px] bg-[#F4F2FF] text-[#5B3DF5] text-[12.5px] font-semibold tabular-nums whitespace-nowrap">
-                      已选 {selectedCardIds.size} 张
-                    </span>
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        setSelectedCardIds((prev) => {
-                          const next = new Set(prev);
-                          for (const c of pagedCards) next.add(c.id);
-                          return next;
-                        });
-                      }}
-                      className="min-h-[38px] px-3.5 py-1.5 rounded-[9px] border border-[#E0E0E6] bg-[#FAFAFC] text-[12px] font-medium text-[#4C5264] hover:border-[#7C5CFC]/45 hover:text-[#6B48F5] transition-colors cursor-pointer whitespace-nowrap"
-                    >
-                      全选本页 ({pagedCards.length})
-                    </button>
-                    {filteredCards.length > pagedCards.length && (
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          setSelectedCardIds(new Set(filteredCards.map((c) => c.id)));
-                        }}
-                        className="min-h-[38px] px-3.5 py-1.5 rounded-[9px] border border-[#E0E0E6] bg-[#FAFAFC] text-[12px] font-medium text-[#4C5264] hover:border-[#7C5CFC]/45 hover:text-[#6B48F5] transition-colors cursor-pointer whitespace-nowrap"
-                      >
-                        全选筛选结果 ({filteredCards.length})
-                      </button>
-                    )}
-                    {selectedCardIds.size > 0 && (
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          setSelectedCardIds(new Set());
-                          setConfirmBulkDelete(false);
-                        }}
-                        className="min-h-[38px] px-3.5 py-1.5 rounded-[9px] border border-[#E0E0E6] bg-white text-[12px] font-medium text-[#686E7E] hover:border-[#C5C8D4] hover:text-[#1E2028] transition-colors cursor-pointer whitespace-nowrap"
-                      >
-                        清空选择
-                      </button>
-                    )}
-                  </div>
-
-                  <button
-                    type="button"
-                    data-batch-exit-btn
-                    onClick={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      setBatchSelectMode(false);
-                      setSelectedCardIds(new Set());
-                      setConfirmBulkDelete(false);
-                    }}
-                    className="min-h-[38px] px-3.5 py-1.5 inline-flex items-center gap-1.5 rounded-[9px] border border-[#E0E0E6] bg-white text-[12px] font-medium text-[#4C5264] hover:border-[#7C5CFC]/45 hover:text-[#1E2028] transition-colors cursor-pointer whitespace-nowrap"
-                  >
-                    <X className="w-3.5 h-3.5" />
-                    <span>退出批量模式</span>
-                  </button>
-                </div>
-
-                {/* 底部常用批量操作 vs 危险删除隔离区 */}
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div className="flex flex-wrap items-center gap-2.5 sm:gap-3">
-                    <div className="flex flex-wrap sm:flex-nowrap items-center gap-2 max-w-full">
-                      <input
-                        type="text"
-                        value={batchTagInput}
-                        onChange={(e) => setBatchTagInput(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') {
-                            e.preventDefault();
-                            handleBulkAddTags();
-                          }
-                        }}
-                        placeholder="批量添加标签（空格/逗号分隔）"
-                        className="w-full sm:w-[215px] min-h-[38px] px-3 rounded-[9px] border border-[#E0E0E6] bg-[#FAFAFC] text-[12px] text-[#1E2028] focus:bg-white focus:outline-none focus:border-[#7C5CFC]"
-                      />
-                      <button
-                        type="button"
-                        disabled={selectedCardIds.size === 0 || !batchTagInput.trim()}
-                        onClick={handleBulkAddTags}
-                        className="min-h-[38px] px-3.5 py-1.5 inline-flex items-center gap-1.5 rounded-[9px] border border-[#DDD8FA] bg-[#F4F2FF] text-[12px] font-medium text-[#6B48F5] hover:bg-[#EBE6FF] disabled:opacity-40 transition-colors cursor-pointer whitespace-nowrap"
-                      >
-                        <Tag className="w-3.5 h-3.5" />
-                        <span>批量打标签</span>
-                      </button>
-                    </div>
-
-                    <button
-                      type="button"
-                      disabled={selectedCardIds.size === 0}
-                      onClick={() => handleBulkTogglePrivate(!privateView)}
-                      className="min-h-[38px] px-3.5 py-1.5 inline-flex items-center gap-1.5 rounded-[9px] border border-[#E5C4D6] bg-[#FDF6FA] text-[12px] font-medium text-[#8C3665] hover:bg-[#F9EAF2] hover:border-[#D39BB9] disabled:opacity-40 transition-colors cursor-pointer whitespace-nowrap"
-                    >
-                      {privateView ? (
-                        <Eye className="w-3.5 h-3.5" />
-                      ) : (
-                        <EyeOff className="w-3.5 h-3.5" />
-                      )}
-                      <span>{privateView ? '批量取消私密' : '批量设为私密'}</span>
-                    </button>
-
-                    {boundDirHandle && (
-                      <button
-                        type="button"
-                        disabled={selectedCardIds.size === 0 || isSyncingFolder}
-                        onClick={() =>
-                          void handleSyncScopedCardsToFolder(
-                            scopedCards.filter((c) => selectedCardIds.has(c.id))
-                          )
-                        }
-                        className="min-h-[38px] px-3.5 py-1.5 inline-flex items-center gap-1.5 rounded-[9px] border border-emerald-300 bg-emerald-50 text-[12px] font-medium text-emerald-800 hover:bg-emerald-100/80 disabled:opacity-40 transition-colors cursor-pointer whitespace-nowrap"
-                      >
-                        <FolderSync className="w-3.5 h-3.5" />
-                        <span>批量写入文件夹</span>
-                      </button>
-                    )}
-                  </div>
-
-                  {/* 危险操作独立隔离区 */}
-                  <div className="flex flex-wrap items-center gap-2.5 sm:pl-3 sm:border-l sm:border-[#EAEAEF]">
-                    {confirmBulkDelete ? (
-                      <div className="inline-flex flex-wrap items-center gap-2.5 p-1.5 rounded-[10px] border border-[#F5B8C4] bg-[#FFF1F3]">
-                        <button
-                          type="button"
-                          onClick={(e) => handleBulkDeleteSelected(e)}
-                          className="min-h-[38px] px-4 py-1.5 inline-flex items-center gap-1.5 rounded-[8px] bg-[#D92D4B] text-white text-[12px] font-semibold shadow-[0_2px_8px_rgba(217,45,75,0.28)] hover:bg-[#BE1E3A] transition-colors cursor-pointer whitespace-nowrap"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                          <span>确认彻底删除 ({selectedCardIds.size})</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            setConfirmBulkDelete(false);
-                          }}
-                          className="min-h-[38px] px-3.5 py-1.5 rounded-[8px] border border-[#E0E0E6] bg-white text-[12px] font-medium text-[#4C5264] hover:text-[#1E2028] transition-colors cursor-pointer whitespace-nowrap"
-                        >
-                          取消
-                        </button>
-                      </div>
-                    ) : (
-                      <button
-                        type="button"
-                        data-batch-delete-trigger
-                        disabled={selectedCardIds.size === 0}
-                        onClick={(e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          setConfirmBulkDelete(true);
-                        }}
-                        className="min-h-[38px] px-4 py-1.5 inline-flex items-center gap-1.5 rounded-[9px] border border-[#F5B8C4] bg-[#FFF5F7] text-[12px] font-semibold text-[#B42343] hover:bg-[#FFE6EC] hover:border-[#E85D75] disabled:opacity-40 disabled:hover:bg-[#FFF5F7] transition-colors cursor-pointer whitespace-nowrap"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                        <span>
-                          {selectedCardIds.size > 0
-                            ? `批量删除 (${selectedCardIds.size})`
-                            : '批量删除'}
-                        </span>
-                      </button>
-                    )}
-                  </div>
-                </div>
+              <div className="rounded-[10px] border border-[#DDD8FA] bg-[#F8F6FF] px-3 py-1.5 text-[11.5px] text-[#5B3DF5] flex flex-wrap items-center justify-between gap-2">
+                <span>
+                  批量整理已开启：点击卡片任意位置即可快速勾选，按住 <kbd className="px-1 py-0.5 rounded bg-white border border-[#DDD8FA] font-mono text-[10.5px]">Shift</kbd> 点击可连续范围多选；批量删除与翻页按钮已常驻固定在底部。
+                </span>
               </div>
             )}
           </div>
@@ -3649,258 +3636,622 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
               )}
             </div>
           ) : (
-            <>
-              <div ref={cardGridRef} className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3.5">
-                {pagedCards.map((card) => {
-                  const isSendingThis =
-                    runStatus.state === 'sending' && runStatus.cardId === card.id;
-                  const isSelected = selectedCardIds.has(card.id);
-                  const posDisplay = card.applyFineTuneOnSend
-                    ? card.fineTunedPositive
-                    : card.extractedPositive;
-                  const negDisplay = card.applyFineTuneOnSend
-                    ? card.fineTunedNegative
-                    : card.extractedNegative;
-                  const hasModified =
-                    card.fineTunedPositive.trim() !== card.extractedPositive.trim() ||
-                    card.fineTunedNegative.trim() !== card.extractedNegative.trim();
+            <div ref={cardGridRef} className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3.5">
+              {pagedCards.map((card) => {
+                const isSendingThis =
+                  runStatus.state === 'sending' && runStatus.cardId === card.id;
+                const isSelected = selectedCardIds.has(card.id);
+                const posDisplay = card.applyFineTuneOnSend
+                  ? card.fineTunedPositive
+                  : card.extractedPositive;
+                const negDisplay = card.applyFineTuneOnSend
+                  ? card.fineTunedNegative
+                  : card.extractedNegative;
+                const hasModified =
+                  card.fineTunedPositive.trim() !== card.extractedPositive.trim() ||
+                  card.fineTunedNegative.trim() !== card.extractedNegative.trim();
 
-                  return (
-                    <article
-                      key={card.id}
-                      data-card-id={card.id}
-                      className={`rounded-[14px] bg-white border overflow-hidden flex flex-col transition-colors ${
-                        isSelected
-                          ? 'border-[#7C5CFC] ring-2 ring-[#7C5CFC]/20'
-                          : 'border-[#E0E0E6] hover:border-[#7C5CFC]/45'
-                      }`}
-                    >
-                      {/* 缩略图与头部 */}
-                      <div className="flex gap-3 p-3.5 border-b border-[#EAEAEF]">
-                        {batchSelectMode && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setSelectedCardIds((prev) => {
-                                const next = new Set(prev);
-                                if (next.has(card.id)) next.delete(card.id);
-                                else next.add(card.id);
-                                return next;
-                              });
-                            }}
-                            aria-label={isSelected ? '取消选择此卡片' : '选择此卡片'}
-                            className={`self-start w-7 h-7 rounded-[8px] border flex items-center justify-center transition-colors cursor-pointer shrink-0 ${
-                              isSelected
-                                ? 'border-[#7C5CFC] bg-[#F4F2FF] text-[#6B48F5]'
-                                : 'border-[#E0E0E6] bg-[#FAFAFC] text-[#949AA8] hover:border-[#7C5CFC]/50 hover:text-[#6B48F5]'
-                            }`}
-                          >
-                            {isSelected ? (
-                              <CheckSquare className="w-4 h-4" />
-                            ) : (
-                              <Square className="w-4 h-4" />
-                            )}
-                          </button>
-                        )}
+                return (
+                  <article
+                    key={card.id}
+                    data-card-id={card.id}
+                    onClick={
+                      batchSelectMode
+                        ? (e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            toggleCardSelectionInBatch(card.id, e.shiftKey);
+                          }
+                        : undefined
+                    }
+                    className={`rounded-[14px] border overflow-hidden flex flex-col transition-colors ${
+                      batchSelectMode ? 'cursor-pointer select-none' : ''
+                    } ${
+                      isSelected
+                        ? 'border-[#7C5CFC] bg-[#FAF8FF] ring-2 ring-[#7C5CFC]/25'
+                        : 'border-[#E0E0E6] bg-white hover:border-[#7C5CFC]/45'
+                    }`}
+                  >
+                    {/* 缩略图与头部 */}
+                    <div className="flex gap-3 p-3.5 border-b border-[#EAEAEF]">
+                      {batchSelectMode && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            toggleCardSelectionInBatch(card.id, e.shiftKey);
+                          }}
+                          aria-label={isSelected ? '取消选择此卡片' : '选择此卡片'}
+                          className={`self-start w-7 h-7 rounded-[8px] border flex items-center justify-center transition-colors cursor-pointer shrink-0 ${
+                            isSelected
+                              ? 'border-[#7C5CFC] bg-[#7C5CFC] text-white'
+                              : 'border-[#D2D4DF] bg-[#FAFAFC] text-[#949AA8] hover:border-[#7C5CFC]/60 hover:text-[#6B48F5]'
+                          }`}
+                        >
+                          {isSelected ? (
+                            <CheckSquare className="w-4 h-4" />
+                          ) : (
+                            <Square className="w-4 h-4" />
+                          )}
+                        </button>
+                      )}
 
-                        <CardThumbnailPreview
-                          card={card}
-                          onOpenLightbox={handleOpenLightbox}
-                        />
+                      <CardThumbnailPreview
+                        card={card}
+                        onOpenLightbox={handleOpenLightbox}
+                      />
 
-                        <div className="min-w-0 flex-1 flex flex-col justify-between">
-                          <div className="space-y-1">
-                            <div className="flex items-start justify-between gap-1.5">
-                              <h4 className="text-[13.5px] font-semibold text-[#1E2028] leading-snug line-clamp-2 break-words">
-                                {card.title}
-                              </h4>
-                              <div className="flex items-center gap-1 shrink-0">
-                                <button
-                                  type="button"
-                                  onClick={() => handleToggleCardPrivate(card.id)}
-                                  title={card.isPrivate ? '取消私密并移回公开列表' : '设为私密（移入私密区）'}
-                                  className={`h-7 px-2 inline-flex items-center gap-1 rounded-[7px] border text-[10.5px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
-                                    card.isPrivate
-                                      ? 'border-[#F5B8C4] bg-[#FFF1F3] text-[#C93B58] hover:border-[#E85D75]'
-                                      : 'border-[#E0E0E6] bg-white text-[#686E7E] hover:border-[#E85D75]/50 hover:text-[#C93B58]'
-                                  }`}
-                                >
-                                  {card.isPrivate ? (
-                                    <Eye className="w-3 h-3" />
-                                  ) : (
-                                    <EyeOff className="w-3 h-3" />
-                                  )}
-                                  <span>{card.isPrivate ? '取消私密' : '设为私密'}</span>
-                                </button>
-                                {cardHasImage(card) && (
-                                  <button
-                                    type="button"
-                                    onClick={() => void handleDownloadCardOriginalImage(card)}
-                                    title="下载原始参考图"
-                                    className="w-7 h-7 inline-flex items-center justify-center rounded-[7px] text-[#949AA8] hover:bg-[#F4F2FF] hover:text-[#7C5CFC] cursor-pointer"
-                                  >
-                                    <ImageDown className="w-3.5 h-3.5" />
-                                  </button>
+                      <div className="min-w-0 flex-1 flex flex-col justify-between">
+                        <div className="space-y-1">
+                          <div className="flex items-start justify-between gap-1.5">
+                            <h4 className="text-[13.5px] font-semibold text-[#1E2028] leading-snug line-clamp-2 break-words">
+                              {card.title}
+                            </h4>
+                            <div className="flex items-center gap-1 shrink-0">
+                              <button
+                                type="button"
+                                onClick={(e) => handleToggleCardPrivate(card.id, e)}
+                                title={card.isPrivate ? '取消私密并移回公开列表' : '设为私密（移入私密区）'}
+                                className={`h-7 px-2 inline-flex items-center gap-1 rounded-[7px] border text-[10.5px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                                  card.isPrivate
+                                    ? 'border-[#F5B8C4] bg-[#FFF1F3] text-[#C93B58] hover:border-[#E85D75]'
+                                    : 'border-[#E0E0E6] bg-white text-[#686E7E] hover:border-[#E85D75]/50 hover:text-[#C93B58]'
+                                }`}
+                              >
+                                {card.isPrivate ? (
+                                  <Eye className="w-3 h-3" />
+                                ) : (
+                                  <EyeOff className="w-3 h-3" />
                                 )}
+                                <span>{card.isPrivate ? '取消私密' : '设为私密'}</span>
+                              </button>
+                              {cardHasImage(card) && (
                                 <button
                                   type="button"
-                                  onClick={() => handleDownloadCardJson(card)}
-                                  title="下载卡片工作流 JSON"
+                                  onClick={(e) => {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    void handleDownloadCardOriginalImage(card);
+                                  }}
+                                  title="下载原始参考图"
                                   className="w-7 h-7 inline-flex items-center justify-center rounded-[7px] text-[#949AA8] hover:bg-[#F4F2FF] hover:text-[#7C5CFC] cursor-pointer"
                                 >
-                                  <Download className="w-3.5 h-3.5" />
+                                  <ImageDown className="w-3.5 h-3.5" />
                                 </button>
-                                {boundDirHandle && (
-                                  <button
-                                    type="button"
-                                    onClick={() => void handleWriteSingleCardToFolder(card)}
-                                    title="写入当前绑定的本地文件夹"
-                                    className="w-7 h-7 inline-flex items-center justify-center rounded-[7px] text-[#949AA8] hover:bg-emerald-50 hover:text-emerald-600 cursor-pointer"
-                                  >
-                                    <FolderSync className="w-3.5 h-3.5" />
-                                  </button>
-                                )}
+                              )}
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  handleDownloadCardJson(card);
+                                }}
+                                title="下载卡片工作流 JSON"
+                                className="w-7 h-7 inline-flex items-center justify-center rounded-[7px] text-[#949AA8] hover:bg-[#F4F2FF] hover:text-[#7C5CFC] cursor-pointer"
+                              >
+                                <Download className="w-3.5 h-3.5" />
+                              </button>
+                              {boundDirHandle && (
                                 <button
                                   type="button"
-                                  data-card-delete-btn={card.id}
-                                  onClick={(e) => handleDeleteCard(card.id, e)}
-                                  title="删除此卡片"
-                                  aria-label={`删除卡片 ${card.title}`}
-                                  className="w-7 h-7 inline-flex items-center justify-center rounded-[7px] text-[#949AA8] hover:bg-[#FFF1F3] hover:text-[#E85D75] cursor-pointer"
+                                  onClick={(e) => {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    void handleWriteSingleCardToFolder(card);
+                                  }}
+                                  title="写入当前绑定的本地文件夹"
+                                  className="w-7 h-7 inline-flex items-center justify-center rounded-[7px] text-[#949AA8] hover:bg-emerald-50 hover:text-emerald-600 cursor-pointer"
                                 >
-                                  <Trash2 className="w-3.5 h-3.5" />
+                                  <FolderSync className="w-3.5 h-3.5" />
                                 </button>
-                              </div>
-                            </div>
-
-                            <div className="text-[11px] text-[#686E7E] truncate">
-                              {card.tags.length > 0 ? card.tags.join(' · ') : '未分类'}
+                              )}
+                              <button
+                                type="button"
+                                data-card-delete-btn={card.id}
+                                onClick={(e) => handleDeleteCard(card.id, e)}
+                                title="删除此卡片"
+                                aria-label={`删除卡片 ${card.title}`}
+                                className="w-7 h-7 inline-flex items-center justify-center rounded-[7px] text-[#949AA8] hover:bg-[#FFF1F3] hover:text-[#E85D75] cursor-pointer"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
                             </div>
                           </div>
 
-                          <div className="text-[10.5px] text-[#8E94A4] font-mono tabular-nums flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                            <span>{formatFormatLabel(card.workflowFormat)}</span>
-                            {card.originalImageWidth && card.originalImageHeight && (
-                              <span>
-                                · {card.originalImageWidth}×{card.originalImageHeight}
-                              </span>
-                            )}
-                            {hasModified && (
-                              <span className="text-[#6B48F5] font-sans font-medium">
-                                · 已微调
-                              </span>
-                            )}
-                            {card.lastPromptId && (
-                              <span className="text-emerald-600">
-                                · #{card.lastPromptId.slice(0, 6)}
-                              </span>
-                            )}
+                          <div className="text-[11px] text-[#686E7E] truncate">
+                            {card.tags.length > 0 ? card.tags.join(' · ') : '未分类'}
                           </div>
                         </div>
-                      </div>
 
-                      {/* 可点击唤出微调的提示词摘要区 */}
-                      <button
-                        type="button"
-                        onClick={() => openFineTuner(card, 'positive')}
-                        title="点击唤出可视化 Tag 微调面板"
-                        className="flex-1 px-3.5 py-2.5 text-left bg-[#FAFAFC] hover:bg-[#F5F3FF]/60 transition-colors cursor-pointer space-y-1.5"
-                      >
-                        <div className="text-[11px] text-[#373C4B] font-mono line-clamp-2 break-words leading-relaxed">
-                          <span className="font-sans font-semibold text-[#6B48F5] mr-1">
-                            Pos:
-                          </span>
-                          {posDisplay || '（空）'}
-                        </div>
-                        <div className="text-[11px] text-[#686E7E] font-mono line-clamp-1 break-words">
-                          <span className="font-sans font-semibold text-[#E85D75] mr-1">
-                            Neg:
-                          </span>
-                          {negDisplay || '（空）'}
-                        </div>
-                      </button>
-
-                      {/* 卡片底部操作栏 */}
-                      <div className="px-3.5 py-2.5 bg-white border-t border-[#EAEAEF] flex items-center gap-2">
-                        <button
-                          type="button"
-                          onClick={() => openFineTuner(card, 'positive')}
-                          className="flex-1 h-8 px-2.5 inline-flex items-center justify-center gap-1.5 text-[11.5px] font-medium rounded-[9px] border border-[#E0E0E6] bg-white text-[#4C5264] hover:border-[#7C5CFC]/50 hover:text-[#6B48F5] transition-colors whitespace-nowrap cursor-pointer"
-                        >
-                          <SlidersHorizontal className="w-3.5 h-3.5" />
-                          <span>微调提示词</span>
-                        </button>
-
-                        <button
-                          type="button"
-                          onClick={() => void handleRunCard(card)}
-                          disabled={isSendingThis}
-                          className="flex-1 h-8 px-2.5 inline-flex items-center justify-center gap-1.5 text-[11.5px] font-medium rounded-[9px] bg-gradient-to-b from-[#8A6CFF] to-[#7C5CFC] text-white shadow-[0_2px_6px_rgba(124,92,252,0.24)] hover:brightness-105 disabled:opacity-50 transition-all whitespace-nowrap cursor-pointer"
-                        >
-                          {isSendingThis ? (
-                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                          ) : (
-                            <Play className="w-3.5 h-3.5" />
+                        <div className="text-[10.5px] text-[#8E94A4] font-mono tabular-nums flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                          <span>{formatFormatLabel(card.workflowFormat)}</span>
+                          {card.originalImageWidth && card.originalImageHeight && (
+                            <span>
+                              · {card.originalImageWidth}×{card.originalImageHeight}
+                            </span>
                           )}
-                          <span>{isSendingThis ? '发送中...' : '运行发送 UI'}</span>
-                        </button>
+                          {hasModified && (
+                            <span className="text-[#6B48F5] font-sans font-medium">
+                              · 已微调
+                            </span>
+                          )}
+                          {card.lastPromptId && (
+                            <span className="text-emerald-600">
+                              · #{card.lastPromptId.slice(0, 6)}
+                            </span>
+                          )}
+                        </div>
                       </div>
-                    </article>
-                  );
-                })}
-              </div>
+                    </div>
 
-              {/* 大规模常驻分页控制条 */}
-              {filteredCards.length > 12 && (
-                <div className="rounded-[12px] border border-[#E0E0E6] bg-white px-3.5 py-2 flex flex-wrap items-center justify-between gap-2 text-[11.5px] text-[#4C5264]">
-                  <div className="flex items-center gap-2 tabular-nums">
-                    <span>
-                      显示第 {(safePage - 1) * pageSize + 1}–
-                      {Math.min(safePage * pageSize, filteredCards.length)} 张，共{' '}
-                      {filteredCards.length} 张
-                    </span>
-                    <select
-                      aria-label="每页显示卡片数"
-                      value={pageSize}
-                      onChange={(e) => setPageSize(Number(e.target.value) as 24 | 48 | 96)}
-                      className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-[#FAFAFC] text-[11px] text-[#1E2028]"
+                    {/* 可点击唤出微调的提示词摘要区（批量模式下点击同样快速勾选） */}
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        if (batchSelectMode) {
+                          toggleCardSelectionInBatch(card.id, e.shiftKey);
+                        } else {
+                          openFineTuner(card, 'positive');
+                        }
+                      }}
+                      title={
+                        batchSelectMode
+                          ? '点击勾选/取消此卡片（按住 Shift 支持连选）'
+                          : '点击唤出可视化 Tag 微调面板'
+                      }
+                      className={`flex-1 px-3.5 py-2.5 text-left transition-colors cursor-pointer space-y-1.5 ${
+                        isSelected
+                          ? 'bg-[#F5F2FF]/80 hover:bg-[#EFEAFF]'
+                          : 'bg-[#FAFAFC] hover:bg-[#F5F3FF]/60'
+                      }`}
                     >
-                      <option value={24}>每页 24 张</option>
-                      <option value={48}>每页 48 张</option>
-                      <option value={96}>每页 96 张</option>
-                    </select>
-                  </div>
+                      <div className="text-[11px] text-[#373C4B] font-mono line-clamp-2 break-words leading-relaxed">
+                        <span className="font-sans font-semibold text-[#6B48F5] mr-1">
+                          Pos:
+                        </span>
+                        {posDisplay || '（空）'}
+                      </div>
+                      <div className="text-[11px] text-[#686E7E] font-mono line-clamp-1 break-words">
+                        <span className="font-sans font-semibold text-[#E85D75] mr-1">
+                          Neg:
+                        </span>
+                        {negDisplay || '（空）'}
+                      </div>
+                    </button>
 
-                  {totalPages > 1 && (
-                    <div className="flex items-center gap-1.5 tabular-nums">
+                    {/* 卡片底部操作栏 */}
+                    <div
+                      onClick={(e) => {
+                        if (batchSelectMode) {
+                          e.stopPropagation();
+                        }
+                      }}
+                      className="px-3.5 py-2.5 bg-white border-t border-[#EAEAEF] flex items-center gap-2"
+                    >
                       <button
                         type="button"
-                        disabled={safePage <= 1}
-                        onClick={() => setPage((p) => Math.max(1, p - 1))}
-                        className="h-7 px-2.5 inline-flex items-center gap-1 rounded-[7px] border border-[#E0E0E6] bg-white hover:border-[#7C5CFC]/50 disabled:opacity-40 cursor-pointer"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          openFineTuner(card, 'positive');
+                        }}
+                        className="flex-1 h-8 px-2.5 inline-flex items-center justify-center gap-1.5 text-[11.5px] font-medium rounded-[9px] border border-[#E0E0E6] bg-white text-[#4C5264] hover:border-[#7C5CFC]/50 hover:text-[#6B48F5] transition-colors whitespace-nowrap cursor-pointer"
                       >
-                        <ChevronLeft className="w-3.5 h-3.5" />
-                        <span>上一页</span>
+                        <SlidersHorizontal className="w-3.5 h-3.5" />
+                        <span>微调提示词</span>
                       </button>
-                      <span className="px-2 font-mono text-[11px]">
-                        {safePage} / {totalPages}
-                      </span>
+
                       <button
                         type="button"
-                        disabled={safePage >= totalPages}
-                        onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-                        className="h-7 px-2.5 inline-flex items-center gap-1 rounded-[7px] border border-[#E0E0E6] bg-white hover:border-[#7C5CFC]/50 disabled:opacity-40 cursor-pointer"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          void handleRunCard(card);
+                        }}
+                        disabled={isSendingThis}
+                        className="flex-1 h-8 px-2.5 inline-flex items-center justify-center gap-1.5 text-[11.5px] font-medium rounded-[9px] bg-gradient-to-b from-[#8A6CFF] to-[#7C5CFC] text-white shadow-[0_2px_6px_rgba(124,92,252,0.24)] hover:brightness-105 disabled:opacity-50 transition-all whitespace-nowrap cursor-pointer"
                       >
-                        <span>下一页</span>
-                        <ChevronRight className="w-3.5 h-3.5" />
+                        {isSendingThis ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Play className="w-3.5 h-3.5" />
+                        )}
+                        <span>{isSendingThis ? '发送中...' : '运行发送 UI'}</span>
                       </button>
                     </div>
-                  )}
-                </div>
-              )}
-            </>
+                  </article>
+                );
+              })}
+            </div>
           )}
         </div>
+
+        {/* 连续删卡局部无感浮动反馈（悬浮在滚动区域右下角，位于常驻底部操作坞上方） */}
+        {deleteStatus && (
+          <div className="pointer-events-none absolute bottom-3 right-4 left-4 sm:left-auto z-20 flex justify-end">
+            <div
+              role="status"
+              aria-live="polite"
+              className={`pointer-events-auto max-w-full sm:max-w-[460px] rounded-[11px] border px-3.5 py-2.5 shadow-[0_8px_24px_rgba(18,22,33,0.14)] backdrop-blur-md flex items-center gap-2.5 text-[12px] ${
+                deleteStatus.phase === 'warn'
+                  ? 'border-amber-300 bg-amber-50/95 text-amber-900'
+                  : deleteStatus.phase === 'done'
+                  ? 'border-emerald-300 bg-emerald-50/95 text-emerald-900'
+                  : 'border-[#DDD8FA] bg-white/95 text-[#373C4B]'
+              }`}
+            >
+              {deleteStatus.phase === 'pending' && (
+                <Loader2 className="w-4 h-4 animate-spin shrink-0 text-[#7C5CFC]" />
+              )}
+              {deleteStatus.phase === 'done' && (
+                <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-600" />
+              )}
+              {deleteStatus.phase === 'warn' && (
+                <AlertCircle className="w-4 h-4 shrink-0 text-amber-600" />
+              )}
+              <span className="truncate font-medium">{deleteStatus.text}</span>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  if (deleteToastTimerRef.current !== null) {
+                    window.clearTimeout(deleteToastTimerRef.current);
+                    deleteToastTimerRef.current = null;
+                  }
+                  setDeleteStatus(null);
+                }}
+                aria-label="关闭删除提示"
+                className="p-0.5 opacity-65 hover:opacity-100 cursor-pointer shrink-0"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+        )}
+        </div>
+
+        {/* 底部常驻控制坞：无论滚动到哪一屏，批量删除、快捷批量整理与翻页始终触手可及 */}
+        {(batchSelectMode || filteredCards.length > 0) && (
+          <div
+            ref={batchToolbarRef}
+            onClick={(e) => e.stopPropagation()}
+            onMouseDown={(e) => e.stopPropagation()}
+            className="shrink-0 z-10 bg-white border-t border-[#E0E0E6] px-3.5 sm:px-5 py-2.5 space-y-2.5 shadow-[0_-6px_20px_rgba(18,22,33,0.06)]"
+          >
+            {batchSelectMode && (
+              <div className="rounded-[11px] border border-[#DDD8FA] bg-[#FAF9FF] px-3 py-2.5 flex flex-col gap-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="inline-flex items-center min-h-[34px] px-2.5 rounded-[8px] bg-[#7C5CFC] text-white text-[12px] font-semibold tabular-nums whitespace-nowrap">
+                      已选 {selectedCardIds.size} 张
+                    </span>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setSelectedCardIds((prev) => {
+                          const next = new Set(prev);
+                          for (const c of pagedCardsRef.current) next.add(c.id);
+                          return next;
+                        });
+                      }}
+                      className="min-h-[34px] px-3 py-1 rounded-[8px] border border-[#E0E0E6] bg-white text-[12px] font-medium text-[#4C5264] hover:border-[#7C5CFC]/45 hover:text-[#6B48F5] transition-colors cursor-pointer whitespace-nowrap"
+                    >
+                      全选本页 ({pagedCards.length})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setSelectedCardIds((prev) => {
+                          const next = new Set(prev);
+                          for (const c of pagedCardsRef.current) {
+                            if (next.has(c.id)) next.delete(c.id);
+                            else next.add(c.id);
+                          }
+                          return next;
+                        });
+                      }}
+                      className="min-h-[34px] px-3 py-1 rounded-[8px] border border-[#E0E0E6] bg-white text-[12px] font-medium text-[#4C5264] hover:border-[#7C5CFC]/45 hover:text-[#6B48F5] transition-colors cursor-pointer whitespace-nowrap"
+                    >
+                      反选本页
+                    </button>
+                    {filteredCards.length > pagedCards.length && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setSelectedCardIds(
+                            new Set(filteredCardsRef.current.map((c) => c.id))
+                          );
+                        }}
+                        className="min-h-[34px] px-3 py-1 rounded-[8px] border border-[#E0E0E6] bg-white text-[12px] font-medium text-[#4C5264] hover:border-[#7C5CFC]/45 hover:text-[#6B48F5] transition-colors cursor-pointer whitespace-nowrap"
+                      >
+                        全选筛选 ({filteredCards.length})
+                      </button>
+                    )}
+                    {selectedCardIds.size > 0 && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setSelectedCardIds(new Set());
+                          setConfirmBulkDelete(false);
+                          lastBatchClickedIdRef.current = null;
+                        }}
+                        className="min-h-[34px] px-3 py-1 rounded-[8px] border border-[#E0E0E6] bg-white text-[12px] font-medium text-[#686E7E] hover:border-[#C5C8D4] hover:text-[#1E2028] transition-colors cursor-pointer whitespace-nowrap"
+                      >
+                        清空
+                      </button>
+                    )}
+                  </div>
+
+                  <button
+                    type="button"
+                    data-batch-exit-btn
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setBatchSelectMode(false);
+                      setSelectedCardIds(new Set());
+                      setConfirmBulkDelete(false);
+                      lastBatchClickedIdRef.current = null;
+                    }}
+                    className="min-h-[34px] px-3 py-1 inline-flex items-center gap-1.5 rounded-[8px] border border-[#E0E0E6] bg-white text-[12px] font-medium text-[#4C5264] hover:border-[#7C5CFC]/45 hover:text-[#1E2028] transition-colors cursor-pointer whitespace-nowrap"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                    <span>退出批量</span>
+                  </button>
+                </div>
+
+                <div className="flex flex-wrap items-center justify-between gap-2.5">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="flex items-center gap-1.5">
+                      <input
+                        type="text"
+                        value={batchTagInput}
+                        onChange={(e) => setBatchTagInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            handleBulkAddTags(e);
+                          }
+                        }}
+                        placeholder="批量添加标签（空格/逗号分隔）"
+                        className="w-[175px] sm:w-[205px] min-h-[36px] px-2.5 rounded-[8px] border border-[#E0E0E6] bg-white text-[12px] text-[#1E2028] focus:outline-none focus:border-[#7C5CFC]"
+                      />
+                      <button
+                        type="button"
+                        disabled={selectedCardIds.size === 0 || !batchTagInput.trim()}
+                        onClick={(e) => handleBulkAddTags(e)}
+                        className="min-h-[36px] px-3 py-1 inline-flex items-center gap-1.5 rounded-[8px] border border-[#DDD8FA] bg-[#F4F2FF] text-[12px] font-medium text-[#6B48F5] hover:bg-[#EBE6FF] disabled:opacity-40 transition-colors cursor-pointer whitespace-nowrap"
+                      >
+                        <Tag className="w-3.5 h-3.5" />
+                        <span>打标签</span>
+                      </button>
+                    </div>
+
+                    <button
+                      type="button"
+                      disabled={selectedCardIds.size === 0}
+                      onClick={(e) => handleBulkTogglePrivate(!privateView, e)}
+                      className="min-h-[36px] px-3 py-1 inline-flex items-center gap-1.5 rounded-[8px] border border-[#E5C4D6] bg-[#FDF6FA] text-[12px] font-medium text-[#8C3665] hover:bg-[#F9EAF2] hover:border-[#D39BB9] disabled:opacity-40 transition-colors cursor-pointer whitespace-nowrap"
+                    >
+                      {privateView ? (
+                        <Eye className="w-3.5 h-3.5" />
+                      ) : (
+                        <EyeOff className="w-3.5 h-3.5" />
+                      )}
+                      <span>{privateView ? '取消私密' : '设为私密'}</span>
+                    </button>
+
+                    {boundDirHandle && (
+                      <button
+                        type="button"
+                        disabled={selectedCardIds.size === 0 || isSyncingFolder}
+                        onClick={(e) =>
+                          void handleSyncScopedCardsToFolder(
+                            scopedCardsRef.current.filter((c) => selectedCardIds.has(c.id)),
+                            e
+                          )
+                        }
+                        className="min-h-[36px] px-3 py-1 inline-flex items-center gap-1.5 rounded-[8px] border border-emerald-300 bg-emerald-50 text-[12px] font-medium text-emerald-800 hover:bg-emerald-100/80 disabled:opacity-40 transition-colors cursor-pointer whitespace-nowrap"
+                      >
+                        <FolderSync className="w-3.5 h-3.5" />
+                        <span>写入文件夹</span>
+                      </button>
+                    )}
+                  </div>
+
+                  {/* 危险删除独立隔离区（完全阻止默认事件与冒泡） */}
+                  <div className="flex flex-wrap items-center gap-2 sm:pl-3 sm:border-l sm:border-[#E5E2F5]">
+                    {confirmBulkDelete ? (
+                      <div className="inline-flex flex-wrap items-center gap-2 p-1 rounded-[9px] border border-[#F5B8C4] bg-[#FFF1F3]">
+                        <button
+                          type="button"
+                          onClick={(e) => handleBulkDeleteSelected(e)}
+                          className="min-h-[36px] px-4 py-1 inline-flex items-center gap-1.5 rounded-[8px] bg-[#D92D4B] text-white text-[12px] font-semibold shadow-[0_2px_8px_rgba(217,45,75,0.28)] hover:bg-[#BE1E3A] transition-colors cursor-pointer whitespace-nowrap"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          <span>确认彻底删除 ({selectedCardIds.size})</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            setConfirmBulkDelete(false);
+                          }}
+                          className="min-h-[36px] px-3 py-1 rounded-[8px] border border-[#E0E0E6] bg-white text-[12px] font-medium text-[#4C5264] hover:text-[#1E2028] transition-colors cursor-pointer whitespace-nowrap"
+                        >
+                          取消
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        data-batch-delete-trigger
+                        disabled={selectedCardIds.size === 0}
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setConfirmBulkDelete(true);
+                        }}
+                        className="min-h-[36px] px-4 py-1 inline-flex items-center gap-1.5 rounded-[8px] border border-[#F5B8C4] bg-[#FFF5F7] text-[12px] font-semibold text-[#B42343] hover:bg-[#FFE6EC] hover:border-[#E85D75] disabled:opacity-40 disabled:hover:bg-[#FFF5F7] transition-colors cursor-pointer whitespace-nowrap"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        <span>
+                          {selectedCardIds.size > 0
+                            ? `批量删除 (${selectedCardIds.size})`
+                            : '批量删除'}
+                        </span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* 常驻底部翻页与快速批量入口 */}
+            {filteredCards.length > 0 && (
+              <div className="flex flex-wrap items-center justify-between gap-2 text-[11.5px] text-[#4C5264]">
+                <div className="flex flex-wrap items-center gap-2 tabular-nums">
+                  <span>
+                    显示第 {(safePage - 1) * pageSize + 1}–
+                    {Math.min(safePage * pageSize, filteredCards.length)} 张，共{' '}
+                    {filteredCards.length} 张
+                  </span>
+                  <select
+                    aria-label="每页显示卡片数"
+                    value={pageSize}
+                    onChange={(e) => setPageSize(Number(e.target.value) as 24 | 48 | 96)}
+                    className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-[#FAFAFC] text-[11px] text-[#1E2028]"
+                  >
+                    <option value={24}>每页 24 张</option>
+                    <option value={48}>每页 48 张</option>
+                    <option value={96}>每页 96 张</option>
+                  </select>
+                  {!batchSelectMode && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setBatchSelectMode(true);
+                        setSelectedCardIds(new Set());
+                        setConfirmBulkDelete(false);
+                        lastBatchClickedIdRef.current = null;
+                      }}
+                      className="h-7 px-2.5 inline-flex items-center gap-1 rounded-[7px] border border-[#E0E0E6] bg-white text-[11px] font-medium text-[#4C5264] hover:border-[#7C5CFC]/50 hover:text-[#6B48F5] cursor-pointer whitespace-nowrap"
+                    >
+                      <CheckSquare className="w-3.5 h-3.5" />
+                      <span>批量整理</span>
+                    </button>
+                  )}
+                </div>
+
+                {totalPages > 1 && (
+                  <div className="flex flex-wrap items-center gap-1.5 tabular-nums">
+                    <button
+                      type="button"
+                      disabled={safePage <= 1}
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        goToPage(1);
+                      }}
+                      className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-white text-[11px] hover:border-[#7C5CFC]/50 disabled:opacity-40 cursor-pointer"
+                    >
+                      首页
+                    </button>
+                    <button
+                      type="button"
+                      disabled={safePage <= 1}
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        goToPage(safePage - 1);
+                      }}
+                      className="h-7 px-2.5 inline-flex items-center gap-1 rounded-[7px] border border-[#E0E0E6] bg-white hover:border-[#7C5CFC]/50 disabled:opacity-40 cursor-pointer"
+                    >
+                      <ChevronLeft className="w-3.5 h-3.5" />
+                      <span>上一页</span>
+                    </button>
+                    <select
+                      aria-label="快速跳转页码"
+                      value={safePage}
+                      onChange={(e) => {
+                        e.stopPropagation();
+                        goToPage(Number(e.target.value));
+                      }}
+                      className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-[#FAFAFC] font-mono text-[11px] text-[#1E2028]"
+                    >
+                      {Array.from({ length: totalPages }, (_, idx) => idx + 1).map((p) => (
+                        <option key={p} value={p}>
+                          第 {p} / {totalPages} 页
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      disabled={safePage >= totalPages}
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        goToPage(safePage + 1);
+                      }}
+                      className="h-7 px-2.5 inline-flex items-center gap-1 rounded-[7px] border border-[#E0E0E6] bg-white hover:border-[#7C5CFC]/50 disabled:opacity-40 cursor-pointer"
+                    >
+                      <span>下一页</span>
+                      <ChevronRight className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      disabled={safePage >= totalPages}
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        goToPage(totalPages);
+                      }}
+                      className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-white text-[11px] hover:border-[#7C5CFC]/50 disabled:opacity-40 cursor-pointer"
+                    >
+                      末页
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* 右侧可视化微调抽屉 */}
         {editingCard && (
@@ -4330,7 +4681,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
                 <button
                   type="button"
-                  onClick={() => handleToggleCardPrivate(lightboxCard.id)}
+                  onClick={(e) => handleToggleCardPrivate(lightboxCard.id, e)}
                   className="h-8 px-2.5 inline-flex items-center gap-1.5 rounded-[8px] bg-white/10 hover:bg-white/20 border border-white/15 text-[11.5px] text-white cursor-pointer whitespace-nowrap"
                 >
                   {lightboxCard.isPrivate ? (
@@ -4427,48 +4778,6 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
             <div className="shrink-0 pt-2 text-center text-[11px] text-white/55">
               点击空白处或按 Esc 关闭预览 · 左右方向键切换卡片（当前{privateView ? '私密' : '公开'}视图范围）
-            </div>
-          </div>
-        )}
-
-        {/* 连续删卡局部无感浮动反馈（不挤压网格布局、不打断焦点） */}
-        {deleteStatus && (
-          <div className="pointer-events-none absolute bottom-4 right-4 left-4 sm:left-auto z-30 flex justify-end">
-            <div
-              role="status"
-              aria-live="polite"
-              className={`pointer-events-auto max-w-full sm:max-w-[460px] rounded-[11px] border px-3.5 py-2.5 shadow-[0_8px_24px_rgba(18,22,33,0.14)] backdrop-blur-md flex items-center gap-2.5 text-[12px] ${
-                deleteStatus.phase === 'warn'
-                  ? 'border-amber-300 bg-amber-50/95 text-amber-900'
-                  : deleteStatus.phase === 'done'
-                  ? 'border-emerald-300 bg-emerald-50/95 text-emerald-900'
-                  : 'border-[#DDD8FA] bg-white/95 text-[#373C4B]'
-              }`}
-            >
-              {deleteStatus.phase === 'pending' && (
-                <Loader2 className="w-4 h-4 animate-spin shrink-0 text-[#7C5CFC]" />
-              )}
-              {deleteStatus.phase === 'done' && (
-                <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-600" />
-              )}
-              {deleteStatus.phase === 'warn' && (
-                <AlertCircle className="w-4 h-4 shrink-0 text-amber-600" />
-              )}
-              <span className="truncate font-medium">{deleteStatus.text}</span>
-              <button
-                type="button"
-                onClick={() => {
-                  if (deleteToastTimerRef.current !== null) {
-                    window.clearTimeout(deleteToastTimerRef.current);
-                    deleteToastTimerRef.current = null;
-                  }
-                  setDeleteStatus(null);
-                }}
-                aria-label="关闭删除提示"
-                className="p-0.5 opacity-65 hover:opacity-100 cursor-pointer shrink-0"
-              >
-                <X className="w-3.5 h-3.5" />
-              </button>
             </div>
           </div>
         )}
