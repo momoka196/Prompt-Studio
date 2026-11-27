@@ -284,3 +284,43 @@ export interface WorkflowCollectionCard {
   updatedAt: number;
 }
 
+export interface ExtractedCardGenerationParams {
+  width?: number;
+  height?: number;
+  steps?: number;
+  cfg?: number;
+  sampler?: string;
+  scheduler?: string;
+  denoise?: number;
+  seed?: number;
+  sourceLabel?: string;
+}
+
+export type CardSlotWriteMode = 'replace' | 'append';
+
+export interface CardApplyToCharacterPayload {
+  cardId: string;
+  cardTitle: string;
+  targetCharacterId: string;
+  preserveIdentityAndHair: boolean;
+  applyOutfit: boolean;
+  outfitText: string;
+  outfitMode: CardSlotWriteMode;
+  applyPose: boolean;
+  poseText: string;
+  poseMode: CardSlotWriteMode;
+  applyExpression: boolean;
+  expressionText: string;
+  expressionMode: CardSlotWriteMode;
+  applyBackground: boolean;
+  backgroundText: string;
+  backgroundMode: CardSlotWriteMode;
+  applyNegative: boolean;
+  negativeText: string;
+  negativeMode: 'append-safe' | 'replace-override';
+  applySamplingParams: boolean;
+  samplingParams?: ExtractedCardGenerationParams;
+  switchAndClose: boolean;
+}
+
+

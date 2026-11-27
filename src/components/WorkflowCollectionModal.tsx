@@ -27,18 +27,24 @@ import {
   RotateCcw,
   Save,
   Search,
+  ShieldCheck,
   SlidersHorizontal,
   Sparkles,
   Square,
   Tag,
   Trash2,
   Upload,
+  UserCheck,
   X,
   ZoomIn,
 } from 'lucide-react';
 import { DEFAULT_COMFY_SEED } from '../data/presets';
 import {
+  CardApplyToCharacterPayload,
+  CardSlotWriteMode,
+  CharacterConfig,
   ComfyProfile,
+  ExtractedCardGenerationParams,
   WorkflowCollectionCard,
   WorkflowJsonFormat,
   WorkflowPromptNodeCandidate,
@@ -54,6 +60,7 @@ import {
   dedupeAndMergeIncomingCards,
   deleteCardsFromLocalDirectory,
   ensureDirectoryWritePermission,
+  extractCardGenerationParams,
   extractComfyMetadataFromPngFile,
   findDuplicateCardForSingleDraft,
   FolderSyncIndexEntry,
@@ -64,6 +71,7 @@ import {
   parseComfyWorkflowSource,
   parsePromptToTagItems,
   pickLocalWorkflowDirectory,
+  prepareCardPromptsForCharacterApply,
   readImageDimensions,
   resolveCardImageBlob,
   scanLocalDirectoryAndMerge,
@@ -71,6 +79,7 @@ import {
   serializeTagItemsToPrompt,
   syncCardsIncrementalToLocalDirectory,
 } from '../utils/workflowLibrary';
+import { getCharacterAvatarColor } from './CharacterSidebar';
 import {
   clearCardImageCache,
   formatBytesCompact,
@@ -104,8 +113,13 @@ interface WorkflowCollectionModalProps {
   comfyUrl: string;
   activeProfile: ComfyProfile;
   activeCharacterName: string;
+  characters?: CharacterConfig[];
+  selectedCharId?: string;
   knownCharacterHints?: string[];
   onOpenSettings: () => void;
+  onApplyCardToCharacter?: (
+    payload: CardApplyToCharacterPayload
+  ) => { ok: boolean; error?: string };
 }
 
 interface DraftImportState {
@@ -326,8 +340,11 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   comfyUrl,
   activeProfile,
   activeCharacterName,
+  characters = [],
+  selectedCharId = '',
   knownCharacterHints,
   onOpenSettings,
+  onApplyCardToCharacter,
 }) => {
   const [draft, setDraft] = useState<DraftImportState>(EMPTY_DRAFT);
   const [createPanelOpen, setCreatePanelOpen] = useState<boolean>(
@@ -424,6 +441,33 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   const [newTagInput, setNewTagInput] = useState('');
   const [saveFeedback, setSaveFeedback] = useState<string | null>(null);
 
+  // Apply-to-Character modal state
+  const [applyingCardId, setApplyingCardId] = useState<string | null>(null);
+  const [applyTargetCharId, setApplyTargetCharId] = useState<string>('');
+  const [applyPreserveIdentity, setApplyPreserveIdentity] = useState<boolean>(true);
+  const [applyPromptSource, setApplyPromptSource] = useState<'effective' | 'extracted'>('effective');
+  const [applyOutfit, setApplyOutfit] = useState<boolean>(true);
+  const [applyOutfitText, setApplyOutfitText] = useState<string>('');
+  const [applyOutfitMode, setApplyOutfitMode] = useState<CardSlotWriteMode>('replace');
+  const [applyPose, setApplyPose] = useState<boolean>(true);
+  const [applyPoseText, setApplyPoseText] = useState<string>('');
+  const [applyPoseMode, setApplyPoseMode] = useState<CardSlotWriteMode>('replace');
+  const [applyExpression, setApplyExpression] = useState<boolean>(true);
+  const [applyExpressionText, setApplyExpressionText] = useState<string>('');
+  const [applyExpressionMode, setApplyExpressionMode] = useState<CardSlotWriteMode>('replace');
+  const [applyBackground, setApplyBackground] = useState<boolean>(false);
+  const [applyBackgroundText, setApplyBackgroundText] = useState<string>('');
+  const [applyBackgroundMode, setApplyBackgroundMode] = useState<CardSlotWriteMode>('replace');
+  const [applyNegative, setApplyNegative] = useState<boolean>(false);
+  const [applyNegativeText, setApplyNegativeText] = useState<string>('');
+  const [applyNegativeMode, setApplyNegativeMode] = useState<'append-safe' | 'replace-override'>('append-safe');
+  const [applySamplingParams, setApplySamplingParams] = useState<boolean>(false);
+  const [applyExtractedParams, setApplyExtractedParams] = useState<ExtractedCardGenerationParams>({});
+  const [applyStrippedIdentityTags, setApplyStrippedIdentityTags] = useState<string[]>([]);
+  const [applyStrippedNegativeTags, setApplyStrippedNegativeTags] = useState<string[]>([]);
+  const [applySwitchAndClose, setApplySwitchAndClose] = useState<boolean>(true);
+  const [applyErrorMsg, setApplyErrorMsg] = useState<string | null>(null);
+
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const jsonInputRef = useRef<HTMLInputElement | null>(null);
   const collectionImportRef = useRef<HTMLInputElement | null>(null);
@@ -492,6 +536,11 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   const editingCard = useMemo(
     () => (editingCardId ? cards.find((c) => c.id === editingCardId) ?? null : null),
     [cards, editingCardId]
+  );
+
+  const applyingCard = useMemo(
+    () => (applyingCardId ? cards.find((c) => c.id === applyingCardId) ?? null : null),
+    [cards, applyingCardId]
   );
 
   useEffect(() => {
@@ -736,6 +785,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       setPrivateView(false);
       setActiveTagFilter('ALL');
       setLightboxCardId(null);
+      setApplyingCardId(null);
       setBatchSelectMode(false);
       setSelectedCardIds(new Set());
       lastBatchClickedIdRef.current = null;
@@ -773,6 +823,14 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         return;
       }
 
+      if (applyingCardId) {
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          setApplyingCardId(null);
+        }
+        return;
+      }
+
       if (e.key === 'Escape') {
         if (editingCardId) {
           setEditingCardId(null);
@@ -783,7 +841,173 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [open, editingCardId, lightboxCardId]);
+  }, [open, editingCardId, lightboxCardId, applyingCardId]);
+
+  const populateApplyPreparedFields = useCallback(
+    (
+      card: WorkflowCollectionCard,
+      preserveIdentity: boolean,
+      sourceScope: 'effective' | 'extracted'
+    ) => {
+      const prepared = prepareCardPromptsForCharacterApply(card, {
+        knownCharacterHints,
+        preserveIdentityAndHair: preserveIdentity,
+        sourceScope,
+      });
+      setApplyOutfitText(prepared.outfitText);
+      setApplyPoseText(prepared.poseText);
+      setApplyExpressionText(prepared.expressionText);
+      setApplyBackgroundText(prepared.backgroundText);
+      setApplyNegativeText(prepared.negativeText);
+      setApplyStrippedIdentityTags(prepared.strippedIdentityTags);
+      setApplyStrippedNegativeTags(prepared.strippedNegativeTags);
+      return prepared;
+    },
+    [knownCharacterHints]
+  );
+
+  const openApplyToCharacter = useCallback(
+    (card: WorkflowCollectionCard, e?: React.SyntheticEvent) => {
+      if (e) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+      const extractedParams = extractCardGenerationParams(card);
+      const hasAnyParams = Boolean(
+        extractedParams.width ||
+          extractedParams.height ||
+          extractedParams.steps ||
+          extractedParams.cfg ||
+          extractedParams.sampler ||
+          extractedParams.scheduler ||
+          extractedParams.denoise !== undefined ||
+          extractedParams.seed !== undefined
+      );
+
+      setApplyTargetCharId(selectedCharId || characters[0]?.id || '');
+      setApplyPreserveIdentity(true);
+      setApplyPromptSource('effective');
+      const prepared = populateApplyPreparedFields(card, true, 'effective');
+      setApplyOutfit(Boolean(prepared.outfitText.trim()));
+      setApplyOutfitMode('replace');
+      setApplyPose(Boolean(prepared.poseText.trim()));
+      setApplyPoseMode('replace');
+      setApplyExpression(Boolean(prepared.expressionText.trim()));
+      setApplyExpressionMode('replace');
+      setApplyBackground(false);
+      setApplyBackgroundMode('replace');
+      setApplyNegative(false);
+      setApplyNegativeMode('append-safe');
+      setApplyExtractedParams(extractedParams);
+      setApplySamplingParams(hasAnyParams);
+      setApplySwitchAndClose(true);
+      setApplyErrorMsg(null);
+      setApplyingCardId(card.id);
+    },
+    [characters, populateApplyPreparedFields, selectedCharId]
+  );
+
+  const handleConfirmApplyToCharacter = useCallback(
+    (e?: React.SyntheticEvent) => {
+      if (e) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+      if (!applyingCard || !onApplyCardToCharacter) return;
+      if (!applyTargetCharId) {
+        setApplyErrorMsg('请先选择要套用的目标角色');
+        return;
+      }
+
+      const hasOutfit = applyOutfit && applyOutfitText.trim().length > 0;
+      const hasPose = applyPose && applyPoseText.trim().length > 0;
+      const hasExpr = applyExpression && applyExpressionText.trim().length > 0;
+      const hasBg = applyBackground && applyBackgroundText.trim().length > 0;
+      const hasNeg = applyNegative && applyNegativeText.trim().length > 0;
+      const hasSampling =
+        applySamplingParams &&
+        Boolean(
+          applyExtractedParams.width ||
+            applyExtractedParams.height ||
+            applyExtractedParams.steps ||
+            applyExtractedParams.cfg ||
+            applyExtractedParams.sampler ||
+            applyExtractedParams.scheduler ||
+            applyExtractedParams.denoise !== undefined ||
+            applyExtractedParams.seed !== undefined
+        );
+
+      if (!hasOutfit && !hasPose && !hasExpr && !hasBg && !hasNeg && !hasSampling) {
+        setApplyErrorMsg('请至少勾选一项要带入的内容（服装 / 动作 / 表情 / 背景 / 负向 / 生成参数）');
+        return;
+      }
+
+      const res = onApplyCardToCharacter({
+        cardId: applyingCard.id,
+        cardTitle: applyingCard.title,
+        targetCharacterId: applyTargetCharId,
+        preserveIdentityAndHair: applyPreserveIdentity,
+        applyOutfit: hasOutfit,
+        outfitText: applyOutfitText,
+        outfitMode: applyOutfitMode,
+        applyPose: hasPose,
+        poseText: applyPoseText,
+        poseMode: applyPoseMode,
+        applyExpression: hasExpr,
+        expressionText: applyExpressionText,
+        expressionMode: applyExpressionMode,
+        applyBackground: hasBg,
+        backgroundText: applyBackgroundText,
+        backgroundMode: applyBackgroundMode,
+        applyNegative: hasNeg,
+        negativeText: applyNegativeText,
+        negativeMode: applyNegativeMode,
+        applySamplingParams: hasSampling,
+        samplingParams: hasSampling ? applyExtractedParams : undefined,
+        switchAndClose: applySwitchAndClose,
+      });
+
+      if (!res.ok) {
+        setApplyErrorMsg(res.error ?? '套用失败');
+        return;
+      }
+
+      setApplyingCardId(null);
+      if (!applySwitchAndClose) {
+        const targetName =
+          characters.find((c) => c.id === applyTargetCharId)?.name ?? '目标角色';
+        setImportNotice({
+          type: 'ok',
+          text: `已将「${applyingCard.title}」套用到角色「${targetName}」并切为当前激活角色`,
+        });
+      }
+    },
+    [
+      applyBackground,
+      applyBackgroundMode,
+      applyBackgroundText,
+      applyExpression,
+      applyExpressionMode,
+      applyExpressionText,
+      applyExtractedParams,
+      applyNegative,
+      applyNegativeMode,
+      applyNegativeText,
+      applyOutfit,
+      applyOutfitMode,
+      applyOutfitText,
+      applyPose,
+      applyPoseMode,
+      applyPoseText,
+      applyPreserveIdentity,
+      applySamplingParams,
+      applySwitchAndClose,
+      applyTargetCharId,
+      applyingCard,
+      characters,
+      onApplyCardToCharacter,
+    ]
+  );
 
   const openFineTuner = useCallback((card: WorkflowCollectionCard, initialTab: 'positive' | 'negative' = 'positive') => {
     setEditingCardId(card.id);
@@ -1748,6 +1972,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
       setEditingCardId((prev) => (prev && targetIdSet.has(prev) ? null : prev));
       setLightboxCardId((prev) => (prev && targetIdSet.has(prev) ? null : prev));
+      setApplyingCardId((prev) => (prev && targetIdSet.has(prev) ? null : prev));
 
       setSelectedCardIds((prev) => {
         if (prev.size === 0) return prev;
@@ -3896,8 +4121,20 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                                   e.stopPropagation();
                                 }
                               }}
-                              className="px-3.5 py-2.5 bg-white border-t border-[#EAEAEF] flex items-center gap-2"
+                              className="px-3 py-2.5 bg-white border-t border-[#EAEAEF] flex items-center gap-1.5"
                             >
+                              {onApplyCardToCharacter && characters.length > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => openApplyToCharacter(card, e)}
+                                  title="将此卡片提示词与生成参数套用到指定角色（默认保留目标角色原外貌与发型，防止串角）"
+                                  className="flex-1 min-w-0 h-8 px-2 inline-flex items-center justify-center gap-1 text-[11px] font-medium rounded-[9px] border border-[#F5B8C4] bg-[#FFF5F7] text-[#C93B58] hover:bg-[#FFE8ED] hover:border-[#E85D75] transition-colors whitespace-nowrap cursor-pointer"
+                                >
+                                  <UserCheck className="w-3.5 h-3.5 shrink-0" />
+                                  <span className="truncate">应用到角色</span>
+                                </button>
+                              )}
+
                               <button
                                 type="button"
                                 onClick={(e) => {
@@ -3905,10 +4142,10 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                                   e.stopPropagation();
                                   openFineTuner(card, 'positive');
                                 }}
-                                className="flex-1 h-8 px-2.5 inline-flex items-center justify-center gap-1.5 text-[11.5px] font-medium rounded-[9px] border border-[#E0E0E6] bg-white text-[#4C5264] hover:border-[#7C5CFC]/50 hover:text-[#6B48F5] transition-colors whitespace-nowrap cursor-pointer"
+                                className="flex-1 min-w-0 h-8 px-2 inline-flex items-center justify-center gap-1 text-[11px] font-medium rounded-[9px] border border-[#E0E0E6] bg-white text-[#4C5264] hover:border-[#7C5CFC]/50 hover:text-[#6B48F5] transition-colors whitespace-nowrap cursor-pointer"
                               >
-                                <SlidersHorizontal className="w-3.5 h-3.5" />
-                                <span>微调提示词</span>
+                                <SlidersHorizontal className="w-3.5 h-3.5 shrink-0" />
+                                <span className="truncate">微调提示词</span>
                               </button>
 
                               <button
@@ -3919,14 +4156,16 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                                   void handleRunCard(card);
                                 }}
                                 disabled={isSendingThis}
-                                className="flex-1 h-8 px-2.5 inline-flex items-center justify-center gap-1.5 text-[11.5px] font-medium rounded-[9px] bg-gradient-to-b from-[#8A6CFF] to-[#7C5CFC] text-white shadow-[0_2px_6px_rgba(124,92,252,0.24)] hover:brightness-105 disabled:opacity-50 transition-all whitespace-nowrap cursor-pointer"
+                                className="flex-1 min-w-0 h-8 px-2 inline-flex items-center justify-center gap-1 text-[11px] font-medium rounded-[9px] bg-gradient-to-b from-[#8A6CFF] to-[#7C5CFC] text-white shadow-[0_2px_6px_rgba(124,92,252,0.24)] hover:brightness-105 disabled:opacity-50 transition-all whitespace-nowrap cursor-pointer"
                               >
                                 {isSendingThis ? (
-                                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                  <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
                                 ) : (
-                                  <Play className="w-3.5 h-3.5" />
+                                  <Play className="w-3.5 h-3.5 shrink-0" />
                                 )}
-                                <span>{isSendingThis ? '发送中...' : '运行发送 UI'}</span>
+                                <span className="truncate">
+                                  {isSendingThis ? '发送中...' : '运行发送 UI'}
+                                </span>
                               </button>
                             </div>
                           </article>
@@ -4791,6 +5030,23 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                   <span>下载 JSON</span>
                 </button>
 
+                {onApplyCardToCharacter && characters.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      const target = lightboxCard;
+                      setLightboxCardId(null);
+                      openApplyToCharacter(target, e);
+                    }}
+                    className="h-8 px-2.5 inline-flex items-center gap-1.5 rounded-[8px] bg-[#E85D75]/25 hover:bg-[#E85D75]/40 border border-[#F5B8C4]/50 text-[11.5px] text-white cursor-pointer whitespace-nowrap"
+                  >
+                    <UserCheck className="w-3.5 h-3.5" />
+                    <span>应用到角色</span>
+                  </button>
+                )}
+
                 <button
                   type="button"
                   onClick={() => {
@@ -4859,6 +5115,516 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
             <div className="shrink-0 pt-2 text-center text-[11px] text-white/55">
               点击空白处或按 Esc 关闭预览 · 左右方向键切换卡片（当前{privateView ? '私密' : '公开'}视图范围）
+            </div>
+          </div>
+        )}
+
+        {/* 应用到角色 / 换角使用轻量弹窗 */}
+        {applyingCard && onApplyCardToCharacter && (
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label={`将卡片「${applyingCard.title}」应用到角色`}
+            className="fixed inset-0 z-[65] flex items-center justify-center bg-[#1E2028]/45 backdrop-blur-[2px] p-3 sm:p-6"
+            onClick={(e) => {
+              e.stopPropagation();
+              if (e.target === e.currentTarget) {
+                setApplyingCardId(null);
+              }
+            }}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="w-full max-w-[760px] max-h-[90vh] rounded-[16px] bg-white border border-[#E0E0E6] shadow-[0_24px_64px_rgba(18,22,33,0.26)] flex flex-col overflow-hidden"
+            >
+              {/* 弹窗头 */}
+              <div className="shrink-0 px-4 sm:px-5 py-3.5 border-b border-[#EAEAEF] bg-[#FAFAFC] flex items-center justify-between gap-3">
+                <div className="flex items-center gap-3 min-w-0">
+                  <DrawerThumbnailButton
+                    card={applyingCard}
+                    alt={applyingCard.title}
+                    onOpenLightbox={(id) => setLightboxCardId(id)}
+                  />
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <h3 className="text-[14px] font-bold text-[#1E2028] truncate">
+                        应用到角色 · {applyingCard.title}
+                      </h3>
+                      {applyingCard.isPrivate && (
+                        <span className="px-1.5 py-0.5 rounded-[5px] bg-[#FFF1F3] border border-[#F5B8C4] text-[10px] font-medium text-[#C93B58] shrink-0">
+                          私密卡片
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-[11px] text-[#686E7E] truncate">
+                      选择目标角色卡与要带入的提示词/参数，支持一键切换过去微调或发送到 ComfyUI
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setApplyingCardId(null);
+                  }}
+                  aria-label="关闭应用到角色弹窗"
+                  className="h-8 w-8 inline-flex items-center justify-center rounded-[8px] border border-[#E0E0E6] bg-white text-[#5A6072] hover:text-[#1E2028] cursor-pointer shrink-0"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {/* 弹窗主体 */}
+              <div className="flex-1 min-h-0 overflow-y-auto p-4 sm:p-5 space-y-4">
+                {/* 1. 目标角色选择 */}
+                <section className="space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[12px] font-semibold text-[#1E2028]">
+                      1. 选择目标角色卡
+                    </span>
+                    <span className="text-[11px] text-[#686E7E]">
+                      共 {characters.length} 个角色可选
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    {characters.map((ch) => {
+                      const isTarget = ch.id === applyTargetCharId;
+                      const isCurrentActive = ch.id === selectedCharId;
+                      const avatarColor = getCharacterAvatarColor(ch);
+                      return (
+                        <button
+                          key={ch.id}
+                          type="button"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            setApplyTargetCharId(ch.id);
+                            setApplyErrorMsg(null);
+                          }}
+                          className={`px-3 py-2.5 rounded-[11px] border text-left transition-all cursor-pointer flex items-center justify-between gap-2 ${
+                            isTarget
+                              ? 'border-[#7C5CFC] bg-[#F5F2FF] ring-2 ring-[#7C5CFC]/20'
+                              : 'border-[#E0E0E6] bg-white hover:border-[#7C5CFC]/45'
+                          }`}
+                        >
+                          <div className="flex items-center gap-2.5 min-w-0">
+                            <span
+                              className="w-3.5 h-3.5 rounded-full shrink-0 border border-black/10"
+                              style={{ backgroundColor: avatarColor.bg }}
+                            />
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-1.5">
+                                <span className="text-[12.5px] font-semibold text-[#1E2028] truncate">
+                                  {ch.name}
+                                </span>
+                                {isCurrentActive && (
+                                  <span className="px-1.5 py-0.5 rounded-[5px] bg-[#EAEAEF] text-[10px] font-medium text-[#4C5264] shrink-0">
+                                    当前激活
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-[10.5px] text-[#686E7E] truncate">
+                                {ch.outfit.text.trim()
+                                  ? `现有服装：${ch.outfit.text.trim()}`
+                                  : '现有服装：空'}
+                              </div>
+                            </div>
+                          </div>
+                          {isTarget && (
+                            <CheckCircle2 className="w-4 h-4 text-[#7C5CFC] shrink-0" />
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </section>
+
+                {/* 2. 防串角色与原词来源选项 */}
+                <section className="rounded-[12px] border border-[#DDD8FA] bg-[#FAF9FF] p-3.5 space-y-2.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <label className="inline-flex items-center gap-2 text-[12px] font-semibold text-[#373C4B] cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={applyPreserveIdentity}
+                        onChange={(e) => {
+                          const next = e.target.checked;
+                          setApplyPreserveIdentity(next);
+                          populateApplyPreparedFields(
+                            applyingCard,
+                            next,
+                            applyPromptSource
+                          );
+                        }}
+                        className="w-4 h-4 accent-[#7C5CFC]"
+                      />
+                      <ShieldCheck className="w-4 h-4 text-[#7C5CFC]" />
+                      <span>保留目标角色原有外貌与发型（防“换人串角色”）</span>
+                    </label>
+
+                    <div className="flex items-center gap-1.5 text-[11px]">
+                      <span className="text-[#686E7E]">提取来源:</span>
+                      <select
+                        value={applyPromptSource}
+                        onChange={(e) => {
+                          const nextSource = e.target.value as 'effective' | 'extracted';
+                          setApplyPromptSource(nextSource);
+                          populateApplyPreparedFields(
+                            applyingCard,
+                            applyPreserveIdentity,
+                            nextSource
+                          );
+                        }}
+                        className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-white text-[11px] text-[#1E2028] focus:outline-none focus:border-[#7C5CFC]"
+                      >
+                        <option value="effective">当前生效词条（含微调）</option>
+                        <option value="extracted">JSON 原提取词条</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  {applyPreserveIdentity ? (
+                    <div className="text-[11px] text-[#4C5264] space-y-1">
+                      <p>
+                        套用时<strong>绝不覆盖</strong>目标角色的外貌（appearance）、发型（HAIRSTYLE_PRESETS）、刘海、发饰、体型规范及禁用词；并已自动剔除原卡中的角色名/发色/瞳色/兽耳光环及 solo/构图/塑料质感词。
+                      </p>
+                      {applyStrippedIdentityTags.length > 0 && (
+                        <p className="font-mono text-[10.5px] text-[#6B48F5] break-words">
+                          已自动过滤 {applyStrippedIdentityTags.length} 项防串角/通用词：
+                          {applyStrippedIdentityTags.slice(0, 10).join(', ')}
+                          {applyStrippedIdentityTags.length > 10
+                            ? ` 等 +${applyStrippedIdentityTags.length - 10} 项`
+                            : ''}
+                        </p>
+                      )}
+                    </div>
+                  ) : (
+                    <p className="text-[11px] text-amber-700">
+                      已关闭特征过滤（仍保留目标角色原有外貌/发型槽位，仅将发色/发型等词保留在待写入的服装/动作候选词中，请手动核对避免串角）。
+                    </p>
+                  )}
+                </section>
+
+                {/* 3. 选择带入的内容 */}
+                <section className="space-y-2.5">
+                  <div className="text-[12px] font-semibold text-[#1E2028]">
+                    2. 勾选要带入的内容（支持套用前微调与覆盖/追加模式）
+                  </div>
+
+                  {/* 服装 outfit */}
+                  <div className="rounded-[11px] border border-[#E0E0E6] bg-white p-3 space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <label className="inline-flex items-center gap-2 text-[12px] font-semibold text-[#1E2028] cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={applyOutfit}
+                          onChange={(e) => setApplyOutfit(e.target.checked)}
+                          className="w-3.5 h-3.5 accent-[#7C5CFC]"
+                        />
+                        <span>服装 / 配饰与补充提示词（outfit）</span>
+                      </label>
+                      <select
+                        value={applyOutfitMode}
+                        onChange={(e) =>
+                          setApplyOutfitMode(e.target.value as CardSlotWriteMode)
+                        }
+                        className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-[#FAFAFC] text-[11px] text-[#373C4B]"
+                      >
+                        <option value="replace">替换目标角色服装槽位</option>
+                        <option value="append">追加到目标角色服装后</option>
+                      </select>
+                    </div>
+                    <textarea
+                      rows={2}
+                      value={applyOutfitText}
+                      onChange={(e) => {
+                        setApplyOutfitText(e.target.value);
+                        if (e.target.value.trim() && !applyOutfit) setApplyOutfit(true);
+                      }}
+                      placeholder="未识别到服装/补充词，也可手动填入..."
+                      className="w-full rounded-[8px] border border-[#E0E0E6] bg-[#FAFAFC] px-2.5 py-1.5 text-[11.5px] font-mono text-[#1E2028] focus:outline-none focus:border-[#7C5CFC] resize-y"
+                    />
+                  </div>
+
+                  {/* 动作 pose */}
+                  <div className="rounded-[11px] border border-[#E0E0E6] bg-white p-3 space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <label className="inline-flex items-center gap-2 text-[12px] font-semibold text-[#1E2028] cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={applyPose}
+                          onChange={(e) => setApplyPose(e.target.checked)}
+                          className="w-3.5 h-3.5 accent-[#7C5CFC]"
+                        />
+                        <span>动作 / 姿态（pose）</span>
+                      </label>
+                      <select
+                        value={applyPoseMode}
+                        onChange={(e) =>
+                          setApplyPoseMode(e.target.value as CardSlotWriteMode)
+                        }
+                        className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-[#FAFAFC] text-[11px] text-[#373C4B]"
+                      >
+                        <option value="replace">替换目标角色动作槽位</option>
+                        <option value="append">追加到目标角色动作后</option>
+                      </select>
+                    </div>
+                    <textarea
+                      rows={2}
+                      value={applyPoseText}
+                      onChange={(e) => {
+                        setApplyPoseText(e.target.value);
+                        if (e.target.value.trim() && !applyPose) setApplyPose(true);
+                      }}
+                      placeholder="未识别到明显动作词，可保持不勾选或手动输入..."
+                      className="w-full rounded-[8px] border border-[#E0E0E6] bg-[#FAFAFC] px-2.5 py-1.5 text-[11.5px] font-mono text-[#1E2028] focus:outline-none focus:border-[#7C5CFC] resize-y"
+                    />
+                  </div>
+
+                  {/* 表情 expression */}
+                  <div className="rounded-[11px] border border-[#E0E0E6] bg-white p-3 space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <label className="inline-flex items-center gap-2 text-[12px] font-semibold text-[#1E2028] cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={applyExpression}
+                          onChange={(e) => setApplyExpression(e.target.checked)}
+                          className="w-3.5 h-3.5 accent-[#7C5CFC]"
+                        />
+                        <span>表情 / 眼神（expression）</span>
+                      </label>
+                      <select
+                        value={applyExpressionMode}
+                        onChange={(e) =>
+                          setApplyExpressionMode(e.target.value as CardSlotWriteMode)
+                        }
+                        className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-[#FAFAFC] text-[11px] text-[#373C4B]"
+                      >
+                        <option value="replace">替换目标角色表情槽位</option>
+                        <option value="append">追加到目标角色表情后</option>
+                      </select>
+                    </div>
+                    <textarea
+                      rows={2}
+                      value={applyExpressionText}
+                      onChange={(e) => {
+                        setApplyExpressionText(e.target.value);
+                        if (e.target.value.trim() && !applyExpression) setApplyExpression(true);
+                      }}
+                      placeholder="未识别到明显表情词，可保持不勾选或手动输入..."
+                      className="w-full rounded-[8px] border border-[#E0E0E6] bg-[#FAFAFC] px-2.5 py-1.5 text-[11.5px] font-mono text-[#1E2028] focus:outline-none focus:border-[#7C5CFC] resize-y"
+                    />
+                  </div>
+
+                  {/* 场景背景 shared.background */}
+                  <div className="rounded-[11px] border border-[#E0E0E6] bg-white p-3 space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <label className="inline-flex items-center gap-2 text-[12px] font-semibold text-[#1E2028] cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={applyBackground}
+                          onChange={(e) => setApplyBackground(e.target.checked)}
+                          className="w-3.5 h-3.5 accent-[#7C5CFC]"
+                        />
+                        <span>共用场景 / 背景（shared.background，默认不覆盖）</span>
+                      </label>
+                      <select
+                        value={applyBackgroundMode}
+                        onChange={(e) =>
+                          setApplyBackgroundMode(e.target.value as CardSlotWriteMode)
+                        }
+                        className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-[#FAFAFC] text-[11px] text-[#373C4B]"
+                      >
+                        <option value="replace">替换当前全局背景</option>
+                        <option value="append">追加到当前全局背景</option>
+                      </select>
+                    </div>
+                    <textarea
+                      rows={2}
+                      value={applyBackgroundText}
+                      onChange={(e) => {
+                        setApplyBackgroundText(e.target.value);
+                        if (e.target.value.trim() && !applyBackground) setApplyBackground(true);
+                      }}
+                      placeholder="未识别到背景词（可选）..."
+                      className="w-full rounded-[8px] border border-[#E0E0E6] bg-[#FAFAFC] px-2.5 py-1.5 text-[11.5px] font-mono text-[#1E2028] focus:outline-none focus:border-[#7C5CFC] resize-y"
+                    />
+                  </div>
+
+                  {/* 负向提示词 */}
+                  <div className="rounded-[11px] border border-[#E0E0E6] bg-white p-3 space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <label className="inline-flex items-center gap-2 text-[12px] font-semibold text-[#1E2028] cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={applyNegative}
+                          onChange={(e) => setApplyNegative(e.target.checked)}
+                          className="w-3.5 h-3.5 accent-[#E85D75]"
+                        />
+                        <span>负向提示词（已按红线剔除角色特征与禁忌质感词）</span>
+                      </label>
+                      <select
+                        value={applyNegativeMode}
+                        onChange={(e) =>
+                          setApplyNegativeMode(
+                            e.target.value as 'append-safe' | 'replace-override'
+                          )
+                        }
+                        className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-[#FAFAFC] text-[11px] text-[#373C4B]"
+                      >
+                        <option value="append-safe">安全追加到通用负向（保留动态护栏）</option>
+                        <option value="replace-override">设为手动负向覆盖（仍受安全护栏保护）</option>
+                      </select>
+                    </div>
+                    <textarea
+                      rows={2}
+                      value={applyNegativeText}
+                      onChange={(e) => {
+                        setApplyNegativeText(e.target.value);
+                        if (e.target.value.trim() && !applyNegative) setApplyNegative(true);
+                      }}
+                      placeholder="卡片暂无额外可安全带入的负向词..."
+                      className="w-full rounded-[8px] border border-[#E0E0E6] bg-[#FAFAFC] px-2.5 py-1.5 text-[11.5px] font-mono text-[#1E2028] focus:outline-none focus:border-[#7C5CFC] resize-y"
+                    />
+                    {applyStrippedNegativeTags.length > 0 && (
+                      <p className="text-[10.5px] text-[#686E7E]">
+                        已自动移除 {applyStrippedNegativeTags.length} 个可能触发角色冲突或负向红线的词：
+                        {applyStrippedNegativeTags.join(', ')}
+                      </p>
+                    )}
+                  </div>
+
+                  {/* 工作流生成参数 */}
+                  <div className="rounded-[11px] border border-[#E0E0E6] bg-white p-3 space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <label className="inline-flex items-center gap-2 text-[12px] font-semibold text-[#1E2028] cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={applySamplingParams}
+                          onChange={(e) => setApplySamplingParams(e.target.checked)}
+                          disabled={
+                            !applyExtractedParams.width &&
+                            !applyExtractedParams.height &&
+                            !applyExtractedParams.steps &&
+                            !applyExtractedParams.cfg &&
+                            !applyExtractedParams.sampler &&
+                            !applyExtractedParams.scheduler &&
+                            applyExtractedParams.denoise === undefined &&
+                            applyExtractedParams.seed === undefined
+                          }
+                          className="w-3.5 h-3.5 accent-[#7C5CFC]"
+                        />
+                        <span>
+                          工作流生成参数（同步到当前模型方案「{activeProfile.name}」）
+                        </span>
+                      </label>
+                      {applyExtractedParams.sourceLabel && (
+                        <span className="text-[10.5px] text-[#686E7E]">
+                          提取自：{applyExtractedParams.sourceLabel}
+                        </span>
+                      )}
+                    </div>
+
+                    {applyExtractedParams.width ||
+                    applyExtractedParams.height ||
+                    applyExtractedParams.steps ||
+                    applyExtractedParams.cfg ||
+                    applyExtractedParams.sampler ||
+                    applyExtractedParams.scheduler ||
+                    applyExtractedParams.denoise !== undefined ||
+                    applyExtractedParams.seed !== undefined ? (
+                      <div className="flex flex-wrap items-center gap-1.5 text-[11px] font-mono tabular-nums text-[#373C4B]">
+                        {applyExtractedParams.width && applyExtractedParams.height && (
+                          <span className="px-2 py-0.5 rounded-[6px] bg-[#F4F2FF] border border-[#DDD8FA] text-[#5B3DF5]">
+                            {applyExtractedParams.width}×{applyExtractedParams.height}
+                          </span>
+                        )}
+                        {applyExtractedParams.steps && (
+                          <span className="px-2 py-0.5 rounded-[6px] bg-[#FAFAFC] border border-[#E0E0E6]">
+                            Steps {applyExtractedParams.steps}
+                          </span>
+                        )}
+                        {applyExtractedParams.cfg && (
+                          <span className="px-2 py-0.5 rounded-[6px] bg-[#FAFAFC] border border-[#E0E0E6]">
+                            CFG {applyExtractedParams.cfg}
+                          </span>
+                        )}
+                        {applyExtractedParams.sampler && (
+                          <span className="px-2 py-0.5 rounded-[6px] bg-[#FAFAFC] border border-[#E0E0E6]">
+                            {applyExtractedParams.sampler}
+                          </span>
+                        )}
+                        {applyExtractedParams.scheduler && (
+                          <span className="px-2 py-0.5 rounded-[6px] bg-[#FAFAFC] border border-[#E0E0E6]">
+                            {applyExtractedParams.scheduler}
+                          </span>
+                        )}
+                        {applyExtractedParams.denoise !== undefined && (
+                          <span className="px-2 py-0.5 rounded-[6px] bg-[#FAFAFC] border border-[#E0E0E6]">
+                            Denoise {applyExtractedParams.denoise}
+                          </span>
+                        )}
+                        {applyExtractedParams.seed !== undefined && (
+                          <span className="px-2 py-0.5 rounded-[6px] bg-[#FAFAFC] border border-[#E0E0E6]">
+                            Seed {applyExtractedParams.seed}
+                          </span>
+                        )}
+                      </div>
+                    ) : (
+                      <p className="text-[11px] text-[#8E94A4]">
+                        该卡片暂未解析出可同步的采样/分辨率参数（仅套用上方已勾选的提示词）。
+                      </p>
+                    )}
+                  </div>
+                </section>
+              </div>
+
+              {/* 弹窗底部确认栏 */}
+              <div className="shrink-0 px-4 sm:px-5 py-3 border-t border-[#EAEAEF] bg-[#FAFAFC] space-y-2">
+                {applyErrorMsg && (
+                  <div className="rounded-[8px] border border-[#F5B8C4] bg-[#FFF1F3] px-3 py-1.5 text-[11.5px] text-[#B42343]">
+                    {applyErrorMsg}
+                  </div>
+                )}
+                <div className="flex flex-wrap items-center justify-between gap-2.5">
+                  <label className="inline-flex items-center gap-2 text-[12px] text-[#373C4B] cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={applySwitchAndClose}
+                      onChange={(e) => setApplySwitchAndClose(e.target.checked)}
+                      className="w-3.5 h-3.5 accent-[#7C5CFC]"
+                    />
+                    <span>套用后切换到该角色并返回主编辑区</span>
+                  </label>
+
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setApplyingCardId(null);
+                      }}
+                      className="h-9 px-3.5 rounded-[10px] border border-[#E0E0E6] bg-white text-[12px] font-medium text-[#4C5264] hover:text-[#1E2028] cursor-pointer"
+                    >
+                      取消
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => handleConfirmApplyToCharacter(e)}
+                      className="h-9 px-4 inline-flex items-center gap-1.5 rounded-[10px] bg-gradient-to-b from-[#F07187] to-[#E85D75] text-white text-[12px] font-semibold shadow-[0_2px_8px_rgba(232,93,117,0.28)] hover:brightness-105 cursor-pointer whitespace-nowrap"
+                    >
+                      <UserCheck className="w-4 h-4" />
+                      <span>
+                        确认套用到「
+                        {characters.find((c) => c.id === applyTargetCharId)?.name ??
+                          '角色'}
+                        」
+                      </span>
+                    </button>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         )}

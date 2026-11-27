@@ -13,6 +13,7 @@ import {
   X,
 } from 'lucide-react';
 import {
+  CHARACTER_FORBIDDEN_FEATURES,
   COMFY_ARCH_DEFAULTS,
   DEFAULT_ANIMA_LORAS,
   DEFAULT_COMFY_PROFILES,
@@ -21,10 +22,12 @@ import {
   SHARED_BODY_TYPE_STRING,
 } from './data/presets';
 import {
+  CardApplyToCharacterPayload,
   CharacterConfig,
   ComfyLoaderKey,
   ComfyLoadersConfig,
   ComfyProfile,
+  ComfySamplingParams,
   ComfyValidationMap,
   ConflictItem,
   HistorySnapshot,
@@ -44,8 +47,11 @@ import {
   LOADER_NODE_META,
   parseComfyProfileImport,
   sanitizeFilenamePrefix,
+  splitPromptTags,
+  stripForbiddenAntiTextureFullText,
   stripLegacyExpressionTokensFromAppearance,
 } from './utils/promptBuilder';
+import { mergePromptSlotTexts } from './utils/workflowLibrary';
 import { CharacterSidebar } from './components/CharacterSidebar';
 import { CharacterEditorPanel } from './components/CharacterEditorPanel';
 import { SharedLayerPanel } from './components/SharedLayerPanel';
@@ -383,6 +389,8 @@ export default function App() {
   const [guardHelpOpen, setGuardHelpOpen] = useState(false);
   const [validation, setValidation] = useState<ComfyValidationMap>(EMPTY_VALIDATION);
   const [probingLoaders, setProbingLoaders] = useState(false);
+  const [applyCardToast, setApplyCardToast] = useState<string | null>(null);
+  const applyCardToastTimerRef = useRef<number | null>(null);
   const lastAutoSnapshotRef = useRef<string>(JSON.stringify(config));
   const cardsMutatedRef = useRef(false);
 
@@ -594,6 +602,238 @@ export default function App() {
     };
     setHistory((prev) => [snap, ...prev].slice(0, MAX_HISTORY_ITEMS));
   }, []);
+
+  const handleApplyWorkflowCardToCharacter = useCallback(
+    (payload: CardApplyToCharacterPayload): { ok: boolean; error?: string } => {
+      const targetChar = config.characters.find(
+        (c) => c.id === payload.targetCharacterId
+      );
+      if (!targetChar) {
+        return { ok: false, error: '未找到目标角色，请重新选择' };
+      }
+
+      pushHistory(
+        `套用卡片「${payload.cardTitle}」到「${targetChar.name}」前`,
+        config
+      );
+
+      const cleanPosSlot = (raw: string): string =>
+        stripForbiddenAntiTextureFullText(raw).cleanedText;
+
+      const cleanSafeNegative = (raw: string): string => {
+        const strippedAntiTex = stripForbiddenAntiTextureFullText(raw).cleanedText;
+        const forbiddenMatchers = CHARACTER_FORBIDDEN_FEATURES.map((feat) => {
+          const escaped = feat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          return new RegExp(`\\b${escaped}\\b`, 'i');
+        });
+        return splitPromptTags(strippedAntiTex)
+          .filter((token) => !forbiddenMatchers.some((re) => re.test(token)))
+          .join(', ');
+      };
+
+      const appliedParts: string[] = [];
+      if (payload.applyOutfit && payload.outfitText.trim()) appliedParts.push('服装');
+      if (payload.applyPose && payload.poseText.trim()) appliedParts.push('动作');
+      if (payload.applyExpression && payload.expressionText.trim()) appliedParts.push('表情');
+      if (payload.applyBackground && payload.backgroundText.trim()) appliedParts.push('背景');
+      if (payload.applyNegative && payload.negativeText.trim()) appliedParts.push('负向提示词');
+      if (payload.applySamplingParams && payload.samplingParams) appliedParts.push('生成参数');
+
+      updateConfig((prev) => {
+        const nextCharacters = prev.characters.map((ch) => {
+          if (ch.id !== payload.targetCharacterId) return ch;
+          // 严格保留目标角色外貌、发型、刘海、发饰与禁用词（防串角色）
+          const nextOutfitText =
+            payload.applyOutfit && payload.outfitText.trim()
+              ? mergePromptSlotTexts(
+                  ch.outfit.text,
+                  cleanPosSlot(payload.outfitText),
+                  payload.outfitMode
+                )
+              : ch.outfit.text;
+          const nextPoseText =
+            payload.applyPose && payload.poseText.trim()
+              ? mergePromptSlotTexts(
+                  ch.pose.text,
+                  cleanPosSlot(payload.poseText),
+                  payload.poseMode
+                )
+              : ch.pose.text;
+          const nextExprText =
+            payload.applyExpression && payload.expressionText.trim()
+              ? mergePromptSlotTexts(
+                  ch.expression.text,
+                  cleanPosSlot(payload.expressionText),
+                  payload.expressionMode
+                )
+              : ch.expression.text;
+
+          return {
+            ...ch,
+            outfit: { ...ch.outfit, text: nextOutfitText },
+            pose: { ...ch.pose, text: nextPoseText },
+            expression: { ...ch.expression, text: nextExprText },
+          };
+        });
+
+        let nextShared = prev.shared;
+        if (payload.applyBackground && payload.backgroundText.trim()) {
+          const nextBgText = mergePromptSlotTexts(
+            nextShared.background.text,
+            cleanPosSlot(payload.backgroundText),
+            payload.backgroundMode
+          );
+          nextShared = {
+            ...nextShared,
+            background: { ...nextShared.background, text: nextBgText },
+            selectedBackgroundId: null,
+            selectedBackgroundName: `来自收藏卡 · ${payload.cardTitle}`,
+          };
+        }
+
+        if (payload.applyNegative && payload.negativeText.trim()) {
+          const safeNeg = cleanSafeNegative(payload.negativeText);
+          if (safeNeg) {
+            if (payload.negativeMode === 'replace-override') {
+              nextShared = {
+                ...nextShared,
+                manualNegativeOverride: safeNeg,
+              };
+            } else if (nextShared.manualNegativeOverride !== null) {
+              nextShared = {
+                ...nextShared,
+                manualNegativeOverride: mergePromptSlotTexts(
+                  nextShared.manualNegativeOverride,
+                  safeNeg,
+                  'append'
+                ),
+              };
+            } else {
+              const incomingTags = splitPromptTags(safeNeg);
+              const existingAll = new Set(
+                nextShared.negativeGroups.flatMap((g) =>
+                  g.tags.map((t) => t.text.trim().toLowerCase())
+                )
+              );
+              const toAppend = incomingTags.filter(
+                (tag) => !existingAll.has(tag.trim().toLowerCase())
+              );
+              if (toAppend.length > 0) {
+                const targetGroupExists = nextShared.negativeGroups.some(
+                  (g) => g.id === 'general-quality'
+                );
+                nextShared = {
+                  ...nextShared,
+                  negativeGroups: nextShared.negativeGroups.map((g, idx) => {
+                    const isTarget = targetGroupExists
+                      ? g.id === 'general-quality'
+                      : idx === nextShared.negativeGroups.length - 1;
+                    if (!isTarget) return g;
+                    return {
+                      ...g,
+                      enabled: true,
+                      tags: [
+                        ...g.tags,
+                        ...toAppend.map((text, tIdx) => ({
+                          id: `card-neg-${Date.now()}-${tIdx}`,
+                          text,
+                          weight: 1.0,
+                        })),
+                      ],
+                    };
+                  }),
+                };
+              }
+            }
+          }
+        }
+
+        let nextProfiles = prev.comfyProfiles;
+        if (payload.applySamplingParams && payload.samplingParams) {
+          const sp = payload.samplingParams;
+          const baseList =
+            prev.comfyProfiles && prev.comfyProfiles.length > 0
+              ? prev.comfyProfiles
+              : DEFAULT_COMFY_PROFILES;
+          const activeId = prev.activeComfyProfileId ?? baseList[0].id;
+          nextProfiles = baseList.map((profile) => {
+            if (profile.id !== activeId) return profile;
+            const manualSet = new Set<keyof ComfySamplingParams>(
+              profile.manualSamplingFields ?? []
+            );
+            const nextSampling: ComfySamplingParams = { ...profile.sampling };
+            if (typeof sp.width === 'number' && sp.width >= 64) {
+              nextSampling.width = sp.width;
+              manualSet.add('width');
+            }
+            if (typeof sp.height === 'number' && sp.height >= 64) {
+              nextSampling.height = sp.height;
+              manualSet.add('height');
+            }
+            if (typeof sp.steps === 'number' && sp.steps >= 1) {
+              nextSampling.steps = sp.steps;
+              manualSet.add('steps');
+            }
+            if (typeof sp.cfg === 'number' && sp.cfg > 0) {
+              nextSampling.cfg = sp.cfg;
+              manualSet.add('cfg');
+            }
+            if (typeof sp.sampler === 'string' && sp.sampler.trim()) {
+              nextSampling.sampler = sp.sampler.trim();
+              manualSet.add('sampler');
+            }
+            if (typeof sp.scheduler === 'string' && sp.scheduler.trim()) {
+              nextSampling.scheduler = sp.scheduler.trim();
+              manualSet.add('scheduler');
+            }
+            if (typeof sp.denoise === 'number' && sp.denoise > 0 && sp.denoise <= 1) {
+              nextSampling.denoise = sp.denoise;
+              manualSet.add('denoise');
+            }
+            if (typeof sp.seed === 'number' && sp.seed >= 0) {
+              nextSampling.seedMode = 'fixed';
+              nextSampling.seed = sp.seed;
+              manualSet.add('seedMode');
+              manualSet.add('seed');
+            }
+            return {
+              ...profile,
+              sampling: nextSampling,
+              manualSamplingFields: Array.from(manualSet),
+            };
+          });
+        }
+
+        return {
+          ...prev,
+          shared: nextShared,
+          characters: nextCharacters,
+          comfyProfiles: nextProfiles,
+        };
+      });
+
+      setSelectedCharId(targetChar.id);
+      if (payload.switchAndClose) {
+        setWorkbenchOpen(false);
+      }
+
+      const summarySuffix =
+        appliedParts.length > 0 ? `（已更新：${appliedParts.join('、')}）` : '';
+      setApplyCardToast(
+        `已将卡片「${payload.cardTitle}」套用到「${targetChar.name}」并切换为当前角色${summarySuffix}`
+      );
+      if (applyCardToastTimerRef.current !== null) {
+        window.clearTimeout(applyCardToastTimerRef.current);
+      }
+      applyCardToastTimerRef.current = window.setTimeout(() => {
+        setApplyCardToast(null);
+        applyCardToastTimerRef.current = null;
+      }, 4800);
+
+      return { ok: true };
+    },
+    [config, pushHistory, setSelectedCharId, updateConfig]
+  );
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -1119,6 +1359,26 @@ export default function App() {
 
       {/* 主工作区：撑满视口高度 */}
       <main className="flex-1 min-h-0 flex flex-col max-w-[1600px] w-full mx-auto px-4 py-3 gap-3">
+        {applyCardToast && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="shrink-0 rounded-[12px] border border-emerald-200 bg-emerald-50/95 px-4 py-2 flex items-center justify-between gap-2 text-[12px] text-emerald-800 shadow-[0_2px_10px_rgba(16,185,129,0.08)]"
+          >
+            <div className="flex items-center gap-2 min-w-0">
+              <Check className="w-4 h-4 text-emerald-600 shrink-0" />
+              <span className="font-medium truncate">{applyCardToast}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setApplyCardToast(null)}
+              aria-label="关闭提示"
+              className="p-0.5 text-emerald-600 hover:text-emerald-900 cursor-pointer shrink-0"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
         {/* 冲突提醒条（浅色柔和提示） */}
         {conflicts.length > 0 && (
           <div
@@ -1387,8 +1647,11 @@ export default function App() {
         comfyUrl={config.comfyUrl}
         activeProfile={activeProfile}
         activeCharacterName={activeCharacter?.name ?? '角色'}
+        characters={config.characters}
+        selectedCharId={activeCharacter?.id ?? ''}
         knownCharacterHints={knownCharacterHints}
         onOpenSettings={handleOpenSettingsFromWorkbench}
+        onApplyCardToCharacter={handleApplyWorkflowCardToCharacter}
       />
     </div>
   );

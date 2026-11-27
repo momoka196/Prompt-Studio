@@ -1,17 +1,21 @@
 import {
   ComfyProfile,
+  ExtractedCardGenerationParams,
   WorkflowCollectionCard,
   WorkflowJsonFormat,
   WorkflowPromptNodeCandidate,
   WorkflowPromptTagItem,
 } from '../types/studio';
+import { CHARACTER_FORBIDDEN_FEATURES } from '../data/presets';
 import {
   clampWeight,
   formatWeightedText,
+  isDollPlasticTextureTag,
   parseComfyErrorResponse,
   postProfileToComfyUI,
   sanitizeFilenamePrefix,
   splitPromptTags,
+  stripForbiddenAntiTextureFullText,
 } from './promptBuilder';
 import {
   computeBlobContentHash,
@@ -3587,5 +3591,380 @@ export async function loadFolderSyncStateSnapshot(
   const { entries, deletedTombstones } = await readFolderSyncIndex(rootHandle);
   return { entries, deletedTombstones };
 }
+
+function stripTokenWeightForClassify(raw: string): string {
+  return raw
+    .trim()
+    .replace(/^\((.+):[0-9.]+\)$/g, '$1')
+    .replace(/[()[\]]/g, '')
+    .replace(/:[0-9.]+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function pickFinitePositiveNumber(val: unknown): number | undefined {
+  if (typeof val === 'number' && Number.isFinite(val) && val > 0) return val;
+  if (typeof val === 'string' && val.trim()) {
+    const num = Number(val.trim());
+    if (Number.isFinite(num) && num > 0) return num;
+  }
+  return undefined;
+}
+
+function pickFiniteNonNegativeNumber(val: unknown): number | undefined {
+  if (typeof val === 'number' && Number.isFinite(val) && val >= 0) return val;
+  if (typeof val === 'string' && val.trim()) {
+    const num = Number(val.trim());
+    if (Number.isFinite(num) && num >= 0) return num;
+  }
+  return undefined;
+}
+
+export function extractCardGenerationParams(
+  card: WorkflowCollectionCard
+): ExtractedCardGenerationParams {
+  const result: ExtractedCardGenerationParams = {};
+  let graph: ComfyApiGraph | null = null;
+  let sourceLabel = '';
+
+  if (card.apiPromptJson) {
+    try {
+      const parsed = JSON.parse(card.apiPromptJson);
+      if (isApiPromptDict(parsed)) {
+        graph = parsed;
+        sourceLabel = 'API 节点图';
+      }
+    } catch {
+      graph = null;
+    }
+  }
+
+  if (!graph && card.rawWorkflowJson) {
+    try {
+      const parsedRaw = JSON.parse(card.rawWorkflowJson) as Record<string, unknown>;
+      if (isApiPromptDict(parsedRaw)) {
+        graph = parsedRaw;
+        sourceLabel = 'API 工作流';
+      } else if (isUiWorkflowObject(parsedRaw)) {
+        graph = convertUiWorkflowToApiPrompt(parsedRaw);
+        if (graph) {
+          sourceLabel = 'UI 工作流';
+        }
+      } else if (
+        parsedRaw &&
+        typeof parsedRaw === 'object' &&
+        parsedRaw.format === 'a1111-png-parameters'
+      ) {
+        const steps = pickFinitePositiveNumber(parsedRaw.steps);
+        const cfg = pickFinitePositiveNumber(parsedRaw.cfg);
+        const seed = pickFiniteNonNegativeNumber(parsedRaw.seed);
+        const sampler =
+          typeof parsedRaw.sampler === 'string' && parsedRaw.sampler.trim()
+            ? parsedRaw.sampler.trim()
+            : undefined;
+        if (steps !== undefined) result.steps = Math.round(steps);
+        if (cfg !== undefined) result.cfg = cfg;
+        if (seed !== undefined) result.seed = Math.floor(seed);
+        if (sampler) result.sampler = sampler;
+        sourceLabel = 'PNG 参数块';
+      }
+    } catch {
+      graph = null;
+    }
+  }
+
+  if (graph) {
+    const nodes = Object.values(graph);
+    const samplers = nodes.filter((n) => SAMPLER_NODE_TYPES.has(n.class_type));
+
+    for (const s of samplers) {
+      const inp = s.inputs ?? {};
+      if (result.steps === undefined) {
+        const steps = pickFinitePositiveNumber(inp.steps);
+        if (steps !== undefined) result.steps = Math.round(steps);
+      }
+      if (result.cfg === undefined) {
+        const cfg = pickFinitePositiveNumber(inp.cfg);
+        if (cfg !== undefined) result.cfg = cfg;
+      }
+      if (result.sampler === undefined && typeof inp.sampler_name === 'string' && inp.sampler_name.trim()) {
+        result.sampler = inp.sampler_name.trim();
+      }
+      if (result.scheduler === undefined && typeof inp.scheduler === 'string' && inp.scheduler.trim()) {
+        result.scheduler = inp.scheduler.trim();
+      }
+      if (result.denoise === undefined) {
+        const denoise = pickFinitePositiveNumber(inp.denoise);
+        if (denoise !== undefined && denoise <= 1.0) result.denoise = denoise;
+      }
+      if (result.seed === undefined) {
+        const seed =
+          pickFiniteNonNegativeNumber(inp.seed) ??
+          pickFiniteNonNegativeNumber(inp.noise_seed);
+        if (seed !== undefined) result.seed = Math.floor(seed);
+      }
+    }
+
+    for (const node of nodes) {
+      const inp = node.inputs ?? {};
+      if (node.class_type === 'RandomNoise' && result.seed === undefined) {
+        const seed = pickFiniteNonNegativeNumber(inp.noise_seed);
+        if (seed !== undefined) result.seed = Math.floor(seed);
+      }
+      if (node.class_type === 'KSamplerSelect' && result.sampler === undefined) {
+        if (typeof inp.sampler_name === 'string' && inp.sampler_name.trim()) {
+          result.sampler = inp.sampler_name.trim();
+        }
+      }
+      if (node.class_type === 'BasicScheduler') {
+        if (result.scheduler === undefined && typeof inp.scheduler === 'string' && inp.scheduler.trim()) {
+          result.scheduler = inp.scheduler.trim();
+        }
+        if (result.steps === undefined) {
+          const steps = pickFinitePositiveNumber(inp.steps);
+          if (steps !== undefined) result.steps = Math.round(steps);
+        }
+        if (result.denoise === undefined) {
+          const denoise = pickFinitePositiveNumber(inp.denoise);
+          if (denoise !== undefined && denoise <= 1.0) result.denoise = denoise;
+        }
+      }
+      if (node.class_type === 'CFGGuider' && result.cfg === undefined) {
+        const cfg = pickFinitePositiveNumber(inp.cfg);
+        if (cfg !== undefined) result.cfg = cfg;
+      }
+      if (
+        (result.width === undefined || result.height === undefined) &&
+        (/LatentImage/i.test(node.class_type) || node.class_type === 'CLIPTextEncodeSDXL')
+      ) {
+        const w = pickFinitePositiveNumber(inp.width);
+        const h = pickFinitePositiveNumber(inp.height);
+        if (w !== undefined && w >= 64 && h !== undefined && h >= 64) {
+          result.width = Math.round(w);
+          result.height = Math.round(h);
+        }
+      }
+    }
+
+    // Fallback: any node carrying numeric width & height >= 128
+    if (result.width === undefined || result.height === undefined) {
+      for (const node of nodes) {
+        const w = pickFinitePositiveNumber(node.inputs?.width);
+        const h = pickFinitePositiveNumber(node.inputs?.height);
+        if (w !== undefined && w >= 128 && h !== undefined && h >= 128) {
+          result.width = Math.round(w);
+          result.height = Math.round(h);
+          break;
+        }
+      }
+    }
+  }
+
+  if (
+    (result.width === undefined || result.height === undefined) &&
+    card.originalImageWidth &&
+    card.originalImageHeight
+  ) {
+    result.width = card.originalImageWidth;
+    result.height = card.originalImageHeight;
+    if (!sourceLabel) sourceLabel = '参考图尺寸';
+  }
+
+  if (sourceLabel) {
+    result.sourceLabel = sourceLabel;
+  }
+
+  return result;
+}
+
+const STUDIO_BOILERPLATE_TOKEN_RE =
+  /^(?:solo|1girl|2girls|3girls|multiple girls|1boy|2boys|masterpiece|best quality|high quality|amazing quality|very aesthetic|aesthetic|newest|recent|absurdres|highres|ultra detailed|extremely detailed|detailed|anime style|anime illustration|anime coloring|flat color|cell shading|source_anime|safe|general|sensitive|questionable|explicit|nsfw|sfw|upper body|cowboy shot|half body|full body|portrait|chibi|flat chest|small breasts|slender|narrow waist|petite|small stature|short legs|stubby legs|childlike proportions|small body|baby|loli|toddlercon|lolicon|pedo|narrow shoulders|toddling|looking at viewer)$/i;
+
+const META_PREFIX_TOKEN_RE = /^(?:rating:|score_|year\s+\d{4}|20\d{2}s?$|by\s+|@|<lora:)/i;
+
+const SERIES_CHARACTER_TAG_RE =
+  /\(\s*(?:blue archive|genshin impact|honkai[^)]*|arknights|fate[^)]*|hololive|azur lane|uma musume|princess connect[^)]*|touhou|vocaloid)\s*\)$/i;
+
+const IDENTITY_HAIR_EYES_SPECIES_RE =
+  /\b(?:(?:black|blonde|golden|silver|white|grey|gray|pink|blue|red|green|purple|lavender|orange|brown|aqua|cyan|mint|dark|light|two-tone|gradient|multicolored|streaked)\s+hair|(?:long|short|medium|very\s+long|shoulder\s+length|waist\s+length|floor\s+length)\s+hair|twintails?|low\s+twintails?|twin\s+braids?|ponytail|side\s+ponytail|high\s+ponytail|hair\s+bun|double\s+bun|bob\s+cut|hime\s+cut|ahoge|hair\s+over\s+one\s+eye|(?:blunt|parted|swept|crossed|side|asymmetrical)\s+bangs|bangs|sidelocks|messy\s+hair|wavy\s+hair|curly\s+hair|straight\s+hair|braided\s+hair|braids|(?:blue|red|pink|purple|violet|yellow|golden|amber|green|emerald|brown|black|orange|silver|grey|gray|gradient)\s+eyes?|heterochromia|cat\s+ears?|fox\s+ears?|animal\s+ears?|bunny\s+ears?|rabbit\s+ears?|dog\s+ears?|wolf\s+ears?|elf\s+ears?|pointy\s+ears?|demon\s+horns?|devil\s+horns?|horns|angel\s+wings?|bat\s+wings?|demon\s+wings?|wings|devil\s+tail|cat\s+tail|fox\s+tail|tail|halo)\b/i;
+
+const APPLY_BG_TOKEN_RE =
+  /\b(?:background|indoors?|outdoors?|classroom|bedroom|living room|park|garden|street|beach|poolside|sky|clouds|window|sunlight|moonlight|curtains|desk|sofa|couch|chair|table|floor|wooden floor|wall|trees|sakura|cherry blossom|night|starry|cafe|library|backdrop|depth of field|scenery|bokeh|room|balcony|hallway|kitchen|meadow|forest|snow|rain)\b/i;
+
+const APPLY_EXPR_TOKEN_RE =
+  /\b(?:smile|smiling|grin|laugh|laughing|blush|blushing|rosy cheeks|wink|winking|closed eyes|eyes closed|half-closed|open mouth|closed mouth|parted lips|pout|pouting|tears|crying|happy|cheerful|shy|embarrassed|surprised|shocked|sleepy|drowsy|yawn|smug|playful|stare|gaze|looking away|looking back|looking down|looking up|tongue out|blep|sparkles in eyes|heart-shaped pupils|star-shaped pupils|expression|frown|nervous|flustered)\b|>_<|:3|\^_\^/i;
+
+const APPLY_POSE_TOKEN_RE =
+  /\b(?:standing|sitting|seated|kneeling|crouching|squatting|lying|leaning|jumping|running|walking|tilting head|head tilt|hand|hands|arm|arms|finger|fingers|peace sign|v sign|double peace|wave|waving|pointing|hugging|hug|holding|crossed|behind back|on hip|on cheek|chin|skirt lift|twirling|pose|posture|dynamic|facing|turned|tiptoes|one leg|salute|fists|outstretched|reaching|clasped|resting|peeking)\b/i;
+
+export interface PreparedCardPromptsForApply {
+  rawPositive: string;
+  rawNegative: string;
+  outfitText: string;
+  poseText: string;
+  expressionText: string;
+  backgroundText: string;
+  negativeText: string;
+  strippedIdentityTags: string[];
+  strippedNegativeTags: string[];
+}
+
+export function prepareCardPromptsForCharacterApply(
+  card: WorkflowCollectionCard,
+  options?: {
+    knownCharacterHints?: string[];
+    preserveIdentityAndHair?: boolean;
+    sourceScope?: 'effective' | 'extracted';
+  }
+): PreparedCardPromptsForApply {
+  const preserveIdentity = options?.preserveIdentityAndHair ?? true;
+  const useExtractedOnly = options?.sourceScope === 'extracted';
+  const rawPositive = (
+    useExtractedOnly
+      ? card.extractedPositive
+      : card.applyFineTuneOnSend
+      ? card.fineTunedPositive || card.extractedPositive
+      : card.extractedPositive || card.fineTunedPositive
+  ).trim();
+  const rawNegative = (
+    useExtractedOnly
+      ? card.extractedNegative
+      : card.applyFineTuneOnSend
+      ? card.fineTunedNegative || card.extractedNegative
+      : card.extractedNegative || card.fineTunedNegative
+  ).trim();
+
+  const hintMatchers: RegExp[] = [];
+  for (const rawHint of options?.knownCharacterHints ?? []) {
+    const cleanHint = rawHint.trim().toLowerCase();
+    if (!cleanHint) continue;
+    const escapedFull = cleanHint.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    hintMatchers.push(new RegExp(`^${escapedFull}$`, 'i'));
+    const baseName = cleanHint.replace(/\s*\([^)]*\)\s*/g, '').trim();
+    if (baseName.length >= 2) {
+      const escapedBase = baseName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      hintMatchers.push(
+        /[\u4e00-\u9fa5]/.test(baseName)
+          ? new RegExp(escapedBase, 'i')
+          : new RegExp(`\\b${escapedBase}\\b`, 'i')
+      );
+    }
+  }
+
+  const forbiddenFeatureMatchers = CHARACTER_FORBIDDEN_FEATURES.map((feat) => {
+    const escaped = feat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`\\b${escaped}\\b`, 'i');
+  });
+
+  const posAntiTex = stripForbiddenAntiTextureFullText(rawPositive);
+  const posTokens = splitPromptTags(posAntiTex.cleanedText);
+  const strippedIdentityTags: string[] = [...posAntiTex.removedTerms];
+
+  const outfitList: string[] = [];
+  const poseList: string[] = [];
+  const expressionList: string[] = [];
+  const backgroundList: string[] = [];
+  const seenKeys = new Set<string>();
+
+  for (const token of posTokens) {
+    const bare = stripTokenWeightForClassify(token);
+    if (!bare) continue;
+    const lower = bare.toLowerCase();
+
+    if (isDollPlasticTextureTag(token)) {
+      strippedIdentityTags.push(bare);
+      continue;
+    }
+
+    if (STUDIO_BOILERPLATE_TOKEN_RE.test(lower) || META_PREFIX_TOKEN_RE.test(lower)) {
+      strippedIdentityTags.push(bare);
+      continue;
+    }
+
+    if (preserveIdentity) {
+      const isIdentityHit =
+        SERIES_CHARACTER_TAG_RE.test(lower) ||
+        IDENTITY_HAIR_EYES_SPECIES_RE.test(lower) ||
+        forbiddenFeatureMatchers.some((re) => re.test(lower)) ||
+        hintMatchers.some((re) => re.test(lower));
+      if (isIdentityHit) {
+        strippedIdentityTags.push(bare);
+        continue;
+      }
+    }
+
+    if (seenKeys.has(lower)) continue;
+    seenKeys.add(lower);
+
+    if (APPLY_BG_TOKEN_RE.test(lower)) {
+      backgroundList.push(token);
+    } else if (APPLY_EXPR_TOKEN_RE.test(lower)) {
+      expressionList.push(token);
+    } else if (APPLY_POSE_TOKEN_RE.test(lower)) {
+      poseList.push(token);
+    } else {
+      outfitList.push(token);
+    }
+  }
+
+  // 负向提示词安全清洗：遵循铁律 2（严禁含发色/发型/瞳色/专属配件）并剔除塑料/人偶质感词
+  const negAntiTex = stripForbiddenAntiTextureFullText(rawNegative);
+  const strippedNegativeTags: string[] = [...negAntiTex.removedTerms];
+  const safeNegList: string[] = [];
+  const seenNegKeys = new Set<string>();
+
+  for (const token of splitPromptTags(negAntiTex.cleanedText)) {
+    const bare = stripTokenWeightForClassify(token);
+    if (!bare) continue;
+    const lower = bare.toLowerCase();
+    if (isDollPlasticTextureTag(token)) {
+      strippedNegativeTags.push(bare);
+      continue;
+    }
+    if (forbiddenFeatureMatchers.some((re) => re.test(lower))) {
+      strippedNegativeTags.push(bare);
+      continue;
+    }
+    if (seenNegKeys.has(lower)) continue;
+    seenNegKeys.add(lower);
+    safeNegList.push(token);
+  }
+
+  return {
+    rawPositive,
+    rawNegative,
+    outfitText: outfitList.join(', '),
+    poseText: poseList.join(', '),
+    expressionText: expressionList.join(', '),
+    backgroundText: backgroundList.join(', '),
+    negativeText: safeNegList.join(', '),
+    strippedIdentityTags: Array.from(new Set(strippedIdentityTags)),
+    strippedNegativeTags: Array.from(new Set(strippedNegativeTags)),
+  };
+}
+
+export function mergePromptSlotTexts(
+  existingText: string,
+  incomingText: string,
+  mode: 'replace' | 'append'
+): string {
+  const incomingTrimmed = incomingText.trim();
+  if (mode === 'replace') {
+    return incomingTrimmed;
+  }
+  const existingTokens = splitPromptTags(existingText);
+  const incomingTokens = splitPromptTags(incomingTrimmed);
+  const seen = new Set<string>();
+  const merged: string[] = [];
+  for (const token of [...existingTokens, ...incomingTokens]) {
+    const key = stripTokenWeightForClassify(token).toLowerCase();
+    if (!key) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(token.trim());
+  }
+  return merged.join(', ');
+}
+
 
 
