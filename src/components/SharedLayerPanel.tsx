@@ -455,7 +455,7 @@ export const SharedLayerPanel: React.FC<SharedLayerPanelProps> = ({
             onToggleExpand={() => toggleSlot('styleAnchor')}
             onTextChange={(text) => updatePositiveSlot('styleAnchor', { text })}
             onWeightChange={(weight) => updatePositiveSlot('styleAnchor', { weight })}
-            placeholder="@4x0style"
+            placeholder="akistyle"
           />
           <CompactSlotRow
             label="构图"

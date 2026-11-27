@@ -1639,7 +1639,7 @@ export const DEFAULT_STUDIO_CONFIG: StudioConfig = {
   activeComfyProfileId: 'profile-anima-4char',
   shared: {
     styleAnchor: {
-      text: '@4x0style',
+      text: '@4x0style, akistyle',
       weight: 1.0,
     },
     background: {
@@ -1686,9 +1686,9 @@ export const DEFAULT_STUDIO_CONFIG: StudioConfig = {
       name: '伊 (Yi · Ibuki)',
       hairstyleId: 'hair-side-ponytail',
       hairBangsId: 'bangs-default',
-      hairAccessoryId: 'acc-preset-bow',
+      hairAccessoryId: null,
       appearance: {
-        text: '(pointed ears:1.3), (small demon horns:1.3), (golden spiked halo:1.4), (black bat wings:1.3), (heart shaped demon tail:1.3), (blonde hair:1.3), (side ponytail:1.7), (ponytail on side:1.5), (swept bangs:1.3), loose hair strands framing face, (black bow:1.5), (hair bow on the side:1.3), yellow eyes, long eyelashes, (fair skin:1.1)',
+        text: '(ibuki (blue archive):1.1), (pointed ears:1.3), (small demon horns:1.3), (golden spiked halo:1.4), (black bat wings:1.3), (heart shaped demon tail:1.3), (blonde hair:1.3), (side ponytail:1.7), (ponytail on side:1.5), (swept bangs:1.3), loose hair strands framing face, yellow eyes, long eyelashes, (fair skin:1.1)',
         weight: 1.0,
       },
       outfit: {

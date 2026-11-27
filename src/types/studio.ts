@@ -321,6 +321,8 @@ export interface CardApplyToCharacterPayload {
   applySamplingParams: boolean;
   samplingParams?: ExtractedCardGenerationParams;
   switchAndClose: boolean;
+  persistToCharacter?: boolean;
+  runDirectly?: boolean;
 }
 
 

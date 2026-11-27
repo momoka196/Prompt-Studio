@@ -465,6 +465,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   const [applyStrippedIdentityTags, setApplyStrippedIdentityTags] = useState<string[]>([]);
   const [applyStrippedNegativeTags, setApplyStrippedNegativeTags] = useState<string[]>([]);
   const [applySwitchAndClose, setApplySwitchAndClose] = useState<boolean>(true);
+  const [applyPersistToChar, setApplyPersistToChar] = useState<boolean>(false);
   const [applyErrorMsg, setApplyErrorMsg] = useState<string | null>(null);
 
   const imageInputRef = useRef<HTMLInputElement | null>(null);
@@ -961,6 +962,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         applySamplingParams: hasSampling,
         samplingParams: hasSampling ? applyExtractedParams : undefined,
         switchAndClose: applySwitchAndClose,
+        persistToCharacter: applyPersistToChar,
       });
 
       if (!res.ok) {
@@ -992,6 +994,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       applyOutfit,
       applyOutfitMode,
       applyOutfitText,
+      applyPersistToChar,
       applyPose,
       applyPoseMode,
       applyPoseText,
@@ -1003,6 +1006,8 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       onApplyCardToCharacter,
     ]
   );
+
+
 
   const openFineTuner = useCallback((card: WorkflowCollectionCard, initialTab: 'positive' | 'negative' = 'positive') => {
     setEditingCardId(card.id);
@@ -2275,6 +2280,114 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       });
     }
   };
+
+  const handleConfirmApplyAndRun = useCallback(
+    async (e?: React.SyntheticEvent) => {
+      if (e) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+      if (!applyingCard || !onApplyCardToCharacter) return;
+      if (!applyTargetCharId) {
+        setApplyErrorMsg('请先选择要套用的目标角色');
+        return;
+      }
+
+      const hasOutfit = applyOutfit && applyOutfitText.trim().length > 0;
+      const hasPose = applyPose && applyPoseText.trim().length > 0;
+      const hasExpr = applyExpression && applyExpressionText.trim().length > 0;
+      const hasBg = applyBackground && applyBackgroundText.trim().length > 0;
+      const hasNeg = applyNegative && applyNegativeText.trim().length > 0;
+      const hasSampling =
+        applySamplingParams &&
+        Boolean(
+          applyExtractedParams.width ||
+            applyExtractedParams.height ||
+            applyExtractedParams.steps ||
+            applyExtractedParams.cfg ||
+            applyExtractedParams.sampler ||
+            applyExtractedParams.scheduler ||
+            applyExtractedParams.denoise !== undefined ||
+            applyExtractedParams.seed !== undefined
+        );
+
+      const res = onApplyCardToCharacter({
+        cardId: applyingCard.id,
+        cardTitle: applyingCard.title,
+        targetCharacterId: applyTargetCharId,
+        applyOutfit: hasOutfit,
+        outfitText: applyOutfitText,
+        outfitMode: applyOutfitMode,
+        applyPose: hasPose,
+        poseText: applyPoseText,
+        poseMode: applyPoseMode,
+        applyExpression: hasExpr,
+        expressionText: applyExpressionText,
+        expressionMode: applyExpressionMode,
+        applyBackground: hasBg,
+        backgroundText: applyBackgroundText,
+        backgroundMode: applyBackgroundMode,
+        applyNegative: hasNeg,
+        negativeText: applyNegativeText,
+        negativeMode: applyNegativeMode,
+        applySamplingParams: hasSampling,
+        samplingParams: hasSampling ? applyExtractedParams : undefined,
+        switchAndClose: true,
+        persistToCharacter: applyPersistToChar,
+        runDirectly: true,
+      });
+
+      if (!res.ok) {
+        setApplyErrorMsg(res.error ?? '复刻应用失败');
+        return;
+      }
+
+      setApplyingCardId(null);
+
+      const targetChar = characters.find((c) => c.id === applyTargetCharId);
+      const charAppearance = targetChar?.appearance.text.trim() ?? '';
+      const combinedPos = [
+        charAppearance,
+        hasOutfit ? applyOutfitText.trim() : '',
+        hasPose ? applyPoseText.trim() : '',
+        hasExpr ? applyExpressionText.trim() : '',
+        applyingCard.extractedPositive,
+      ].filter(Boolean).join(', ');
+
+      const runCard: WorkflowCollectionCard = {
+        ...applyingCard,
+        fineTunedPositive: combinedPos,
+        applyFineTuneOnSend: true,
+      };
+
+      await handleRunCard(runCard);
+    },
+    [
+      applyBackground,
+      applyBackgroundMode,
+      applyBackgroundText,
+      applyExpression,
+      applyExpressionMode,
+      applyExpressionText,
+      applyExtractedParams,
+      applyNegative,
+      applyNegativeMode,
+      applyNegativeText,
+      applyOutfit,
+      applyOutfitMode,
+      applyOutfitText,
+      applyPersistToChar,
+      applyPose,
+      applyPoseMode,
+      applyPoseText,
+      applySamplingParams,
+      applyTargetCharId,
+      applyingCard,
+      characters,
+      handleRunCard,
+      onApplyCardToCharacter,
+    ]
+  );
 
   // Tag Capsule & Textarea Bidirectional Handlers
   const activeTags = editTab === 'positive' ? editPosTags : editNegTags;
@@ -5521,24 +5634,36 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
               </div>
 
               {/* 弹窗底部确认栏 */}
-              <div className="shrink-0 px-4 sm:px-5 py-3 border-t border-[#EAEAEF] bg-[#FAFAFC] space-y-2">
+              <div className="shrink-0 px-4 sm:px-5 py-3 border-t border-[#EAEAEF] bg-[#FAFAFC] space-y-2.5">
                 {applyErrorMsg && (
                   <div className="rounded-[8px] border border-[#F5B8C4] bg-[#FFF1F3] px-3 py-1.5 text-[11.5px] text-[#B42343]">
                     {applyErrorMsg}
                   </div>
                 )}
-                <div className="flex flex-wrap items-center justify-between gap-2.5">
-                  <label className="inline-flex items-center gap-2 text-[12px] text-[#373C4B] cursor-pointer select-none">
-                    <input
-                      type="checkbox"
-                      checked={applySwitchAndClose}
-                      onChange={(e) => setApplySwitchAndClose(e.target.checked)}
-                      className="w-3.5 h-3.5 accent-[#7C5CFC]"
-                    />
-                    <span>套用后切换到该角色并返回主编辑区</span>
-                  </label>
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                  <div className="space-y-1.5">
+                    <label className="inline-flex items-center gap-2 text-[12px] text-[#373C4B] cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={applySwitchAndClose}
+                        onChange={(e) => setApplySwitchAndClose(e.target.checked)}
+                        className="w-3.5 h-3.5 accent-[#7C5CFC]"
+                      />
+                      <span>套用后切换到该角色并返回主编辑区</span>
+                    </label>
+                    <br />
+                    <label className="inline-flex items-center gap-2 text-[11.5px] text-[#686E7E] cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={applyPersistToChar}
+                        onChange={(e) => setApplyPersistToChar(e.target.checked)}
+                        className="w-3.5 h-3.5 accent-[#7C5CFC]"
+                      />
+                      <span>同时永久保存到角色卡定义（默认仅临时切角生图，保护原角色参数）</span>
+                    </label>
+                  </div>
 
-                  <div className="flex items-center gap-2 shrink-0">
+                  <div className="flex items-center gap-2 shrink-0 pt-1 sm:pt-0">
                     <button
                       type="button"
                       onClick={(e) => {
@@ -5553,14 +5678,21 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                     <button
                       type="button"
                       onClick={(e) => handleConfirmApplyToCharacter(e)}
-                      className="h-9 px-4 inline-flex items-center gap-1.5 rounded-[10px] bg-gradient-to-b from-[#F07187] to-[#E85D75] text-white text-[12px] font-semibold shadow-[0_2px_8px_rgba(232,93,117,0.28)] hover:brightness-105 cursor-pointer whitespace-nowrap"
+                      className="h-9 px-3.5 rounded-[10px] border border-[#DDD8FA] bg-[#F5F2FF] text-[#5B3DF5] text-[12px] font-semibold hover:bg-[#EDE9FE] cursor-pointer whitespace-nowrap"
                     >
-                      <UserCheck className="w-4 h-4" />
+                      <span>仅套用并返回</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => handleConfirmApplyAndRun(e)}
+                      className="h-9 px-4 inline-flex items-center gap-1.5 rounded-[10px] bg-gradient-to-b from-[#7C5CFC] to-[#6342E8] text-white text-[12px] font-semibold shadow-[0_2px_8px_rgba(124,92,252,0.32)] hover:brightness-105 cursor-pointer whitespace-nowrap"
+                    >
+                      <Play className="w-4 h-4 fill-current" />
                       <span>
-                        确认用「
+                        复刻并直接发往 ComfyUI 生图（
                         {characters.find((c) => c.id === applyTargetCharId)?.name ??
                           '角色'}
-                        」复刻收藏图
+                        ）
                       </span>
                     </button>
                   </div>
