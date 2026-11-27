@@ -94,6 +94,7 @@ import {
   saveCardImageBlob,
   saveDeletedCardTombstones,
 } from '../utils/storageCache';
+import { useVirtualGrid } from '../utils/useVirtualGrid';
 
 interface WorkflowCollectionModalProps {
   open: boolean;
@@ -356,7 +357,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   const [activeTagFilter, setActiveTagFilter] = useState<string>('ALL');
   const [showAllTags, setShowAllTags] = useState(false);
   const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState<24 | 48 | 96>(24);
+  const [pageSize, setPageSize] = useState<'all' | 24 | 48 | 96>('all');
 
   // Batch organization mode
   const [batchSelectMode, setBatchSelectMode] = useState(false);
@@ -609,12 +610,26 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     });
   }, [scopedCards, activeTagFilter, debouncedSearch]);
 
-  const totalPages = Math.max(1, Math.ceil(filteredCards.length / pageSize));
+  const totalPages =
+    pageSize === 'all' ? 1 : Math.max(1, Math.ceil(filteredCards.length / pageSize));
   const safePage = Math.min(page, totalPages);
   const pagedCards = useMemo(() => {
+    if (pageSize === 'all') return filteredCards;
     const start = (safePage - 1) * pageSize;
     return filteredCards.slice(start, start + pageSize);
   }, [filteredCards, safePage, pageSize]);
+
+  const virtualGrid = useVirtualGrid({
+    itemCount: pagedCards.length,
+    scrollContainerRef: bodyScrollRef,
+    gridContainerRef: cardGridRef,
+    enabled: open && pagedCards.length > 0,
+    estimatedRowHeight: 276,
+    rowGap: 14,
+    overscanRows: 2,
+    resetKey: `${safePage}:${pageSize}:${privateView}:${activeTagFilter}:${debouncedSearch}`,
+    layoutKey: `${createPanelOpen}:${Boolean(folderNotice)}:${Boolean(importNotice)}:${Boolean(storageWarning)}:${runStatus.state}:${batchSelectMode}:${Boolean(batchProgress)}:${Boolean(syncProgress)}:${Boolean(scanProgress)}:${showAllTags}:${allCategoryTags.length}:${showSkippedDetails}:${skippedDetails.length}`,
+  });
 
   const scopedCardsRef = useRef<WorkflowCollectionCard[]>(scopedCards);
   scopedCardsRef.current = scopedCards;
@@ -3636,255 +3651,296 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
               )}
             </div>
           ) : (
-            <div ref={cardGridRef} className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3.5">
-              {pagedCards.map((card) => {
-                const isSendingThis =
-                  runStatus.state === 'sending' && runStatus.cardId === card.id;
-                const isSelected = selectedCardIds.has(card.id);
-                const posDisplay = card.applyFineTuneOnSend
-                  ? card.fineTunedPositive
-                  : card.extractedPositive;
-                const negDisplay = card.applyFineTuneOnSend
-                  ? card.fineTunedNegative
-                  : card.extractedNegative;
-                const hasModified =
-                  card.fineTunedPositive.trim() !== card.extractedPositive.trim() ||
-                  card.fineTunedNegative.trim() !== card.extractedNegative.trim();
+            <div ref={cardGridRef} className="w-full">
+              {virtualGrid.topSpacerHeight > 0 && (
+                <div
+                  style={{ height: `${virtualGrid.topSpacerHeight}px` }}
+                  aria-hidden="true"
+                />
+              )}
+              {virtualGrid.endRow >= virtualGrid.startRow &&
+                Array.from(
+                  { length: virtualGrid.endRow - virtualGrid.startRow + 1 },
+                  (_, idx) => virtualGrid.startRow + idx
+                ).map((rowIndex) => {
+                  const rowStart = rowIndex * virtualGrid.columnCount;
+                  const rowCards = pagedCards.slice(
+                    rowStart,
+                    rowStart + virtualGrid.columnCount
+                  );
+                  const rowColsClass =
+                    virtualGrid.columnCount === 1
+                      ? 'grid-cols-1'
+                      : virtualGrid.columnCount === 2
+                      ? 'grid-cols-2'
+                      : 'grid-cols-3';
 
-                return (
-                  <article
-                    key={card.id}
-                    data-card-id={card.id}
-                    onClick={
-                      batchSelectMode
-                        ? (e) => {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            toggleCardSelectionInBatch(card.id, e.shiftKey);
-                          }
-                        : undefined
-                    }
-                    className={`rounded-[14px] border overflow-hidden flex flex-col transition-colors ${
-                      batchSelectMode ? 'cursor-pointer select-none' : ''
-                    } ${
-                      isSelected
-                        ? 'border-[#7C5CFC] bg-[#FAF8FF] ring-2 ring-[#7C5CFC]/25'
-                        : 'border-[#E0E0E6] bg-white hover:border-[#7C5CFC]/45'
-                    }`}
-                  >
-                    {/* 缩略图与头部 */}
-                    <div className="flex gap-3 p-3.5 border-b border-[#EAEAEF]">
-                      {batchSelectMode && (
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            toggleCardSelectionInBatch(card.id, e.shiftKey);
-                          }}
-                          aria-label={isSelected ? '取消选择此卡片' : '选择此卡片'}
-                          className={`self-start w-7 h-7 rounded-[8px] border flex items-center justify-center transition-colors cursor-pointer shrink-0 ${
-                            isSelected
-                              ? 'border-[#7C5CFC] bg-[#7C5CFC] text-white'
-                              : 'border-[#D2D4DF] bg-[#FAFAFC] text-[#949AA8] hover:border-[#7C5CFC]/60 hover:text-[#6B48F5]'
-                          }`}
-                        >
-                          {isSelected ? (
-                            <CheckSquare className="w-4 h-4" />
-                          ) : (
-                            <Square className="w-4 h-4" />
-                          )}
-                        </button>
-                      )}
+                  return (
+                    <div
+                      key={`vrow-${rowIndex}`}
+                      ref={virtualGrid.measureRowRef(rowIndex)}
+                      data-virtual-row={rowIndex}
+                      className={`grid ${rowColsClass} gap-3.5 ${
+                        rowIndex < virtualGrid.totalRows - 1 ? 'mb-3.5' : ''
+                      }`}
+                    >
+                      {rowCards.map((card) => {
+                        const isSendingThis =
+                          runStatus.state === 'sending' && runStatus.cardId === card.id;
+                        const isSelected = selectedCardIds.has(card.id);
+                        const posDisplay = card.applyFineTuneOnSend
+                          ? card.fineTunedPositive
+                          : card.extractedPositive;
+                        const negDisplay = card.applyFineTuneOnSend
+                          ? card.fineTunedNegative
+                          : card.extractedNegative;
+                        const hasModified =
+                          card.fineTunedPositive.trim() !== card.extractedPositive.trim() ||
+                          card.fineTunedNegative.trim() !== card.extractedNegative.trim();
 
-                      <CardThumbnailPreview
-                        card={card}
-                        onOpenLightbox={handleOpenLightbox}
-                      />
-
-                      <div className="min-w-0 flex-1 flex flex-col justify-between">
-                        <div className="space-y-1">
-                          <div className="flex items-start justify-between gap-1.5">
-                            <h4 className="text-[13.5px] font-semibold text-[#1E2028] leading-snug line-clamp-2 break-words">
-                              {card.title}
-                            </h4>
-                            <div className="flex items-center gap-1 shrink-0">
-                              <button
-                                type="button"
-                                onClick={(e) => handleToggleCardPrivate(card.id, e)}
-                                title={card.isPrivate ? '取消私密并移回公开列表' : '设为私密（移入私密区）'}
-                                className={`h-7 px-2 inline-flex items-center gap-1 rounded-[7px] border text-[10.5px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
-                                  card.isPrivate
-                                    ? 'border-[#F5B8C4] bg-[#FFF1F3] text-[#C93B58] hover:border-[#E85D75]'
-                                    : 'border-[#E0E0E6] bg-white text-[#686E7E] hover:border-[#E85D75]/50 hover:text-[#C93B58]'
-                                }`}
-                              >
-                                {card.isPrivate ? (
-                                  <Eye className="w-3 h-3" />
-                                ) : (
-                                  <EyeOff className="w-3 h-3" />
-                                )}
-                                <span>{card.isPrivate ? '取消私密' : '设为私密'}</span>
-                              </button>
-                              {cardHasImage(card) && (
+                        return (
+                          <article
+                            key={card.id}
+                            data-card-id={card.id}
+                            onClick={
+                              batchSelectMode
+                                ? (e) => {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    toggleCardSelectionInBatch(card.id, e.shiftKey);
+                                  }
+                                : undefined
+                            }
+                            className={`rounded-[14px] border overflow-hidden flex flex-col transition-colors ${
+                              batchSelectMode ? 'cursor-pointer select-none' : ''
+                            } ${
+                              isSelected
+                                ? 'border-[#7C5CFC] bg-[#FAF8FF] ring-2 ring-[#7C5CFC]/25'
+                                : 'border-[#E0E0E6] bg-white hover:border-[#7C5CFC]/45'
+                            }`}
+                          >
+                            {/* 缩略图与头部 */}
+                            <div className="flex gap-3 p-3.5 border-b border-[#EAEAEF]">
+                              {batchSelectMode && (
                                 <button
                                   type="button"
                                   onClick={(e) => {
                                     e.preventDefault();
                                     e.stopPropagation();
-                                    void handleDownloadCardOriginalImage(card);
+                                    toggleCardSelectionInBatch(card.id, e.shiftKey);
                                   }}
-                                  title="下载原始参考图"
-                                  className="w-7 h-7 inline-flex items-center justify-center rounded-[7px] text-[#949AA8] hover:bg-[#F4F2FF] hover:text-[#7C5CFC] cursor-pointer"
+                                  aria-label={isSelected ? '取消选择此卡片' : '选择此卡片'}
+                                  className={`self-start w-7 h-7 rounded-[8px] border flex items-center justify-center transition-colors cursor-pointer shrink-0 ${
+                                    isSelected
+                                      ? 'border-[#7C5CFC] bg-[#7C5CFC] text-white'
+                                      : 'border-[#D2D4DF] bg-[#FAFAFC] text-[#949AA8] hover:border-[#7C5CFC]/60 hover:text-[#6B48F5]'
+                                  }`}
                                 >
-                                  <ImageDown className="w-3.5 h-3.5" />
+                                  {isSelected ? (
+                                    <CheckSquare className="w-4 h-4" />
+                                  ) : (
+                                    <Square className="w-4 h-4" />
+                                  )}
                                 </button>
                               )}
+
+                              <CardThumbnailPreview
+                                card={card}
+                                onOpenLightbox={handleOpenLightbox}
+                              />
+
+                              <div className="min-w-0 flex-1 flex flex-col justify-between">
+                                <div className="space-y-1">
+                                  <div className="flex items-start justify-between gap-1.5">
+                                    <h4 className="text-[13.5px] font-semibold text-[#1E2028] leading-snug line-clamp-2 break-words">
+                                      {card.title}
+                                    </h4>
+                                    <div className="flex items-center gap-1 shrink-0">
+                                      <button
+                                        type="button"
+                                        onClick={(e) => handleToggleCardPrivate(card.id, e)}
+                                        title={card.isPrivate ? '取消私密并移回公开列表' : '设为私密（移入私密区）'}
+                                        className={`h-7 px-2 inline-flex items-center gap-1 rounded-[7px] border text-[10.5px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                                          card.isPrivate
+                                            ? 'border-[#F5B8C4] bg-[#FFF1F3] text-[#C93B58] hover:border-[#E85D75]'
+                                            : 'border-[#E0E0E6] bg-white text-[#686E7E] hover:border-[#E85D75]/50 hover:text-[#C93B58]'
+                                        }`}
+                                      >
+                                        {card.isPrivate ? (
+                                          <Eye className="w-3 h-3" />
+                                        ) : (
+                                          <EyeOff className="w-3 h-3" />
+                                        )}
+                                        <span>{card.isPrivate ? '取消私密' : '设为私密'}</span>
+                                      </button>
+                                      {cardHasImage(card) && (
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.preventDefault();
+                                            e.stopPropagation();
+                                            void handleDownloadCardOriginalImage(card);
+                                          }}
+                                          title="下载原始参考图"
+                                          className="w-7 h-7 inline-flex items-center justify-center rounded-[7px] text-[#949AA8] hover:bg-[#F4F2FF] hover:text-[#7C5CFC] cursor-pointer"
+                                        >
+                                          <ImageDown className="w-3.5 h-3.5" />
+                                        </button>
+                                      )}
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.preventDefault();
+                                          e.stopPropagation();
+                                          handleDownloadCardJson(card);
+                                        }}
+                                        title="下载卡片工作流 JSON"
+                                        className="w-7 h-7 inline-flex items-center justify-center rounded-[7px] text-[#949AA8] hover:bg-[#F4F2FF] hover:text-[#7C5CFC] cursor-pointer"
+                                      >
+                                        <Download className="w-3.5 h-3.5" />
+                                      </button>
+                                      {boundDirHandle && (
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.preventDefault();
+                                            e.stopPropagation();
+                                            void handleWriteSingleCardToFolder(card);
+                                          }}
+                                          title="写入当前绑定的本地文件夹"
+                                          className="w-7 h-7 inline-flex items-center justify-center rounded-[7px] text-[#949AA8] hover:bg-emerald-50 hover:text-emerald-600 cursor-pointer"
+                                        >
+                                          <FolderSync className="w-3.5 h-3.5" />
+                                        </button>
+                                      )}
+                                      <button
+                                        type="button"
+                                        data-card-delete-btn={card.id}
+                                        onClick={(e) => handleDeleteCard(card.id, e)}
+                                        title="删除此卡片"
+                                        aria-label={`删除卡片 ${card.title}`}
+                                        className="w-7 h-7 inline-flex items-center justify-center rounded-[7px] text-[#949AA8] hover:bg-[#FFF1F3] hover:text-[#E85D75] cursor-pointer"
+                                      >
+                                        <Trash2 className="w-3.5 h-3.5" />
+                                      </button>
+                                    </div>
+                                  </div>
+
+                                  <div className="text-[11px] text-[#686E7E] truncate">
+                                    {card.tags.length > 0 ? card.tags.join(' · ') : '未分类'}
+                                  </div>
+                                </div>
+
+                                <div className="text-[10.5px] text-[#8E94A4] font-mono tabular-nums flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                                  <span>{formatFormatLabel(card.workflowFormat)}</span>
+                                  {card.originalImageWidth && card.originalImageHeight && (
+                                    <span>
+                                      · {card.originalImageWidth}×{card.originalImageHeight}
+                                    </span>
+                                  )}
+                                  {hasModified && (
+                                    <span className="text-[#6B48F5] font-sans font-medium">
+                                      · 已微调
+                                    </span>
+                                  )}
+                                  {card.lastPromptId && (
+                                    <span className="text-emerald-600">
+                                      · #{card.lastPromptId.slice(0, 6)}
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+
+                            {/* 可点击唤出微调的提示词摘要区（批量模式下点击同样快速勾选） */}
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                if (batchSelectMode) {
+                                  toggleCardSelectionInBatch(card.id, e.shiftKey);
+                                } else {
+                                  openFineTuner(card, 'positive');
+                                }
+                              }}
+                              title={
+                                batchSelectMode
+                                  ? '点击勾选/取消此卡片（按住 Shift 支持连选）'
+                                  : '点击唤出可视化 Tag 微调面板'
+                              }
+                              className={`flex-1 px-3.5 py-2.5 text-left transition-colors cursor-pointer space-y-1.5 ${
+                                isSelected
+                                  ? 'bg-[#F5F2FF]/80 hover:bg-[#EFEAFF]'
+                                  : 'bg-[#FAFAFC] hover:bg-[#F5F3FF]/60'
+                              }`}
+                            >
+                              <div className="text-[11px] text-[#373C4B] font-mono line-clamp-2 break-words leading-relaxed">
+                                <span className="font-sans font-semibold text-[#6B48F5] mr-1">
+                                  Pos:
+                                </span>
+                                {posDisplay || '（空）'}
+                              </div>
+                              <div className="text-[11px] text-[#686E7E] font-mono line-clamp-1 break-words">
+                                <span className="font-sans font-semibold text-[#E85D75] mr-1">
+                                  Neg:
+                                </span>
+                                {negDisplay || '（空）'}
+                              </div>
+                            </button>
+
+                            {/* 卡片底部操作栏 */}
+                            <div
+                              onClick={(e) => {
+                                if (batchSelectMode) {
+                                  e.stopPropagation();
+                                }
+                              }}
+                              className="px-3.5 py-2.5 bg-white border-t border-[#EAEAEF] flex items-center gap-2"
+                            >
                               <button
                                 type="button"
                                 onClick={(e) => {
                                   e.preventDefault();
                                   e.stopPropagation();
-                                  handleDownloadCardJson(card);
+                                  openFineTuner(card, 'positive');
                                 }}
-                                title="下载卡片工作流 JSON"
-                                className="w-7 h-7 inline-flex items-center justify-center rounded-[7px] text-[#949AA8] hover:bg-[#F4F2FF] hover:text-[#7C5CFC] cursor-pointer"
+                                className="flex-1 h-8 px-2.5 inline-flex items-center justify-center gap-1.5 text-[11.5px] font-medium rounded-[9px] border border-[#E0E0E6] bg-white text-[#4C5264] hover:border-[#7C5CFC]/50 hover:text-[#6B48F5] transition-colors whitespace-nowrap cursor-pointer"
                               >
-                                <Download className="w-3.5 h-3.5" />
+                                <SlidersHorizontal className="w-3.5 h-3.5" />
+                                <span>微调提示词</span>
                               </button>
-                              {boundDirHandle && (
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.preventDefault();
-                                    e.stopPropagation();
-                                    void handleWriteSingleCardToFolder(card);
-                                  }}
-                                  title="写入当前绑定的本地文件夹"
-                                  className="w-7 h-7 inline-flex items-center justify-center rounded-[7px] text-[#949AA8] hover:bg-emerald-50 hover:text-emerald-600 cursor-pointer"
-                                >
-                                  <FolderSync className="w-3.5 h-3.5" />
-                                </button>
-                              )}
+
                               <button
                                 type="button"
-                                data-card-delete-btn={card.id}
-                                onClick={(e) => handleDeleteCard(card.id, e)}
-                                title="删除此卡片"
-                                aria-label={`删除卡片 ${card.title}`}
-                                className="w-7 h-7 inline-flex items-center justify-center rounded-[7px] text-[#949AA8] hover:bg-[#FFF1F3] hover:text-[#E85D75] cursor-pointer"
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  void handleRunCard(card);
+                                }}
+                                disabled={isSendingThis}
+                                className="flex-1 h-8 px-2.5 inline-flex items-center justify-center gap-1.5 text-[11.5px] font-medium rounded-[9px] bg-gradient-to-b from-[#8A6CFF] to-[#7C5CFC] text-white shadow-[0_2px_6px_rgba(124,92,252,0.24)] hover:brightness-105 disabled:opacity-50 transition-all whitespace-nowrap cursor-pointer"
                               >
-                                <Trash2 className="w-3.5 h-3.5" />
+                                {isSendingThis ? (
+                                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                ) : (
+                                  <Play className="w-3.5 h-3.5" />
+                                )}
+                                <span>{isSendingThis ? '发送中...' : '运行发送 UI'}</span>
                               </button>
                             </div>
-                          </div>
-
-                          <div className="text-[11px] text-[#686E7E] truncate">
-                            {card.tags.length > 0 ? card.tags.join(' · ') : '未分类'}
-                          </div>
-                        </div>
-
-                        <div className="text-[10.5px] text-[#8E94A4] font-mono tabular-nums flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                          <span>{formatFormatLabel(card.workflowFormat)}</span>
-                          {card.originalImageWidth && card.originalImageHeight && (
-                            <span>
-                              · {card.originalImageWidth}×{card.originalImageHeight}
-                            </span>
-                          )}
-                          {hasModified && (
-                            <span className="text-[#6B48F5] font-sans font-medium">
-                              · 已微调
-                            </span>
-                          )}
-                          {card.lastPromptId && (
-                            <span className="text-emerald-600">
-                              · #{card.lastPromptId.slice(0, 6)}
-                            </span>
-                          )}
-                        </div>
-                      </div>
+                          </article>
+                        );
+                      })}
                     </div>
-
-                    {/* 可点击唤出微调的提示词摘要区（批量模式下点击同样快速勾选） */}
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        if (batchSelectMode) {
-                          toggleCardSelectionInBatch(card.id, e.shiftKey);
-                        } else {
-                          openFineTuner(card, 'positive');
-                        }
-                      }}
-                      title={
-                        batchSelectMode
-                          ? '点击勾选/取消此卡片（按住 Shift 支持连选）'
-                          : '点击唤出可视化 Tag 微调面板'
-                      }
-                      className={`flex-1 px-3.5 py-2.5 text-left transition-colors cursor-pointer space-y-1.5 ${
-                        isSelected
-                          ? 'bg-[#F5F2FF]/80 hover:bg-[#EFEAFF]'
-                          : 'bg-[#FAFAFC] hover:bg-[#F5F3FF]/60'
-                      }`}
-                    >
-                      <div className="text-[11px] text-[#373C4B] font-mono line-clamp-2 break-words leading-relaxed">
-                        <span className="font-sans font-semibold text-[#6B48F5] mr-1">
-                          Pos:
-                        </span>
-                        {posDisplay || '（空）'}
-                      </div>
-                      <div className="text-[11px] text-[#686E7E] font-mono line-clamp-1 break-words">
-                        <span className="font-sans font-semibold text-[#E85D75] mr-1">
-                          Neg:
-                        </span>
-                        {negDisplay || '（空）'}
-                      </div>
-                    </button>
-
-                    {/* 卡片底部操作栏 */}
-                    <div
-                      onClick={(e) => {
-                        if (batchSelectMode) {
-                          e.stopPropagation();
-                        }
-                      }}
-                      className="px-3.5 py-2.5 bg-white border-t border-[#EAEAEF] flex items-center gap-2"
-                    >
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          openFineTuner(card, 'positive');
-                        }}
-                        className="flex-1 h-8 px-2.5 inline-flex items-center justify-center gap-1.5 text-[11.5px] font-medium rounded-[9px] border border-[#E0E0E6] bg-white text-[#4C5264] hover:border-[#7C5CFC]/50 hover:text-[#6B48F5] transition-colors whitespace-nowrap cursor-pointer"
-                      >
-                        <SlidersHorizontal className="w-3.5 h-3.5" />
-                        <span>微调提示词</span>
-                      </button>
-
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          void handleRunCard(card);
-                        }}
-                        disabled={isSendingThis}
-                        className="flex-1 h-8 px-2.5 inline-flex items-center justify-center gap-1.5 text-[11.5px] font-medium rounded-[9px] bg-gradient-to-b from-[#8A6CFF] to-[#7C5CFC] text-white shadow-[0_2px_6px_rgba(124,92,252,0.24)] hover:brightness-105 disabled:opacity-50 transition-all whitespace-nowrap cursor-pointer"
-                      >
-                        {isSendingThis ? (
-                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        ) : (
-                          <Play className="w-3.5 h-3.5" />
-                        )}
-                        <span>{isSendingThis ? '发送中...' : '运行发送 UI'}</span>
-                      </button>
-                    </div>
-                  </article>
-                );
-              })}
+                  );
+                })}
+              {virtualGrid.bottomSpacerHeight > 0 && (
+                <div
+                  style={{ height: `${virtualGrid.bottomSpacerHeight}px` }}
+                  aria-hidden="true"
+                />
+              )}
             </div>
           )}
         </div>
@@ -3962,7 +4018,9 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                       }}
                       className="min-h-[34px] px-3 py-1 rounded-[8px] border border-[#E0E0E6] bg-white text-[12px] font-medium text-[#4C5264] hover:border-[#7C5CFC]/45 hover:text-[#6B48F5] transition-colors cursor-pointer whitespace-nowrap"
                     >
-                      全选本页 ({pagedCards.length})
+                      {filteredCards.length > pagedCards.length
+                        ? `全选本页 (${pagedCards.length})`
+                        : `全选当前 (${pagedCards.length})`}
                     </button>
                     <button
                       type="button"
@@ -3980,7 +4038,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                       }}
                       className="min-h-[34px] px-3 py-1 rounded-[8px] border border-[#E0E0E6] bg-white text-[12px] font-medium text-[#4C5264] hover:border-[#7C5CFC]/45 hover:text-[#6B48F5] transition-colors cursor-pointer whitespace-nowrap"
                     >
-                      反选本页
+                      {filteredCards.length > pagedCards.length ? '反选本页' : '反选当前'}
                     </button>
                     {filteredCards.length > pagedCards.length && (
                       <button
@@ -4146,19 +4204,28 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
               <div className="flex flex-wrap items-center justify-between gap-2 text-[11.5px] text-[#4C5264]">
                 <div className="flex flex-wrap items-center gap-2 tabular-nums">
                   <span>
-                    显示第 {(safePage - 1) * pageSize + 1}–
-                    {Math.min(safePage * pageSize, filteredCards.length)} 张，共{' '}
-                    {filteredCards.length} 张
+                    {pageSize === 'all'
+                      ? `共 ${filteredCards.length} 张卡片（虚拟滚动按可视区渲染）`
+                      : `显示第 ${(safePage - 1) * pageSize + 1}–${Math.min(
+                          safePage * pageSize,
+                          filteredCards.length
+                        )} 张，共 ${filteredCards.length} 张`}
                   </span>
                   <select
-                    aria-label="每页显示卡片数"
-                    value={pageSize}
-                    onChange={(e) => setPageSize(Number(e.target.value) as 24 | 48 | 96)}
+                    aria-label="列表显示模式与每页数量"
+                    value={String(pageSize)}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setPageSize(
+                        val === 'all' ? 'all' : (Number(val) as 24 | 48 | 96)
+                      );
+                    }}
                     className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-[#FAFAFC] text-[11px] text-[#1E2028]"
                   >
-                    <option value={24}>每页 24 张</option>
-                    <option value={48}>每页 48 张</option>
-                    <option value={96}>每页 96 张</option>
+                    <option value="all">全部（虚拟滚动）</option>
+                    <option value="24">每页 24 张</option>
+                    <option value="48">每页 48 张</option>
+                    <option value="96">每页 96 张</option>
                   </select>
                   {!batchSelectMode && (
                     <button
@@ -4179,7 +4246,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                   )}
                 </div>
 
-                {totalPages > 1 && (
+                {totalPages > 1 ? (
                   <div className="flex flex-wrap items-center gap-1.5 tabular-nums">
                     <button
                       type="button"
@@ -4247,6 +4314,20 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                       末页
                     </button>
                   </div>
+                ) : (
+                  filteredCards.length > 12 && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        bodyScrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+                      }}
+                      className="h-7 px-2.5 rounded-[7px] border border-[#E0E0E6] bg-white text-[11px] font-medium text-[#4C5264] hover:border-[#7C5CFC]/50 hover:text-[#6B48F5] cursor-pointer whitespace-nowrap"
+                    >
+                      回到顶部
+                    </button>
+                  )
                 )}
               </div>
             )}
