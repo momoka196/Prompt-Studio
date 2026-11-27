@@ -9,6 +9,7 @@ import {
 } from '../data/presets';
 import {
   BuiltCharacterPrompt,
+  BuiltNegativePromptResult,
   CharacterConfig,
   ComfyArchitecture,
   ComfyLoaderKey,
@@ -17,6 +18,9 @@ import {
   ComfySamplerConfig,
   ConflictItem,
   MinimalBackgroundPreset,
+  NegativeGuardMetadata,
+  NegativeGuardRuleBadge,
+  NegativeGuardRuleId,
   PromptSegment,
   SharedConfig,
   SimplePresetItem,
@@ -43,6 +47,45 @@ export function formatWeightedText(text: string, weight: number): string {
   return `(${trimmed}:${formatWeightNumber(w)})`;
 }
 
+export function splitPromptTags(raw: string): string[] {
+  const result: string[] = [];
+  let current = '';
+  let depth = 0;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (ch === '(' || ch === '[') {
+      depth += 1;
+      current += ch;
+    } else if (ch === ')' || ch === ']') {
+      depth = Math.max(0, depth - 1);
+      current += ch;
+    } else if ((ch === ',' || ch === '，' || ch === '\n') && depth === 0) {
+      const trimmed = current.trim();
+      if (trimmed) result.push(trimmed);
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  const tail = current.trim();
+  if (tail) result.push(tail);
+  return result;
+}
+
+export function normalizeSlotTagsText(raw: string): string {
+  const tokens = splitPromptTags(raw);
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (const token of tokens) {
+    const clean = stripWeightSyntax(token).replace(/\s+/g, ' ').trim();
+    if (!clean) continue;
+    if (seen.has(clean)) continue;
+    seen.add(clean);
+    deduped.push(token);
+  }
+  return deduped.join(', ');
+}
+
 export interface PromptStats {
   tagCount: number;
   charCount: number;
@@ -54,10 +97,7 @@ export function getPromptStats(text: string, maxPreviewTags = 6): PromptStats {
   if (!trimmed) {
     return { tagCount: 0, charCount: 0, preview: '（空）' };
   }
-  const tags = trimmed
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const tags = splitPromptTags(trimmed);
   const previewSlice = tags.slice(0, maxPreviewTags).join(', ');
   const preview = tags.length > maxPreviewTags ? `${previewSlice}, ...` : previewSlice;
   return {
@@ -74,92 +114,20 @@ export interface BuildPromptOptions {
   selectedPresetTitles?: string[];
 }
 
-export interface NegativeGuardRuleBadge {
-  id: 'anti-plush' | 'allow-plush-anti-dup' | 'anti-pajama-bed';
-  label: string;
-  detail: string;
-  tone: 'neutral' | 'plush' | 'pajama';
-}
-
-export interface NegativeAutoGuardAnalysis {
-  hasExplicitPlush: boolean;
-  hasPajama: boolean;
-  appendedTags: string[];
-  rules: NegativeGuardRuleBadge[];
-}
+export type NegativeAutoGuardAnalysis = NegativeGuardMetadata;
+export type { NegativeGuardMetadata, NegativeGuardRuleBadge, NegativeGuardRuleId };
 
 export interface BuildEffectiveNegativeOptions {
+  includeAppearance?: boolean;
   customPresets?: SimplePresetItem[];
   customBackgrounds?: MinimalBackgroundPreset[];
   selectedPresetTitles?: string[];
 }
 
-export function buildCharacterPrompt(
-  shared: SharedConfig,
-  character: CharacterConfig,
-  options: BuildPromptOptions = {}
-): BuiltCharacterPrompt {
-  const includeAppearance = options.includeAppearance ?? true;
-
-  const candidates: {
-    key: string;
-    label: string;
-    layer: 'shared' | 'character';
-    slot: WeightedSlot;
-  }[] = [
-    { key: 'styleAnchor', label: '画风', layer: 'shared', slot: shared.styleAnchor },
-    { key: 'background', label: '场景', layer: 'shared', slot: shared.background },
-    { key: 'composition', label: '构图', layer: 'shared', slot: shared.composition },
-    { key: 'appearance', label: '外貌', layer: 'character', slot: character.appearance },
-    ...(shared.bodyType && shared.bodyType.text.trim()
-      ? [{ key: 'bodyType', label: '体型', layer: 'shared' as const, slot: shared.bodyType }]
-      : []),
-    { key: 'outfit', label: '服装', layer: 'character', slot: character.outfit },
-    { key: 'pose', label: '动作', layer: 'character', slot: character.pose },
-    { key: 'expression', label: '表情', layer: 'character', slot: character.expression },
-  ];
-
-  const segments: PromptSegment[] = [];
-
-  for (const item of candidates) {
-    if (!includeAppearance && item.key === 'appearance') continue;
-    const raw = item.slot.text.trim();
-    if (!raw) continue;
-    const formatted = formatWeightedText(raw, item.slot.weight);
-    segments.push({
-      key: item.key,
-      label: item.label,
-      layer: item.layer,
-      rawText: raw,
-      weight: clampWeight(item.slot.weight),
-      formatted,
-    });
-  }
-
-  return {
-    fullText: segments.map((s) => s.formatted).join(', '),
-    segments,
-  };
-}
-
-export function buildSharedNegativePrompt(shared: SharedConfig): string {
-  if (shared.manualNegativeOverride !== null) {
-    return shared.manualNegativeOverride;
-  }
-  const parts: string[] = [];
-  for (const group of shared.negativeGroups) {
-    if (!group.enabled) continue;
-    for (const tag of group.tags) {
-      const formatted = formatWeightedText(tag.text, tag.weight);
-      if (formatted) parts.push(formatted);
-    }
-  }
-  return parts.join(', ');
-}
-
 const NO_PLUSH_GUARD_TAGS = [
   'plush',
   'plushie',
+  'plush toy',
   'stuffed toy',
   'stuffed animal',
   'doll',
@@ -179,6 +147,7 @@ const ANTI_DUPLICATE_ONLY_TAGS = [
   'mini character',
   'look-alike',
   'duplicate',
+  'clone',
 ];
 
 const PAJAMA_BED_GUARD_TAGS = [
@@ -186,15 +155,304 @@ const PAJAMA_BED_GUARD_TAGS = [
   'on bed',
   'standing on bed',
   'lying on bed',
+  'sitting on bed',
 ];
 
 const PAJAMA_PLUSH_GUARD_TAGS = ['plush toy', 'stuffed toy', 'doll'];
 
+const HAND_SAFETY_GUARD_TAGS = ['extra fingers', 'fused fingers', 'extra arms'];
+
 const PLUSH_KEYWORD_RE =
-  /\b(?:plush(?:ie|ies)?|stuffed\s+(?:toy|animal)s?|dolls?|mascots?|holding\s+(?:a\s+)?(?:doll|plush(?:ie)?))\b|玩偶|毛绒|公仔/i;
+  /\b(?:plush(?:ie|ies)?|stuffed\s+(?:toy|animal|bear|bunny|rabbit)s?|teddy\s*bear|dolls?|mascots?|holding\s+(?:a\s+)?(?:doll|plush(?:ie)?))\b|玩偶|毛绒(?:玩偶|玩具|公仔|小熊|兔)|公仔/i;
 
 const PAJAMA_KEYWORD_RE =
-  /\b(?:pajamas?|pyjamas?|nightwear|sleepwear|loungewear|fleece)\b|睡衣|居家服/i;
+  /\b(?:pajamas?|pyjamas?|nightwear|sleepwear|loungewear|roomwear|homewear|nightgown)\b|睡衣|居家服|家居服/i;
+
+const VISIBLE_FINGER_HAND_ACTION_RE =
+  /\b(?:touching chin|index finger|finger|peace sign|v sign|double peace|finger gun|pointing|salute|holding|hug|hugging|cupping|hand on cheek|one hand near cheek|hands on own thighs|covering lower face|peeking through fingers|fists|waving|reaching one hand|outstretched arms|forming heart with hands|hand on hip)\b/i;
+
+const POSE_HANDS_BUSY_RE =
+  /\b(?:with both hands|both hands|holding|hugging|hug|hands behind back|arms behind head|double peace|forming heart|both fists|hand on hip|one hand touching chin|index finger)\b/i;
+
+const OUTDOOR_BG_RE =
+  /\b(?:outdoor|park|meadow|sky|clouds|starry|night sky|sakura|cherry blossom|fireflies|street|beach|poolside|garden|forest)\b/i;
+
+const STUDIO_BG_RE =
+  /\b(?:photography studio|seamless white backdrop|studio backdrop|white backdrop)\b/i;
+
+const NON_CLASSROOM_INDOOR_BG_RE =
+  /\b(?:bedroom|living room|sofa|cafe|kitchen|bathroom)\b/i;
+
+const CLASSROOM_BG_RE = /\b(?:classroom|school|desk|chalkboard)\b/i;
+
+const EXPR_CLOSED_OR_WIDE_EYES_RE =
+  /\b(?:closed eyes|eyes closed|closed-eye|half-closed eyes|sleepy|wide eyes|wide bright eyes|wide watery eyes|star-shaped pupils|heart-shaped pupils)\b|>_</i;
+
+const EXPR_BLUSH_RE = /\b(?:blush|blushing|rosy cheeks)\b/i;
+
+const GAZE_AWAY_OR_DOWN_RE =
+  /\b(?:looking down at pages|averted gaze|turning head back|looking back at viewer)\b/i;
+
+interface ResolvedCharacterPromptData {
+  segments: PromptSegment[];
+  fullText: string;
+  resolvedAdjustments: string[];
+  hasBackgroundLock: boolean;
+  hasHandSleeveConflict: boolean;
+  hasPoseExprGuard: boolean;
+}
+
+function resolveAndBuildCharacterSegments(
+  shared: SharedConfig,
+  character: CharacterConfig,
+  includeAppearance: boolean
+): ResolvedCharacterPromptData {
+  const resolvedAdjustments: string[] = [];
+  const bgRaw = shared.background.text.trim();
+  const hasBackgroundLock = bgRaw.length > 0;
+  const compRaw = shared.composition.text.trim();
+  const appRaw = includeAppearance ? character.appearance.text.trim() : '';
+  const outfitRaw = character.outfit.text.trim();
+  const poseRaw = character.pose.text.trim();
+  const exprRaw = character.expression.text.trim();
+
+  const hasFullBodyComp = /\b(?:full body|entire body visible|head to toe)\b/i.test(compRaw);
+  const bgIsOutdoor = OUTDOOR_BG_RE.test(bgRaw);
+  const bgIsStudio = STUDIO_BG_RE.test(bgRaw);
+  const bgIsNonClassroomIndoor = NON_CLASSROOM_INDOOR_BG_RE.test(bgRaw) && !CLASSROOM_BG_RE.test(bgRaw);
+
+  let hasHandSleeveConflict = false;
+  let hasPoseExprGuard = false;
+  let hasBgGuardAdjust = false;
+
+  const outfitHasHiddenHands = /\bhands hidden in sleeves\b/i.test(outfitRaw);
+  const poseOrExprNeedsHands =
+    VISIBLE_FINGER_HAND_ACTION_RE.test(poseRaw) || VISIBLE_FINGER_HAND_ACTION_RE.test(exprRaw);
+  if (outfitHasHiddenHands && poseOrExprNeedsHands) {
+    hasHandSleeveConflict = true;
+    resolvedAdjustments.push('解除「手藏袖中」与手指/持物动作的遮挡冲突');
+  }
+
+  const poseOccupyHands = POSE_HANDS_BUSY_RE.test(poseRaw);
+  const exprCoversFaceWithHands = /\b(?:covering lower face with hands|peeking through fingers)\b/i.test(
+    exprRaw
+  );
+  if (poseOccupyHands && exprCoversFaceWithHands) {
+    hasPoseExprGuard = true;
+    resolvedAdjustments.push('保留动作手部姿态，清理表情中重复的双手遮脸词避免多手畸形');
+  }
+
+  const exprHasText = exprRaw.length > 0;
+  const exprClosedOrWideEyes = EXPR_CLOSED_OR_WIDE_EYES_RE.test(exprRaw);
+  const exprHasBlush = EXPR_BLUSH_RE.test(exprRaw);
+  const poseOrExprRedirectsGaze =
+    GAZE_AWAY_OR_DOWN_RE.test(poseRaw) || GAZE_AWAY_OR_DOWN_RE.test(exprRaw);
+
+  const cleanTagsForSlot = (key: string, rawText: string): string => {
+    const tokens = splitPromptTags(rawText);
+    const out: string[] = [];
+
+    for (const token of tokens) {
+      const clean = stripWeightSyntax(token).replace(/\s+/g, ' ').trim();
+      if (!clean) continue;
+
+      // 背景锁定：非背景槽位不允许自带 * background 覆盖场景
+      if (hasBackgroundLock && key !== 'background' && /\bbackground\b/i.test(clean)) {
+        hasBgGuardAdjust = true;
+        continue;
+      }
+
+      // 服装 vs 动作/表情：手藏袖中与手部交互冲突
+      if (key === 'outfit' && hasHandSleeveConflict && clean === 'hands hidden in sleeves') {
+        continue;
+      }
+
+      // 外貌 vs 表情 / 动作：已有显式表情时，去掉外貌默认微笑与重复基础脸红
+      if (key === 'appearance') {
+        if (exprHasText && /^(?:gentle smile|soft smile|smile|neutral expression|expressionless)$/.test(clean)) {
+          hasPoseExprGuard = true;
+          continue;
+        }
+        if (exprHasBlush && clean === 'blush') {
+          continue;
+        }
+        if (poseOrExprRedirectsGaze && clean === 'looking at viewer') {
+          hasPoseExprGuard = true;
+          continue;
+        }
+      }
+
+      // 动作 vs 背景 / 构图 / 表情
+      if (key === 'pose') {
+        // 构图要求全身时，清理冲突的上半身裁剪词
+        if (hasFullBodyComp && /^(?:upper body visible|cowboy shot|portrait)$/.test(clean)) {
+          hasBgGuardAdjust = true;
+          resolvedAdjustments.push('已锁定「全身构图」，移除动作中冲突的半身裁剪词');
+          continue;
+        }
+        // 背景是非教室（户外/影棚/卧室/客厅）时，清理课桌靠窗等固定场景家具词
+        if (hasBackgroundLock && (bgIsOutdoor || bgIsStudio || bgIsNonClassroomIndoor)) {
+          if (/^(?:sitting by window|wooden school desk|wooden chair)$/.test(clean)) {
+            hasBgGuardAdjust = true;
+            continue;
+          }
+          if (clean === 'sitting at desk') {
+            hasBgGuardAdjust = true;
+            out.push('sitting');
+            continue;
+          }
+        }
+        // 户外场景下将室内地板坐姿收敛为自然坐姿
+        if (hasBackgroundLock && bgIsOutdoor && clean === 'sitting on floor') {
+          hasBgGuardAdjust = true;
+          out.push('sitting');
+          continue;
+        }
+        // 已有显式表情时，去掉动作自带表情词与冲突眨眼
+        if (exprHasText) {
+          if (/^(?:gentle smile|soft smile|smile)$/.test(clean)) {
+            hasPoseExprGuard = true;
+            continue;
+          }
+          if (exprClosedOrWideEyes && /^(?:winking at camera|wink|one eye closed)$/.test(clean)) {
+            hasPoseExprGuard = true;
+            resolvedAdjustments.push('已按选定表情的眼部状态调和动作中的眨眼词');
+            continue;
+          }
+        }
+        if (GAZE_AWAY_OR_DOWN_RE.test(exprRaw) && clean === 'looking at viewer') {
+          hasPoseExprGuard = true;
+          continue;
+        }
+      }
+
+      // 表情 vs 动作：双手忙时避免再叠加双手遮脸/指缝偷瞄
+      if (key === 'expression' && poseOccupyHands) {
+        if (/^(?:covering lower face with hands|peeking through fingers)$/.test(clean)) {
+          continue;
+        }
+      }
+
+      out.push(token);
+    }
+
+    if (hasBgGuardAdjust && !resolvedAdjustments.some((m) => m.includes('背景'))) {
+      resolvedAdjustments.push('已锁定全局背景设定，清理动作中与当前空间/构图冲突的场景词');
+    }
+
+    // 槽位内部去重
+    const slotSeen = new Set<string>();
+    const slotDeduped: string[] = [];
+    for (const t of out) {
+      const clean = stripWeightSyntax(t).replace(/\s+/g, ' ').trim();
+      if (!clean || slotSeen.has(clean)) continue;
+      slotSeen.add(clean);
+      slotDeduped.push(t);
+    }
+    return slotDeduped.join(', ');
+  };
+
+  const candidates: {
+    key: string;
+    label: string;
+    layer: 'shared' | 'character';
+    slot: WeightedSlot;
+  }[] = [
+    { key: 'styleAnchor', label: '画风', layer: 'shared', slot: shared.styleAnchor },
+    { key: 'background', label: '场景', layer: 'shared', slot: shared.background },
+    { key: 'composition', label: '构图', layer: 'shared', slot: shared.composition },
+    { key: 'appearance', label: '外貌', layer: 'character', slot: character.appearance },
+    ...(shared.bodyType && shared.bodyType.text.trim()
+      ? [{ key: 'bodyType', label: '体型', layer: 'shared' as const, slot: shared.bodyType }]
+      : []),
+    { key: 'outfit', label: '服装', layer: 'character', slot: character.outfit },
+    { key: 'pose', label: '动作', layer: 'character', slot: character.pose },
+    { key: 'expression', label: '表情', layer: 'character', slot: character.expression },
+  ];
+
+  const globalSeenClean = new Set<string>();
+  const segments: PromptSegment[] = [];
+
+  for (const item of candidates) {
+    if (!includeAppearance && item.key === 'appearance') continue;
+    if (!item.slot.text.trim()) continue;
+
+    const cleaned = cleanTagsForSlot(item.key, item.slot.text);
+    if (!cleaned) continue;
+
+    // 跨槽位全局去重（保留首次出现的词条，避免重复如 looking at viewer, blush, standing）
+    const crossDeduped: string[] = [];
+    for (const token of splitPromptTags(cleaned)) {
+      const clean = stripWeightSyntax(token).replace(/\s+/g, ' ').trim();
+      if (!clean) continue;
+      if (globalSeenClean.has(clean)) continue;
+      globalSeenClean.add(clean);
+      crossDeduped.push(token);
+    }
+
+    const finalRaw = crossDeduped.join(', ');
+    if (!finalRaw) continue;
+
+    const formatted = formatWeightedText(finalRaw, item.slot.weight);
+    segments.push({
+      key: item.key,
+      label: item.label,
+      layer: item.layer,
+      rawText: finalRaw,
+      weight: clampWeight(item.slot.weight),
+      formatted,
+    });
+  }
+
+  return {
+    segments,
+    fullText: segments.map((s) => s.formatted).join(', '),
+    resolvedAdjustments: Array.from(new Set(resolvedAdjustments)),
+    hasBackgroundLock,
+    hasHandSleeveConflict,
+    hasPoseExprGuard,
+  };
+}
+
+export function buildCharacterPrompt(
+  shared: SharedConfig,
+  character: CharacterConfig,
+  options: BuildPromptOptions = {}
+): BuiltCharacterPrompt {
+  const includeAppearance = options.includeAppearance ?? true;
+  const resolved = resolveAndBuildCharacterSegments(shared, character, includeAppearance);
+
+  return {
+    fullText: resolved.fullText,
+    segments: resolved.segments,
+    resolvedAdjustments: resolved.resolvedAdjustments,
+  };
+}
+
+export function buildSharedNegativePrompt(shared: SharedConfig): string {
+  const rawParts: string[] = [];
+  if (shared.manualNegativeOverride !== null) {
+    rawParts.push(...splitPromptTags(shared.manualNegativeOverride));
+  } else {
+    for (const group of shared.negativeGroups) {
+      if (!group.enabled) continue;
+      for (const tag of group.tags) {
+        const formatted = formatWeightedText(tag.text, tag.weight);
+        if (formatted) rawParts.push(formatted);
+      }
+    }
+  }
+
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (const part of rawParts) {
+    const clean = stripWeightSyntax(part).replace(/\s+/g, ' ').trim();
+    if (!clean || seen.has(clean)) continue;
+    seen.add(clean);
+    deduped.push(part);
+  }
+  return deduped.join(', ');
+}
 
 function collectMatchedPresetText(
   shared: SharedConfig,
@@ -245,14 +503,25 @@ function collectMatchedPresetText(
   return extraTexts;
 }
 
-export function analyzeNegativeAutoGuards(
+export function buildNegativePromptWithMeta(
   shared: SharedConfig,
   targetCharacters: CharacterConfig | CharacterConfig[],
   options: BuildEffectiveNegativeOptions = {}
-): NegativeAutoGuardAnalysis {
+): BuiltNegativePromptResult {
   const charList = Array.isArray(targetCharacters)
     ? targetCharacters
     : [targetCharacters];
+  const includeAppearance = options.includeAppearance ?? true;
+
+  const charResolutions = charList.map((char) =>
+    resolveAndBuildCharacterSegments(shared, char, includeAppearance)
+  );
+  const hasBackgroundLock = Boolean(shared.background.text.trim());
+  const hasHandSleeveConflict = charResolutions.some((r) => r.hasHandSleeveConflict);
+  const hasPoseExprGuard = charResolutions.some((r) => r.hasPoseExprGuard);
+  const resolvedAdjustments = Array.from(
+    new Set(charResolutions.flatMap((r) => r.resolvedAdjustments))
+  );
 
   const positiveTexts: string[] = [
     shared.styleAnchor.text,
@@ -260,7 +529,7 @@ export function analyzeNegativeAutoGuards(
     shared.composition.text,
     shared.bodyType?.text ?? '',
     ...charList.flatMap((c) => [
-      c.appearance.text,
+      includeAppearance ? c.appearance.text : '',
       c.outfit.text,
       c.pose.text,
       c.expression.text,
@@ -272,10 +541,10 @@ export function analyzeNegativeAutoGuards(
   const hasExplicitPlush = PLUSH_KEYWORD_RE.test(combinedPositive);
   const hasPajama = PAJAMA_KEYWORD_RE.test(combinedPositive);
 
-  const baseNegative = buildSharedNegativePrompt(shared);
+  const baseNegativePrompt = buildSharedNegativePrompt(shared).trim();
   const existingCleanSet = new Set<string>();
-  if (baseNegative.trim()) {
-    for (const part of baseNegative.split(/[,，\n]+/)) {
+  if (baseNegativePrompt) {
+    for (const part of splitPromptTags(baseNegativePrompt)) {
       const clean = stripWeightSyntax(part).replace(/\s+/g, ' ').trim();
       if (clean) existingCleanSet.add(clean);
     }
@@ -305,40 +574,96 @@ export function analyzeNegativeAutoGuards(
     ANTI_DUPLICATE_ONLY_TAGS.forEach(pushUnique);
   }
 
+  if (hasHandSleeveConflict || hasPoseExprGuard) {
+    HAND_SAFETY_GUARD_TAGS.forEach(pushUnique);
+  }
+
   const rules: NegativeGuardRuleBadge[] = [];
+  const triggeredRuleIds: NegativeGuardRuleId[] = [];
+
   if (hasExplicitPlush) {
+    triggeredRuleIds.push('allow-plush-anti-dup');
     rules.push({
       id: 'allow-plush-anti-dup',
       label: '已选玩偶 · 仅防同化',
-      detail: '已保留玩偶/毛绒玩具正向词，负向仅追加防分身同化词',
+      detail: '已保留玩偶/毛绒玩具正向词，负向仅追加防重影/防分身同化词',
       tone: 'plush',
     });
   } else {
+    triggeredRuleIds.push('anti-plush');
     rules.push({
       id: 'anti-plush',
       label: '未选玩偶 · 防玩偶/同化',
-      detail: '未选玩偶，自动压制凭空生成玩偶与分身同化',
+      detail: '未选玩偶，自动向负向去重追加防凭空刷出玩偶及分身同化词',
       tone: 'neutral',
     });
   }
 
   if (hasPajama) {
+    triggeredRuleIds.push('anti-pajama-bed');
     rules.push({
       id: 'anti-pajama-bed',
       label: '睡衣/居家 · 防站床/同化',
       detail: hasExplicitPlush
         ? '检测到睡衣/居家服，自动压制床铺/站床与分身同化（已保留玩偶）'
-        : '检测到睡衣/居家服，自动压制床铺/站床与玩偶同化',
+        : '检测到睡衣/居家服，自动去重追加防床铺/站床与玩偶同化词',
       tone: 'pajama',
     });
   }
 
+  if (hasBackgroundLock) {
+    triggeredRuleIds.push('anti-bg-override');
+    rules.push({
+      id: 'anti-bg-override',
+      label: '场景锁定 · 防覆盖',
+      detail: '已锁定全局背景槽位空间设定，避免其他维度场景/背景词覆盖',
+      tone: 'guard',
+    });
+  }
+
+  if (hasHandSleeveConflict || hasPoseExprGuard || resolvedAdjustments.length > 0) {
+    triggeredRuleIds.push('anti-pose-expr-conflict');
+    rules.push({
+      id: 'anti-pose-expr-conflict',
+      label: '四维调和 · 防手部/神态打架',
+      detail:
+        resolvedAdjustments.length > 0
+          ? resolvedAdjustments.join('；')
+          : '已自动调和服装、动作与表情间的冲突词条并完成去重',
+      tone: 'guard',
+    });
+  }
+
+  const suffix = appendedTags.join(', ');
+  const negativePrompt = baseNegativePrompt
+    ? suffix
+      ? `${baseNegativePrompt}, ${suffix}`
+      : baseNegativePrompt
+    : suffix;
+
   return {
-    hasExplicitPlush,
-    hasPajama,
-    appendedTags,
-    rules,
+    negativePrompt,
+    baseNegativePrompt,
+    guardMeta: {
+      hasExplicitPlush,
+      hasPajama,
+      hasBackgroundLock,
+      hasPoseExprGuard,
+      hasHandSleeveConflict,
+      resolvedAdjustments,
+      appendedTags,
+      triggeredRuleIds,
+      rules,
+    },
   };
+}
+
+export function analyzeNegativeAutoGuards(
+  shared: SharedConfig,
+  targetCharacters: CharacterConfig | CharacterConfig[],
+  options: BuildEffectiveNegativeOptions = {}
+): NegativeAutoGuardAnalysis {
+  return buildNegativePromptWithMeta(shared, targetCharacters, options).guardMeta;
 }
 
 export function buildEffectiveNegativePrompt(
@@ -346,13 +671,7 @@ export function buildEffectiveNegativePrompt(
   targetCharacters: CharacterConfig | CharacterConfig[],
   options: BuildEffectiveNegativeOptions = {}
 ): string {
-  const baseNegative = buildSharedNegativePrompt(shared).trim();
-  const analysis = analyzeNegativeAutoGuards(shared, targetCharacters, options);
-  if (analysis.appendedTags.length === 0) {
-    return baseNegative;
-  }
-  const suffix = analysis.appendedTags.join(', ');
-  return baseNegative ? `${baseNegative}, ${suffix}` : suffix;
+  return buildNegativePromptWithMeta(shared, targetCharacters, options).negativePrompt;
 }
 
 export function buildCopyAllOutput(
@@ -365,7 +684,7 @@ export function buildCopyAllOutput(
     const built = buildCharacterPrompt(shared, char, options);
     blocks.push(`[${idx + 1}] ${char.name}\nPositive: ${built.fullText}`);
   });
-  const negative = buildEffectiveNegativePrompt(shared, characters, options);
+  const negative = buildNegativePromptWithMeta(shared, characters, options).negativePrompt;
   blocks.push(`[共用负向提示词]\nNegative: ${negative}`);
   return blocks.join('\n\n');
 }
@@ -376,7 +695,7 @@ export function buildWorkflowSnippet(
   options: BuildPromptOptions = {}
 ): string {
   const built = buildCharacterPrompt(shared, character, options);
-  const negative = buildEffectiveNegativePrompt(shared, character, options);
+  const negative = buildNegativePromptWithMeta(shared, character, options).negativePrompt;
   return `=== 正向（粘到共用服装节点）===\n${built.fullText}\n\n=== 负向（粘到共用负向节点）===\n${negative}`;
 }
 
@@ -391,8 +710,7 @@ function stripWeightSyntax(raw: string): string {
 }
 
 function splitCleanTerms(raw: string): string[] {
-  return raw
-    .split(/[,，\n]+/)
+  return splitPromptTags(raw)
     .map((part) => stripWeightSyntax(part))
     .filter((t) => t.length >= 2);
 }

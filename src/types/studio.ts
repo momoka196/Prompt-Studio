@@ -158,6 +158,39 @@ export interface PromptSegment {
 export interface BuiltCharacterPrompt {
   fullText: string;
   segments: PromptSegment[];
+  resolvedAdjustments?: string[];
+}
+
+export type NegativeGuardRuleId =
+  | 'anti-plush'
+  | 'allow-plush-anti-dup'
+  | 'anti-pajama-bed'
+  | 'anti-bg-override'
+  | 'anti-pose-expr-conflict';
+
+export interface NegativeGuardRuleBadge {
+  id: NegativeGuardRuleId;
+  label: string;
+  detail: string;
+  tone: 'neutral' | 'plush' | 'pajama' | 'guard';
+}
+
+export interface NegativeGuardMetadata {
+  hasExplicitPlush: boolean;
+  hasPajama: boolean;
+  hasBackgroundLock: boolean;
+  hasPoseExprGuard: boolean;
+  hasHandSleeveConflict: boolean;
+  resolvedAdjustments: string[];
+  appendedTags: string[];
+  triggeredRuleIds: NegativeGuardRuleId[];
+  rules: NegativeGuardRuleBadge[];
+}
+
+export interface BuiltNegativePromptResult {
+  negativePrompt: string;
+  baseNegativePrompt: string;
+  guardMeta: NegativeGuardMetadata;
 }
 
 export interface ConflictItem {

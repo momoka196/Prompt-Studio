@@ -8,7 +8,12 @@ import {
   SimplePresetItem,
 } from '../data/presets';
 import { CharacterConfig, WeightedSlot } from '../types/studio';
-import { clampWeight, getPromptStats } from '../utils/promptBuilder';
+import {
+  clampWeight,
+  getPromptStats,
+  normalizeSlotTagsText,
+  splitPromptTags,
+} from '../utils/promptBuilder';
 import { parseCutePresetsImport } from '../utils/presetImporter';
 import {
   EditorSlotKey,
@@ -73,22 +78,22 @@ function matchesStyleFilter(
   const hay = `${item.zhName} ${item.vibe} ${item.tags}`.toLowerCase();
 
   if (filter === 'sweet') {
-    return /甜|梦|洛丽塔|女仆|偶像|茶会|荷叶|比心|捧脸|捧|害羞|羞|星|爱|微|浅笑|笑|花|眨眼|wink|cat|lolita|maid|idol|heart|blush|smile|flustered|dreamy|curtsy|cheek|flower/.test(
+    return /甜|梦|洛丽塔|女仆|偶像|茶会|荷叶|比心|捧脸|捧|害羞|羞|星|爱|微|浅笑|笑|花|眨眼|软萌|娇|傲娇|委屈|泪|猫|兔|治愈|草莓|wink|cat|lolita|maid|idol|heart|blush|smile|flustered|dreamy|curtsy|cheek|flower|cute|bashful|teary|bliss/.test(
       hay
     );
   }
   if (filter === 'cozy') {
-    return /居|坐|跪|睡|慵|卫衣|滑肩|抱|哈欠|安详|放空|鼓腮|别扭|sit|floor|kneel|seiza|pajama|hoodie|hug|plushie|sleepy|pout|sulking|yawn|nap/.test(
+    return /居|坐|跪|蹲|睡|慵|卫衣|滑肩|抱|哈欠|安详|放空|鼓腮|别扭|早安|软糯|休闲|吃货|满足|sit|floor|kneel|seiza|squat|crouch|bench|pajama|hoodie|hug|plushie|sleepy|pout|sulking|yawn|nap|cozy|relax|dazed/.test(
       hay
     );
   }
   if (filter === 'school') {
-    return /校|jk|水手|开衫|毛衣|背带|衬衫|课桌|书|阅读|敬礼|体操|学院|文艺|贝雷帽|风衣|大衣|标准|托下巴|站|school|cardigan|sailor|desk|book|reading|uniform|standing|salute|trench|duffle/.test(
+    return /校|jk|水手|开衫|毛衣|背带|衬衫|课桌|书|阅读|敬礼|体操|学院|文艺|贝雷帽|风衣|大衣|标准|托下巴|站|日常|文静|专注|纯真|好奇|吃惊|呆萌|school|cardigan|sailor|desk|book|reading|uniform|standing|salute|trench|duffle|curious|surprised|dazed|smirk/.test(
       hay
     );
   }
   if (filter === 'dynamic') {
-    return /跳|跃|转|举|伸|伞|气球|泳|运动|雨|奶茶|托盘|蛋糕|芭菲|比枪|踮脚|惊喜|吃|魔女|护士|巫女|指向|欢呼|跑|道具|互动|jump|hop|skip|spin|twirl|umbrella|balloon|swimsuit|tiptoe|parfait|cake|dynamic|sipping|reaching|witch|nurse|miko|point|cheer|run|wink/.test(
+    return /跳|跃|转|举|伸|伞|气球|泳|运动|雨|奶茶|托盘|蛋糕|芭菲|比枪|比耶|踮脚|惊喜|吃|魔女|护士|巫女|指向|欢呼|跑|道具|互动|端|托|捧|抱|花|书|敬礼|嘘|眨眼|jump|hop|skip|spin|twirl|umbrella|balloon|swimsuit|tiptoe|parfait|cake|tray|dynamic|sipping|reaching|witch|nurse|miko|point|cheer|run|wink|peace|salute|hold|flower|book/.test(
       hay
     );
   }
@@ -96,8 +101,7 @@ function matchesStyleFilter(
 }
 
 function getCoreEnglishKeywords(tagsText: string, max = 2): string[] {
-  return tagsText
-    .split(',')
+  return splitPromptTags(tagsText)
     .map((s) => s.replace(/^\(|\)$/g, '').replace(/:[0-9.]+$/g, '').trim())
     .filter(Boolean)
     .slice(0, max);
@@ -115,8 +119,7 @@ function normalizeTagToken(raw: string): string {
 }
 
 function extractCleanTags(text: string): string[] {
-  return text
-    .split(',')
+  return splitPromptTags(text)
     .map(normalizeTagToken)
     .filter(Boolean);
 }
@@ -166,9 +169,15 @@ function resolveActivePreset(
       : EXPRESSION_PRESETS;
   const pool = [...customPresets.filter((p) => p.category === category), ...builtin];
 
+  const cleanJoined = extractCleanTags(trimmed).join(', ');
+
   if (cachedPresetId) {
     const cachedItem = pool.find((p) => p.id === cachedPresetId);
-    if (cachedItem && cachedItem.tags.trim() === trimmed) {
+    if (
+      cachedItem &&
+      (cachedItem.tags.trim() === trimmed ||
+        extractCleanTags(cachedItem.tags).join(', ') === cleanJoined)
+    ) {
       return cachedItem;
     }
   }
@@ -176,7 +185,6 @@ function resolveActivePreset(
   const exact = pool.find((p) => p.tags.trim() === trimmed);
   if (exact) return exact;
 
-  const cleanJoined = extractCleanTags(trimmed).join(', ');
   const normalizedExact = pool.find(
     (p) => extractCleanTags(p.tags).join(', ') === cleanJoined
   );
@@ -324,11 +332,12 @@ export const CharacterEditorPanel: React.FC<CharacterEditorPanelProps> = ({
         ? preset.defaultWeight
         : currentWeight;
 
+    const cleanTags = normalizeSlotTagsText(preset.tags) || preset.tags.trim();
     recordPresetSelection(character.id, preset.category, preset.id);
     onUpdateCharacter({
       ...character,
       [preset.category]: {
-        text: preset.tags,
+        text: cleanTags,
         weight: nextWeight,
       },
     });
@@ -344,6 +353,40 @@ export const CharacterEditorPanel: React.FC<CharacterEditorPanelProps> = ({
       },
     });
   };
+
+  // 确保外部重置/导入/回滚/手改槽位后，选中预设缓存与当前槽位内容严格一致
+  useEffect(() => {
+    const categories: PresetCategory[] = ['outfit', 'pose', 'expression'];
+    setSelectedPresetByChar((prev) => {
+      const currentCharMap = prev[character.id] ?? {};
+      const nextCharMap: Partial<Record<PresetCategory, string>> = {};
+      let changed = false;
+
+      for (const cat of categories) {
+        const slotText = character[cat].text.trim();
+        const resolved = slotText
+          ? resolveActivePreset(cat, slotText, customPresets, currentCharMap[cat])
+          : null;
+        if (resolved) {
+          nextCharMap[cat] = resolved.id;
+        }
+        if ((currentCharMap[cat] ?? null) !== (nextCharMap[cat] ?? null)) {
+          changed = true;
+        }
+      }
+
+      if (!changed) return prev;
+      const next = { ...prev, [character.id]: nextCharMap };
+      patchUiCache({ selectedPresetByChar: next });
+      return next;
+    });
+  }, [
+    character.id,
+    character.outfit.text,
+    character.pose.text,
+    character.expression.text,
+    customPresets,
+  ]);
 
   const builtinPresets =
     presetTab === 'outfit'
@@ -554,7 +597,11 @@ export const CharacterEditorPanel: React.FC<CharacterEditorPanelProps> = ({
       </div>
 
       {/* 可爱预设快填：上方已选摘要条 + 分类切换 + 风格筛选 + 充足可视高度的卡片流 */}
-      <div className="flex-1 min-h-[360px] rounded-[14px] studio-card flex flex-col overflow-hidden shrink-0 lg:shrink">
+      <div
+        className={`rounded-[14px] studio-card flex flex-col overflow-hidden shrink-0 ${
+          presetsExpanded ? 'flex-1 min-h-[440px]' : ''
+        }`}
+      >
         <div
           role="button"
           tabIndex={0}
@@ -703,7 +750,10 @@ export const CharacterEditorPanel: React.FC<CharacterEditorPanelProps> = ({
                       {slotHasText && (
                         <button
                           type="button"
-                          onClick={() => handleClearCategorySlot(slotMeta.key)}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleClearCategorySlot(slotMeta.key);
+                          }}
                           title={`清空${slotMeta.label}`}
                           aria-label={`清空${slotMeta.label}`}
                           className="pr-1.5 text-[#949AA8] hover:text-[#E85D75] cursor-pointer"
@@ -915,8 +965,9 @@ export const CharacterEditorPanel: React.FC<CharacterEditorPanelProps> = ({
               </div>
             ) : (
               <div
+                key={`${character.id}-${presetTab}-${styleFilter}`}
                 ref={presetGridRef}
-                className="flex-1 min-h-[190px] overflow-y-auto pr-1 grid grid-cols-1 sm:grid-cols-2 gap-[10px] content-start"
+                className="flex-1 min-h-[220px] overflow-y-auto pr-1 grid grid-cols-1 sm:grid-cols-2 gap-[10px] content-start"
               >
                 {filteredPresets.map((item) => {
                   const isActive = activeCurrentPreset?.id === item.id;

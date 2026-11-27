@@ -29,8 +29,8 @@ import {
   StudioConfig,
 } from './types/studio';
 import {
-  analyzeNegativeAutoGuards,
   buildCopyAllOutput,
+  buildNegativePromptWithMeta,
   buildWorkflowSnippet,
   detectConflicts,
   exportComfyProfilePayload,
@@ -505,12 +505,19 @@ export default function App() {
   const activeGuardAnalysis = useMemo(
     () =>
       activeCharacter
-        ? analyzeNegativeAutoGuards(config.shared, activeCharacter, {
+        ? buildNegativePromptWithMeta(config.shared, activeCharacter, {
+            includeAppearance,
             customPresets: config.customPresets ?? [],
             customBackgrounds: config.customBackgrounds ?? [],
-          })
+          }).guardMeta
         : null,
-    [config.shared, activeCharacter, config.customPresets, config.customBackgrounds]
+    [
+      config.shared,
+      activeCharacter,
+      includeAppearance,
+      config.customPresets,
+      config.customBackgrounds,
+    ]
   );
 
   const handleAddCharacter = () => {
@@ -732,6 +739,11 @@ export default function App() {
         }
         pushHistory('导入配置前', config);
         const normalized = normalizeStudioConfig(parsed);
+        patchUiCache({
+          selectedPresetByChar: {},
+          selectedBackgroundId: normalized.shared.selectedBackgroundId ?? null,
+          selectedBackgroundName: normalized.shared.selectedBackgroundName ?? null,
+        });
         updateConfig(normalized);
         setSelectedCharId(normalized.characters[0].id);
       } catch {
@@ -744,6 +756,11 @@ export default function App() {
   const handleResetDefaults = () => {
     pushHistory('恢复默认 4 角色前', config);
     const fresh = cloneConfig(DEFAULT_STUDIO_CONFIG);
+    patchUiCache({
+      selectedPresetByChar: {},
+      selectedBackgroundId: null,
+      selectedBackgroundName: null,
+    });
     updateConfig(fresh);
     setSelectedCharId(fresh.characters[0].id);
     setImportError(null);
@@ -754,6 +771,11 @@ export default function App() {
     if (!target) return;
     pushHistory('回滚前状态', config);
     const restored = normalizeStudioConfig(cloneConfig(target.config));
+    patchUiCache({
+      selectedPresetByChar: {},
+      selectedBackgroundId: restored.shared.selectedBackgroundId ?? null,
+      selectedBackgroundName: restored.shared.selectedBackgroundName ?? null,
+    });
     updateConfig(restored);
     if (!restored.characters.some((c) => c.id === selectedCharId)) {
       setSelectedCharId(restored.characters[0]?.id ?? '');
@@ -1031,6 +1053,8 @@ export default function App() {
             characters={config.characters}
             selectedCharId={activeCharacter?.id ?? ''}
             includeAppearance={includeAppearance}
+            customPresets={config.customPresets ?? []}
+            customBackgrounds={config.customBackgrounds ?? []}
             onSelectCharacter={setSelectedCharId}
             onAddCharacter={handleAddCharacter}
             onDeleteCharacter={handleDeleteCharacter}
@@ -1098,6 +1122,14 @@ export default function App() {
                   </div>
                 ))}
               </div>
+              {activeGuardAnalysis.resolvedAdjustments.length > 0 && (
+                <div className="pt-1.5 border-t border-[#EAEAEF] space-y-1 text-[10.5px] text-[#0369A1]">
+                  <div className="font-semibold">四维自动调和明细：</div>
+                  {activeGuardAnalysis.resolvedAdjustments.map((adj, idx) => (
+                    <div key={idx}>• {adj}</div>
+                  ))}
+                </div>
+              )}
               {activeGuardAnalysis.appendedTags.length > 0 && (
                 <div className="pt-1.5 border-t border-[#EAEAEF] text-[10.5px] font-mono text-[#686E7E] break-words">
                   当前追加负向词：{activeGuardAnalysis.appendedTags.join(', ')}
@@ -1135,6 +1167,8 @@ export default function App() {
                         ? 'border-emerald-200 bg-emerald-50/90 text-emerald-700'
                         : rule.tone === 'pajama'
                         ? 'border-[#F5B8C4] bg-[#FFF1F3] text-[#C93B58]'
+                        : rule.tone === 'guard'
+                        ? 'border-sky-200 bg-sky-50/90 text-sky-700'
                         : 'border-[#DDD8FA] bg-[#F4F2FF] text-[#6B48F5]'
                     }`}
                   >

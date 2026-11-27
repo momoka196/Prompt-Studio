@@ -23,12 +23,12 @@ import {
   SimplePresetItem,
 } from '../types/studio';
 import {
-  analyzeNegativeAutoGuards,
   buildCharacterPrompt,
-  buildEffectiveNegativePrompt,
+  buildNegativePromptWithMeta,
   getActiveLoaderKeys,
   getPromptStats,
   postProfileToComfyUI,
+  splitPromptTags,
 } from '../utils/promptBuilder';
 import { loadUiCache, patchUiCache } from '../utils/storageCache';
 
@@ -58,10 +58,7 @@ interface OutputSidebarProps {
 }
 
 function splitPillTags(text: string, max = 6): { pills: string[]; remaining: number } {
-  const arr = text
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const arr = splitPromptTags(text);
   return {
     pills: arr.slice(0, max),
     remaining: Math.max(0, arr.length - max),
@@ -111,15 +108,16 @@ export const OutputSidebar: React.FC<OutputSidebarProps> = ({
 
   const builtPositive = buildCharacterPrompt(shared, activeCharacter, {
     includeAppearance,
-  });
-  const guardAnalysis = analyzeNegativeAutoGuards(shared, activeCharacter, {
     customPresets,
     customBackgrounds,
   });
-  const sharedNegative = buildEffectiveNegativePrompt(shared, activeCharacter, {
+  const negativeResult = buildNegativePromptWithMeta(shared, activeCharacter, {
+    includeAppearance,
     customPresets,
     customBackgrounds,
   });
+  const guardAnalysis = negativeResult.guardMeta;
+  const sharedNegative = negativeResult.negativePrompt;
 
   const posStats = getPromptStats(builtPositive.fullText, 6);
   const negStats = getPromptStats(sharedNegative, 6);
@@ -367,6 +365,8 @@ export const OutputSidebar: React.FC<OutputSidebarProps> = ({
                   ? 'border-emerald-200 bg-emerald-50/90 text-emerald-700'
                   : rule.tone === 'pajama'
                   ? 'border-[#F5B8C4] bg-[#FFF1F3] text-[#C93B58]'
+                  : rule.tone === 'guard'
+                  ? 'border-sky-200 bg-sky-50/90 text-sky-700'
                   : 'border-[#DDD8FA] bg-[#F4F2FF] text-[#6B48F5]'
               }`}
             >

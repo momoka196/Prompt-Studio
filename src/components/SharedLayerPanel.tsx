@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Check,
   ChevronRight,
@@ -25,6 +25,7 @@ import {
   buildSharedNegativePrompt,
   clampWeight,
   getPromptStats,
+  normalizeSlotTagsText,
   recommendAntiOutfitTags,
 } from '../utils/promptBuilder';
 import { parseBackgroundPresetsImport } from '../utils/presetImporter';
@@ -144,6 +145,29 @@ export const SharedLayerPanel: React.FC<SharedLayerPanelProps> = ({
     patchUiCache({ selectedBackgroundId: id, selectedBackgroundName: name });
   };
 
+  useEffect(() => {
+    const trimmed = shared.background.text.trim();
+    if (!trimmed) {
+      if (cachedBgSelection.id !== null || cachedBgSelection.name !== null) {
+        persistBgSelection(null, null);
+      }
+      return;
+    }
+    if (shared.selectedBackgroundId !== undefined) {
+      const nextId = shared.selectedBackgroundId ?? null;
+      const nextName = shared.selectedBackgroundName ?? null;
+      if (cachedBgSelection.id !== nextId || cachedBgSelection.name !== nextName) {
+        setCachedBgSelection({ id: nextId, name: nextName });
+      }
+    }
+  }, [
+    shared.background.text,
+    shared.selectedBackgroundId,
+    shared.selectedBackgroundName,
+    cachedBgSelection.id,
+    cachedBgSelection.name,
+  ]);
+
   const updatePositiveSlot = (
     key: 'styleAnchor' | 'background' | 'composition' | 'bodyType',
     patch: Partial<WeightedSlot>
@@ -179,6 +203,7 @@ export const SharedLayerPanel: React.FC<SharedLayerPanelProps> = ({
   };
 
   const handleSelectBackgroundPreset = (bg: MinimalBackgroundPreset) => {
+    const cleanTags = normalizeSlotTagsText(bg.tags) || bg.tags.trim();
     persistBgSelection(bg.id, bg.zhName);
     onUpdateShared({
       ...shared,
@@ -186,7 +211,7 @@ export const SharedLayerPanel: React.FC<SharedLayerPanelProps> = ({
       selectedBackgroundName: bg.zhName,
       background: {
         ...shared.background,
-        text: bg.tags,
+        text: cleanTags,
       },
     });
   };

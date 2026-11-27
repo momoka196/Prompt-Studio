@@ -10,7 +10,12 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { CharacterConfig, SharedConfig } from '../types/studio';
+import {
+  CharacterConfig,
+  MinimalBackgroundPreset,
+  SharedConfig,
+  SimplePresetItem,
+} from '../types/studio';
 import { buildCharacterPrompt } from '../utils/promptBuilder';
 
 interface CharacterSidebarProps {
@@ -18,6 +23,8 @@ interface CharacterSidebarProps {
   characters: CharacterConfig[];
   selectedCharId: string;
   includeAppearance: boolean;
+  customPresets?: SimplePresetItem[];
+  customBackgrounds?: MinimalBackgroundPreset[];
   onSelectCharacter: (id: string) => void;
   onAddCharacter: () => void;
   onDeleteCharacter: (id: string) => void;
@@ -78,6 +85,8 @@ export const CharacterSidebar: React.FC<CharacterSidebarProps> = ({
   characters,
   selectedCharId,
   includeAppearance,
+  customPresets = [],
+  customBackgrounds = [],
   onSelectCharacter,
   onAddCharacter,
   onDeleteCharacter,
@@ -91,7 +100,11 @@ export const CharacterSidebar: React.FC<CharacterSidebarProps> = ({
 
   const handleCopyRow = async (e: React.MouseEvent, char: CharacterConfig) => {
     e.stopPropagation();
-    const built = buildCharacterPrompt(shared, char, { includeAppearance });
+    const built = buildCharacterPrompt(shared, char, {
+      includeAppearance,
+      customPresets,
+      customBackgrounds,
+    });
     try {
       await navigator.clipboard.writeText(built.fullText);
     } catch {
