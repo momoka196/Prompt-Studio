@@ -348,6 +348,7 @@ const STUDIO_IDB_IMAGES_STORE = 'card_images';
 const STUDIO_IDB_FS_STORE = 'fs_handles';
 const STUDIO_IDB_CARDS_KEY = 'cards_v1';
 const STUDIO_IDB_TOMBSTONES_KEY = 'deleted_tombstones_v1';
+const STUDIO_IDB_SYNC_MANIFEST_KEY = 'folder_sync_manifest_v1';
 const STUDIO_IDB_DIR_KEY = 'bound_workflow_dir';
 
 export interface DeletedCardTombstone {
@@ -755,9 +756,17 @@ export async function loadDeletedCardTombstonesFromIndexedDb(): Promise<
   return mergeDeletedTombstonesMaps(localMap, idbMap);
 }
 
-export async function saveDeletedCardTombstones(
+let tombstonesWriteChain: Promise<unknown> = Promise.resolve();
+
+function enqueueTombstoneTask<T>(task: () => Promise<T>): Promise<T> {
+  const next = tombstonesWriteChain.then(task, task);
+  tombstonesWriteChain = next.catch(() => undefined);
+  return next;
+}
+
+async function writeDeletedCardTombstonesRaw(
   map: Record<string, DeletedCardTombstone>
-): Promise<void> {
+): Promise<Record<string, DeletedCardTombstone>> {
   const trimmed = trimTombstonesMap(map);
   try {
     localStorage.setItem(STUDIO_DELETED_CARD_TOMBSTONES_KEY, JSON.stringify(trimmed));
@@ -765,7 +774,7 @@ export async function saveDeletedCardTombstones(
     // 忽略 localStorage 配额异常，以 IndexedDB 为准
   }
   const db = await openStudioDb();
-  if (!db) return;
+  if (!db) return trimmed;
   await new Promise<void>((resolve) => {
     try {
       const tx = db.transaction(STUDIO_IDB_CARDS_STORE, 'readwrite');
@@ -778,47 +787,60 @@ export async function saveDeletedCardTombstones(
       resolve();
     }
   });
-}
-
-export async function recordDeletedCardTombstones(
-  items: DeletedCardTombstone[]
-): Promise<Record<string, DeletedCardTombstone>> {
-  const current = await loadDeletedCardTombstonesFromIndexedDb();
-  const next = { ...current };
-  for (const item of items) {
-    if (!item.cardId) continue;
-    const prev = next[item.cardId];
-    next[item.cardId] = prev
-      ? {
-          ...prev,
-          ...item,
-          deletedAt: Math.max(prev.deletedAt, item.deletedAt),
-          diskFilesDeleted: Boolean(item.diskFilesDeleted || prev.diskFilesDeleted),
-        }
-      : item;
-  }
-  const trimmed = trimTombstonesMap(next);
-  await saveDeletedCardTombstones(trimmed);
   return trimmed;
 }
 
-export async function removeDeletedCardTombstones(
+export function saveDeletedCardTombstones(
+  map: Record<string, DeletedCardTombstone>
+): Promise<void> {
+  return enqueueTombstoneTask(async () => {
+    const current = await loadDeletedCardTombstonesFromIndexedDb();
+    const merged = mergeDeletedTombstonesMaps(current, map);
+    await writeDeletedCardTombstonesRaw(merged);
+  });
+}
+
+export function recordDeletedCardTombstones(
+  items: DeletedCardTombstone[]
+): Promise<Record<string, DeletedCardTombstone>> {
+  return enqueueTombstoneTask(async () => {
+    const current = await loadDeletedCardTombstonesFromIndexedDb();
+    const next = { ...current };
+    for (const item of items) {
+      if (!item.cardId) continue;
+      const prev = next[item.cardId];
+      next[item.cardId] = prev
+        ? {
+            ...prev,
+            ...item,
+            deletedAt: Math.max(prev.deletedAt, item.deletedAt),
+            diskFilesDeleted: Boolean(item.diskFilesDeleted || prev.diskFilesDeleted),
+          }
+        : item;
+    }
+    return writeDeletedCardTombstonesRaw(next);
+  });
+}
+
+export function removeDeletedCardTombstones(
   cardIds: string[]
 ): Promise<Record<string, DeletedCardTombstone>> {
-  const current = await loadDeletedCardTombstonesFromIndexedDb();
-  if (cardIds.length === 0) return current;
-  let changed = false;
-  const next = { ...current };
-  for (const id of cardIds) {
-    if (id in next) {
-      delete next[id];
-      changed = true;
+  return enqueueTombstoneTask(async () => {
+    const current = await loadDeletedCardTombstonesFromIndexedDb();
+    if (cardIds.length === 0) return current;
+    let changed = false;
+    const next = { ...current };
+    for (const id of cardIds) {
+      if (id in next) {
+        delete next[id];
+        changed = true;
+      }
     }
-  }
-  if (changed) {
-    await saveDeletedCardTombstones(next);
-  }
-  return next;
+    if (changed) {
+      return writeDeletedCardTombstonesRaw(next);
+    }
+    return next;
+  });
 }
 
 export async function saveBoundDirectoryHandle(
@@ -940,6 +962,493 @@ export function saveWorkflowCardsSafely(cards: WorkflowCollectionCard[]): {
       };
     }
   }
+}
+
+// ============================================================================
+// 增量文件夹同步引擎（基于 updatedAt 时间戳 + contentHash 指纹比对 + 分片让出主线程）
+// ============================================================================
+
+export interface FolderSyncManifestRecord {
+  cardId: string;
+  relativePath: string;
+  contentHash: string;
+  imageContentHash?: string;
+  imageByteSize?: number;
+  imageFileName?: string;
+  updatedAt: number;
+  syncedAt: number;
+}
+
+export interface FolderSyncProgress {
+  done: number;
+  total: number;
+  percent: number;
+  currentTitle: string;
+  action: 'check' | 'skip' | 'add' | 'update-meta' | 'update-full' | 'done';
+  actionLabel: string;
+  addedCount: number;
+  updatedCount: number;
+  skippedCount: number;
+}
+
+export interface CardSyncDiffDecision {
+  changed: boolean;
+  reason:
+    | 'new'
+    | 'path-changed'
+    | 'timestamp-and-hash-changed'
+    | 'hash-changed'
+    | 'unchanged';
+  skipImageWrite: boolean;
+  contentHash: string;
+}
+
+export interface IncrementalSyncBatchResult<TEntry extends FolderSyncManifestRecord> {
+  addedCount: number;
+  updatedCount: number;
+  skippedCount: number;
+  succeededIds: string[];
+  failed: { cardId: string; title: string; error: string }[];
+  updatedCardsById: Map<string, WorkflowCollectionCard>;
+  entries: Record<string, TEntry>;
+  deletedTombstones: Record<string, DeletedCardTombstone>;
+}
+
+export function computeFastStringDigest64(input: string): string {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b9;
+  for (let i = 0; i < input.length; i++) {
+    const code = input.charCodeAt(i);
+    h1 ^= code;
+    h1 = Math.imul(h1, 0x01000193);
+    h2 ^= code + ((i & 0xff) << 3);
+    h2 = Math.imul(h2, 0x85ebca6b);
+  }
+  return `fnv64:${(h1 >>> 0).toString(16).padStart(8, '0')}${(h2 >>> 0)
+    .toString(16)
+    .padStart(8, '0')}:${input.length}`;
+}
+
+export async function computeBlobContentHash(blob: Blob): Promise<string> {
+  const buf = await blob.arrayBuffer();
+  if (
+    typeof crypto !== 'undefined' &&
+    crypto.subtle &&
+    typeof crypto.subtle.digest === 'function'
+  ) {
+    try {
+      const digest = await crypto.subtle.digest('SHA-256', buf);
+      const bytes = new Uint8Array(digest);
+      let hex = '';
+      for (let i = 0; i < bytes.length; i++) {
+        hex += bytes[i].toString(16).padStart(2, '0');
+      }
+      return `sha256:${hex}`;
+    } catch {
+      // fall through to deterministic byte hash fallback
+    }
+  }
+  const bytes = new Uint8Array(buf);
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b9;
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    h1 ^= b;
+    h1 = Math.imul(h1, 0x01000193);
+    h2 ^= b + ((i & 0xff) << 1);
+    h2 = Math.imul(h2, 0x85ebca6b);
+  }
+  return `fnv64:${(h1 >>> 0).toString(16).padStart(8, '0')}${(h2 >>> 0)
+    .toString(16)
+    .padStart(8, '0')}:${bytes.length}`;
+}
+
+export function computeCardSyncContentHash(card: WorkflowCollectionCard): string {
+  const canonical = JSON.stringify({
+    title: card.title.trim(),
+    tags: card.tags.map((t) => t.trim()).filter(Boolean),
+    isPrivate: Boolean(card.isPrivate),
+    workflowFormat: card.workflowFormat,
+    rawWorkflowJson: card.rawWorkflowJson,
+    apiPromptJson: card.apiPromptJson ?? '',
+    extractedPositive: card.extractedPositive,
+    extractedNegative: card.extractedNegative,
+    fineTunedPositive: card.fineTunedPositive,
+    fineTunedNegative: card.fineTunedNegative,
+    positiveNodeId: card.positiveNodeId ?? null,
+    negativeNodeId: card.negativeNodeId ?? null,
+    applyFineTuneOnSend: card.applyFineTuneOnSend,
+    seedMode: card.seedMode ?? 'workflow',
+    fixedSeed: card.seedMode === 'fixed' ? card.fixedSeed ?? null : null,
+    imageName: card.imageName,
+    imageByteSize: card.imageByteSize ?? null,
+    imageContentHash: card.imageContentHash ?? null,
+  });
+  return computeFastStringDigest64(canonical);
+}
+
+/**
+ * 基于卡片更新时间戳 (updatedAt) 与文件内容指纹 (contentHash / imageContentHash) 判定是否需要执行本地磁盘 IO。
+ * - 若目标路径、updatedAt 与 contentHash 均未变更，直接跳过写入；
+ * - 若仅元数据/提示词变更而原图路径与 imageContentHash 未变，跳过耗时的大体积原图重写。
+ */
+export function evaluateCardIncrementalSyncDiff(params: {
+  card: WorkflowCollectionCard;
+  targetRelativePath: string;
+  prevEntry?: {
+    relativePath: string;
+    contentHash?: string;
+    contentFingerprint?: string;
+    imageContentHash?: string;
+    updatedAt?: number;
+  } | null;
+  computedContentHash?: string;
+}): CardSyncDiffDecision {
+  const { card, targetRelativePath, prevEntry } = params;
+  const contentHash =
+    params.computedContentHash ||
+    card.contentFingerprint ||
+    computeCardSyncContentHash(card);
+
+  if (!prevEntry) {
+    return {
+      changed: true,
+      reason: 'new',
+      skipImageWrite: false,
+      contentHash,
+    };
+  }
+
+  const prevHash = prevEntry.contentHash || prevEntry.contentFingerprint || '';
+  const isSamePath = prevEntry.relativePath === targetRelativePath;
+  const isSameTimestamp =
+    typeof prevEntry.updatedAt === 'number' && prevEntry.updatedAt === card.updatedAt;
+  const isSameHash = Boolean(prevHash) && prevHash === contentHash;
+
+  if (isSamePath && isSameHash) {
+    return {
+      changed: false,
+      reason: 'unchanged',
+      skipImageWrite: true,
+      contentHash,
+    };
+  }
+
+  const skipImageWrite =
+    isSamePath &&
+    Boolean(card.imageContentHash) &&
+    prevEntry.imageContentHash === card.imageContentHash;
+
+  if (!isSamePath) {
+    return {
+      changed: true,
+      reason: 'path-changed',
+      skipImageWrite: false,
+      contentHash,
+    };
+  }
+
+  return {
+    changed: true,
+    reason: isSameTimestamp ? 'hash-changed' : 'timestamp-and-hash-changed',
+    skipImageWrite,
+    contentHash,
+  };
+}
+
+export async function loadFolderSyncManifestFromIndexedDb(
+  folderKey: string
+): Promise<Record<string, FolderSyncManifestRecord>> {
+  const db = await openStudioDb();
+  if (!db) return {};
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(STUDIO_IDB_CARDS_STORE, 'readonly');
+      const store = tx.objectStore(STUDIO_IDB_CARDS_STORE);
+      const req = store.get(`${STUDIO_IDB_SYNC_MANIFEST_KEY}:${folderKey}`);
+      req.onsuccess = () => {
+        const res = req.result as Record<string, FolderSyncManifestRecord> | undefined;
+        resolve(res && typeof res === 'object' ? res : {});
+      };
+      req.onerror = () => resolve({});
+    } catch {
+      resolve({});
+    }
+  });
+}
+
+export async function saveFolderSyncManifestToIndexedDb(
+  folderKey: string,
+  entries: Record<string, FolderSyncManifestRecord>
+): Promise<void> {
+  const db = await openStudioDb();
+  if (!db) return;
+  await new Promise<void>((resolve) => {
+    try {
+      const tx = db.transaction(STUDIO_IDB_CARDS_STORE, 'readwrite');
+      const store = tx.objectStore(STUDIO_IDB_CARDS_STORE);
+      store.put(entries, `${STUDIO_IDB_SYNC_MANIFEST_KEY}:${folderKey}`);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+      tx.onabort = () => resolve();
+    } catch {
+      resolve();
+    }
+  });
+}
+
+export function yieldToMainThread(): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, 0);
+  });
+}
+
+/**
+ * 在存储缓存层统一编排大规模卡片增量文件夹同步：
+ * 1. 基于时间片（每 4 张或每超过 12ms）主动让出主线程，避免数百张卡片同步卡顿 UI；
+ * 2. 通过 updatedAt + contentHash 增量比对，仅执行必要文件写入；
+ * 3. 持续回调细粒度 FolderSyncProgress，并仅在发生变更时更新同步索引。
+ */
+export async function runIncrementalFolderSync<
+  TEntry extends {
+    cardId: string;
+    relativePath: string;
+    contentFingerprint?: string;
+    contentHash?: string;
+    imageContentHash?: string;
+    imageByteSize?: number;
+    imageFileName?: string;
+    updatedAt: number;
+    syncedAt: number;
+  }
+>(params: {
+  cards: WorkflowCollectionCard[];
+  initialEntries: Record<string, TEntry>;
+  initialTombstones: Record<string, DeletedCardTombstone>;
+  folderStorageKey?: string;
+  isCardActive?: (cardId: string) => boolean;
+  prepareCard: (
+    card: WorkflowCollectionCard
+  ) => Promise<{
+    card: WorkflowCollectionCard;
+    targetRelativePath: string;
+  }>;
+  probeFallbackEntry?: (
+    card: WorkflowCollectionCard,
+    targetRelativePath: string
+  ) => Promise<TEntry | null>;
+  writeCard: (
+    card: WorkflowCollectionCard,
+    options: { skipImageWrite: boolean; previousRelativePath?: string }
+  ) => Promise<{
+    ok: boolean;
+    relativePath: string;
+    writtenImageFileName?: string;
+    card: WorkflowCollectionCard;
+    error?: string;
+  }>;
+  buildIndexEntry: (
+    card: WorkflowCollectionCard,
+    relativePath: string,
+    writtenImageFileName?: string
+  ) => TEntry;
+  persistIndex: (
+    entries: Record<string, TEntry>,
+    deletedTombstones: Record<string, DeletedCardTombstone>
+  ) => Promise<void>;
+  onProgress?: (progress: FolderSyncProgress) => void;
+}): Promise<IncrementalSyncBatchResult<TEntry & FolderSyncManifestRecord>> {
+  const {
+    cards,
+    initialEntries,
+    initialTombstones,
+    folderStorageKey,
+    isCardActive,
+    prepareCard,
+    probeFallbackEntry,
+    writeCard,
+    buildIndexEntry,
+    persistIndex,
+    onProgress,
+  } = params;
+
+  const entries: Record<string, TEntry> = { ...initialEntries };
+  const deletedTombstones: Record<string, DeletedCardTombstone> = { ...initialTombstones };
+  const succeededIds: string[] = [];
+  const failed: { cardId: string; title: string; error: string }[] = [];
+  const updatedCardsById = new Map<string, WorkflowCollectionCard>();
+
+  let addedCount = 0;
+  let updatedCount = 0;
+  let skippedCount = 0;
+  let indexDirty = false;
+
+  const total = cards.length;
+  let sliceStartTime =
+    typeof performance !== 'undefined' ? performance.now() : Date.now();
+  let processedInSlice = 0;
+
+  const emitProgress = (
+    done: number,
+    currentTitle: string,
+    action: FolderSyncProgress['action'],
+    actionLabel: string
+  ) => {
+    if (!onProgress) return;
+    onProgress({
+      done,
+      total,
+      percent: total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 100,
+      currentTitle,
+      action,
+      actionLabel,
+      addedCount,
+      updatedCount,
+      skippedCount,
+    });
+  };
+
+  for (let i = 0; i < total; i++) {
+    const rawCard = cards[i];
+    if (isCardActive && !isCardActive(rawCard.id)) {
+      continue;
+    }
+
+    let prevEntry: TEntry | undefined = entries[rawCard.id];
+
+    // 快速通道：若未改动且时间戳与本地已知指纹一致，避免重复对原图 Blob 做哈希计算
+    const precomputedHash = rawCard.contentFingerprint;
+    const { card: hashedCard, targetRelativePath } =
+      prevEntry &&
+      precomputedHash &&
+      rawCard.imageContentHash &&
+      prevEntry.updatedAt === rawCard.updatedAt &&
+      (prevEntry.contentHash || prevEntry.contentFingerprint) === precomputedHash &&
+      prevEntry.relativePath === (rawCard.folderSyncedPath || prevEntry.relativePath)
+        ? {
+            card: rawCard,
+            targetRelativePath: rawCard.folderSyncedPath || prevEntry.relativePath,
+          }
+        : await prepareCard(rawCard);
+
+    if (isCardActive && !isCardActive(rawCard.id)) {
+      continue;
+    }
+
+    if (!prevEntry && probeFallbackEntry) {
+      const probed = await probeFallbackEntry(hashedCard, targetRelativePath);
+      if (probed) {
+        prevEntry = probed;
+        entries[hashedCard.id] = probed;
+        indexDirty = true;
+      }
+    }
+
+    const diff = evaluateCardIncrementalSyncDiff({
+      card: hashedCard,
+      targetRelativePath,
+      prevEntry,
+      computedContentHash: hashedCard.contentFingerprint,
+    });
+
+    if (!diff.changed) {
+      skippedCount += 1;
+      emitProgress(i + 1, hashedCard.title, 'skip', '跳过未变更');
+      const syncedStateCard: WorkflowCollectionCard = {
+        ...hashedCard,
+        folderSyncedPath: targetRelativePath,
+        folderSyncedFingerprint: diff.contentHash,
+        folderSyncedImageHash: hashedCard.imageContentHash,
+        lastFolderSyncAt: hashedCard.lastFolderSyncAt ?? prevEntry?.syncedAt,
+      };
+      if (
+        rawCard.contentFingerprint !== syncedStateCard.contentFingerprint ||
+        rawCard.imageContentHash !== syncedStateCard.imageContentHash ||
+        rawCard.folderSyncedFingerprint !== syncedStateCard.folderSyncedFingerprint ||
+        rawCard.folderSyncedPath !== syncedStateCard.folderSyncedPath
+      ) {
+        updatedCardsById.set(hashedCard.id, syncedStateCard);
+      }
+    } else {
+      const isUpdate = Boolean(prevEntry);
+      const action: FolderSyncProgress['action'] = isUpdate
+        ? diff.skipImageWrite
+          ? 'update-meta'
+          : 'update-full'
+        : 'add';
+      const actionLabel = isUpdate
+        ? diff.skipImageWrite
+          ? '更新元数据'
+          : '更新卡片'
+        : '写入新增';
+
+      emitProgress(i, hashedCard.title, action, actionLabel);
+
+      const res = await writeCard(hashedCard, {
+        skipImageWrite: diff.skipImageWrite,
+        previousRelativePath: prevEntry?.relativePath,
+      });
+
+      if (res.ok) {
+        succeededIds.push(hashedCard.id);
+        updatedCardsById.set(hashedCard.id, res.card);
+        entries[hashedCard.id] = buildIndexEntry(
+          res.card,
+          res.relativePath,
+          res.writtenImageFileName
+        );
+        if (hashedCard.id in deletedTombstones) {
+          delete deletedTombstones[hashedCard.id];
+        }
+        indexDirty = true;
+        if (isUpdate) updatedCount += 1;
+        else addedCount += 1;
+        emitProgress(i + 1, hashedCard.title, action, actionLabel);
+      } else {
+        failed.push({
+          cardId: hashedCard.id,
+          title: hashedCard.title,
+          error: res.error || '写入失败',
+        });
+      }
+    }
+
+    processedInSlice += 1;
+    const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    if (processedInSlice >= 4 || nowMs - sliceStartTime >= 12) {
+      await yieldToMainThread();
+      processedInSlice = 0;
+      sliceStartTime =
+        typeof performance !== 'undefined' ? performance.now() : Date.now();
+    }
+  }
+
+  const normalizedEntries: Record<string, TEntry & FolderSyncManifestRecord> = {};
+  for (const [id, entry] of Object.entries(entries)) {
+    normalizedEntries[id] = {
+      ...entry,
+      contentHash: entry.contentHash || entry.contentFingerprint || '',
+    };
+  }
+
+  if (indexDirty) {
+    await persistIndex(entries, deletedTombstones);
+    if (folderStorageKey && isIndexedDbSupported()) {
+      void saveFolderSyncManifestToIndexedDb(folderStorageKey, normalizedEntries);
+    }
+  }
+
+  emitProgress(total, '', 'done', '完成');
+  return {
+    addedCount,
+    updatedCount,
+    skippedCount,
+    succeededIds,
+    failed,
+    updatedCardsById,
+    entries: normalizedEntries,
+    deletedTombstones,
+  };
 }
 
 

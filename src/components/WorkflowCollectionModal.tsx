@@ -375,12 +375,21 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     type: 'ok' | 'warn' | 'err';
     text: string;
   } | null>(null);
+  const [deleteStatus, setDeleteStatus] = useState<{
+    phase: 'pending' | 'done' | 'warn';
+    count: number;
+    text: string;
+  } | null>(null);
   const [isSyncingFolder, setIsSyncingFolder] = useState(false);
   const [syncProgress, setSyncProgress] = useState<{
     done: number;
     total: number;
+    percent?: number;
     currentTitle: string;
     actionLabel?: string;
+    addedCount?: number;
+    updatedCount?: number;
+    skippedCount?: number;
   } | null>(null);
   const [isScanningFolder, setIsScanningFolder] = useState(false);
   const [scanProgress, setScanProgress] = useState<{
@@ -413,13 +422,35 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const jsonInputRef = useRef<HTMLInputElement | null>(null);
   const collectionImportRef = useRef<HTMLInputElement | null>(null);
+  const cardGridRef = useRef<HTMLDivElement | null>(null);
   const draftPreviewUrlRef = useRef<string | undefined>(undefined);
-  const cardsRef = useRef<WorkflowCollectionCard[]>(cards);
-  cardsRef.current = cards;
   const tombstonesRef = useRef<Record<string, DeletedCardTombstone>>(
     loadDeletedCardTombstones()
   );
   const deletedIdsSessionRef = useRef<Set<string>>(new Set());
+  const cardsRef = useRef<WorkflowCollectionCard[]>(cards);
+  cardsRef.current =
+    deletedIdsSessionRef.current.size > 0
+      ? cards.filter((c) => !deletedIdsSessionRef.current.has(c.id))
+      : cards;
+  const boundDirHandleRef = useRef<FileSystemDirectoryHandle | null>(boundDirHandle);
+  boundDirHandleRef.current = boundDirHandle;
+  const dirPermStateRef = useRef<'none' | 'granted' | 'prompt' | 'denied'>(dirPermState);
+  dirPermStateRef.current = dirPermState;
+  const folderIoQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const pendingDeleteCardsRef = useRef<Map<string, WorkflowCollectionCard>>(new Map());
+  const deleteFlushScheduledRef = useRef(false);
+  const deleteToastTimerRef = useRef<number | null>(null);
+  const burstDeletedTotalRef = useRef(0);
+
+  const enqueueFolderIo = useCallback(<T,>(task: () => Promise<T>): Promise<T> => {
+    const run = folderIoQueueRef.current.then(task, task);
+    folderIoQueueRef.current = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }, []);
 
   useEffect(() => {
     draftPreviewUrlRef.current = draft.previewObjectUrl;
@@ -429,6 +460,9 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     return () => {
       if (draftPreviewUrlRef.current) {
         URL.revokeObjectURL(draftPreviewUrlRef.current);
+      }
+      if (deleteToastTimerRef.current !== null) {
+        window.clearTimeout(deleteToastTimerRef.current);
       }
       clearCardImageCache();
     };
@@ -560,7 +594,28 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
   useEffect(() => {
     setPage(1);
+    setConfirmBulkDelete(false);
   }, [debouncedSearch, activeTagFilter, privateView, pageSize]);
+
+  useEffect(() => {
+    if (page > totalPages) {
+      setPage(totalPages);
+    }
+  }, [page, totalPages]);
+
+  useEffect(() => {
+    setSelectedCardIds((prev) => {
+      if (prev.size === 0) return prev;
+      const validIds = new Set(scopedCards.map((c) => c.id));
+      let changed = false;
+      const next = new Set<string>();
+      for (const id of prev) {
+        if (validIds.has(id)) next.add(id);
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [scopedCards]);
 
   useEffect(() => {
     setConfirmBulkDelete(false);
@@ -646,8 +701,12 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
   const commitCards = useCallback(
     (next: WorkflowCollectionCard[]) => {
-      cardsRef.current = next;
-      const res = onChangeCards(next);
+      const safeNext =
+        deletedIdsSessionRef.current.size > 0
+          ? next.filter((c) => !deletedIdsSessionRef.current.has(c.id))
+          : next;
+      cardsRef.current = safeNext;
+      const res = onChangeCards(safeNext);
       if (!res.ok && res.error) {
         setStorageWarning(res.error);
       } else {
@@ -665,95 +724,105 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     ) => {
       setIsScanningFolder(true);
       setScanProgress({ scanned: 0, currentPath: dirHandle.name });
-      const scanStartedAt = Date.now();
       try {
-        const res = await scanLocalDirectoryAndMerge(dirHandle, cardsRef.current, {
-          tombstones: tombstonesRef.current,
-          onProgress: (scanned, currentPath) => {
-            setScanProgress({ scanned, currentPath });
-          },
-        });
+        return await enqueueFolderIo(async () => {
+          const scanStartedAt = Date.now();
+          const res = await scanLocalDirectoryAndMerge(dirHandle, cardsRef.current, {
+            tombstones: tombstonesRef.current,
+            onProgress: (scanned, currentPath) => {
+              setScanProgress({ scanned, currentPath });
+            },
+          });
 
-        // 并发安全：防止扫描过程中被用户手动删除的卡片在异步返回时复活
-        const currentTombstones = tombstonesRef.current;
-        const deletedDuringScanIds = new Set<string>();
-        for (const [id, tomb] of Object.entries(currentTombstones)) {
-          if (tomb.deletedAt >= scanStartedAt) {
-            deletedDuringScanIds.add(id);
+          // 并发安全：防止扫描过程中被用户手动删除的卡片在异步返回时复活
+          const currentTombstones = tombstonesRef.current;
+          const deletedDuringScanIds = new Set<string>();
+          for (const [id, tomb] of Object.entries(currentTombstones)) {
+            if (tomb.deletedAt >= scanStartedAt) {
+              deletedDuringScanIds.add(id);
+            }
           }
-        }
-        for (const id of deletedIdsSessionRef.current) {
-          const tomb = currentTombstones[id];
-          if (!tomb || tomb.deletedAt >= scanStartedAt) {
-            deletedDuringScanIds.add(id);
+          for (const id of deletedIdsSessionRef.current) {
+            const tomb = currentTombstones[id];
+            if (!tomb || tomb.deletedAt >= scanStartedAt) {
+              deletedDuringScanIds.add(id);
+            }
           }
-        }
 
-        const safeTombstones = mergeDeletedTombstonesMaps(
-          res.tombstones,
-          currentTombstones
-        );
-        for (const clearedId of res.clearedTombstoneIds) {
-          if (!deletedDuringScanIds.has(clearedId)) {
-            deletedIdsSessionRef.current.delete(clearedId);
+          const safeTombstones = mergeDeletedTombstonesMaps(
+            res.tombstones,
+            currentTombstones
+          );
+          const clearedNotDeleted: string[] = [];
+          for (const clearedId of res.clearedTombstoneIds) {
+            if (!deletedDuringScanIds.has(clearedId)) {
+              deletedIdsSessionRef.current.delete(clearedId);
+              delete safeTombstones[clearedId];
+              clearedNotDeleted.push(clearedId);
+            }
           }
-        }
-        tombstonesRef.current = safeTombstones;
-        void saveDeletedCardTombstones(safeTombstones);
-
-        const safeIndexEntries = { ...res.indexEntries };
-        for (const delId of deletedDuringScanIds) {
-          delete safeIndexEntries[delId];
-        }
-        setFolderIndexMap(safeIndexEntries);
-
-        const safeMergedCards = res.mergedCards.filter(
-          (c) => !deletedDuringScanIds.has(c.id)
-        );
-        const safeMergedIdSet = new Set(safeMergedCards.map((c) => c.id));
-        const locallyAddedDuringScan = cardsRef.current.filter(
-          (c) => !safeMergedIdSet.has(c.id) && !deletedDuringScanIds.has(c.id)
-        );
-        const finalMergedCards = [...locallyAddedDuringScan, ...safeMergedCards];
-
-        const safeAdded = res.addedCards.filter((c) => !deletedDuringScanIds.has(c.id));
-        const safeUpdated = res.updatedCards.filter((c) => !deletedDuringScanIds.has(c.id));
-
-        if (
-          safeAdded.length > 0 ||
-          safeUpdated.length > 0 ||
-          res.restoredImageBlobsCount > 0
-        ) {
-          commitCards(finalMergedCards);
-        }
-
-        if (res.discoveredCardsCount === 0 && res.skippedTombstones.length === 0) {
-          if (!options?.silentIfEmpty) {
-            setFolderNotice({
-              type: 'ok',
-              text: `已绑定本地文件夹「${dirHandle.name}」：目录中暂未发现已有卡片（.card.json），可点击右侧「增量同步」将当前工作台卡片写入本地`,
-            });
+          tombstonesRef.current = safeTombstones;
+          if (clearedNotDeleted.length > 0) {
+            void removeDeletedCardTombstones(clearedNotDeleted);
           }
+          void saveDeletedCardTombstones(safeTombstones);
+
+          const safeIndexEntries = { ...res.indexEntries };
+          for (const delId of deletedDuringScanIds) {
+            delete safeIndexEntries[delId];
+          }
+          setFolderIndexMap(safeIndexEntries);
+
+          const safeMergedCards = res.mergedCards.filter(
+            (c) => !deletedDuringScanIds.has(c.id)
+          );
+          const safeMergedIdSet = new Set(safeMergedCards.map((c) => c.id));
+          const locallyAddedDuringScan = cardsRef.current.filter(
+            (c) => !safeMergedIdSet.has(c.id) && !deletedDuringScanIds.has(c.id)
+          );
+          const finalMergedCards = [...locallyAddedDuringScan, ...safeMergedCards];
+
+          const safeAdded = res.addedCards.filter((c) => !deletedDuringScanIds.has(c.id));
+          const safeUpdated = res.updatedCards.filter((c) => !deletedDuringScanIds.has(c.id));
+
+          if (
+            safeAdded.length > 0 ||
+            safeUpdated.length > 0 ||
+            res.restoredImageBlobsCount > 0
+          ) {
+            commitCards(finalMergedCards);
+          }
+
+          if (res.discoveredCardsCount === 0 && res.skippedTombstones.length === 0) {
+            if (!options?.silentIfEmpty) {
+              setFolderNotice({
+                type: 'ok',
+                text: `已绑定本地文件夹「${dirHandle.name}」：目录中暂未发现已有卡片（.card.json），可点击右侧「增量同步」将当前工作台卡片写入本地`,
+              });
+            }
+            return res;
+          }
+
+          const totalSkippedCount =
+            res.stats.skippedDuplicateCount + res.stats.skippedTombstoneCount;
+          const extraRestoreNote =
+            res.restoredImageBlobsCount > 0
+              ? `（含补齐原图 ${res.restoredImageBlobsCount} 张）`
+              : '';
+          const tombstoneSkipNote =
+            res.stats.skippedTombstoneCount > 0
+              ? `，其中拦截已删除卡片 ${res.stats.skippedTombstoneCount} 张`
+              : '';
+          const reintroNote =
+            res.reintroducedFromTombstone.length > 0
+              ? `（检测到文件夹中重新放入曾删除的同名/同源新文件 ${res.reintroducedFromTombstone.length} 张，已重新收录）`
+              : '';
+          setFolderNotice({
+            type: res.reintroducedFromTombstone.length > 0 ? 'warn' : 'ok',
+            text: `已从「${dirHandle.name}」扫描 ${res.discoveredCardsCount} 张卡片：新增 ${safeAdded.length} 张 · 更新 ${safeUpdated.length} 张${extraRestoreNote} · 跳过 ${totalSkippedCount} 张（重复/未变更 ${res.stats.skippedDuplicateCount} 张${tombstoneSkipNote}）${reintroNote}`,
+          });
           return res;
-        }
-
-        const extraRestoreNote =
-          res.restoredImageBlobsCount > 0
-            ? `（含补齐原图 ${res.restoredImageBlobsCount} 张）`
-            : '';
-        const tombstoneSkipNote =
-          res.skippedTombstones.length > 0
-            ? `，拦截已删除卡片 ${res.skippedTombstones.length} 张`
-            : '';
-        const reintroNote =
-          res.reintroducedFromTombstone.length > 0
-            ? `（检测到文件夹中重新放入曾删除的同名/同源新文件 ${res.reintroducedFromTombstone.length} 张，已重新收录）`
-            : '';
-        setFolderNotice({
-          type: res.reintroducedFromTombstone.length > 0 ? 'warn' : 'ok',
-          text: `已从「${dirHandle.name}」扫描 ${res.discoveredCardsCount} 张卡片：新增 ${safeAdded.length} 张、更新 ${safeUpdated.length} 张${extraRestoreNote}、跳过重复/未变更 ${res.skippedDuplicates.length} 张${tombstoneSkipNote}${reintroNote}`,
         });
-        return res;
       } catch (err) {
         setFolderNotice({
           type: 'warn',
@@ -768,7 +837,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         setScanProgress(null);
       }
     },
-    [commitCards]
+    [commitCards, enqueueFolderIo]
   );
 
   const handleSelectLocalFolder = async () => {
@@ -839,59 +908,73 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       updatedCard?: WorkflowCollectionCard;
       error?: string;
     }> => {
-      if (!boundDirHandle || dirPermState !== 'granted') {
+      if (!boundDirHandleRef.current || dirPermStateRef.current !== 'granted') {
         return { written: false };
       }
-      const blobsByCardId = new Map<string, Blob>();
-      if (overrideBlob) {
-        blobsByCardId.set(card.id, overrideBlob);
-      }
-      const res = await syncCardsIncrementalToLocalDirectory(boundDirHandle, [card], {
-        blobsByCardId: blobsByCardId.size > 0 ? blobsByCardId : undefined,
-        isCardActive: (cardId) => !deletedIdsSessionRef.current.has(cardId),
-        extraTombstones: tombstonesRef.current,
-      });
-      const cleanedIndex = { ...res.indexEntries };
-      for (const delId of deletedIdsSessionRef.current) {
-        delete cleanedIndex[delId];
-      }
-      setFolderIndexMap(cleanedIndex);
-      if (res.failed.length > 0) {
-        return { written: false, error: res.failed[0].error };
-      }
-      const syncedCard = res.updatedCardsById.get(card.id);
-      if (res.skippedCount > 0 && res.addedCount === 0 && res.updatedCount === 0) {
+      return enqueueFolderIo(async () => {
+        const activeHandle = boundDirHandleRef.current;
+        if (
+          !activeHandle ||
+          dirPermStateRef.current !== 'granted' ||
+          deletedIdsSessionRef.current.has(card.id)
+        ) {
+          return { written: false };
+        }
+        const blobsByCardId = new Map<string, Blob>();
+        if (overrideBlob) {
+          blobsByCardId.set(card.id, overrideBlob);
+        }
+        const res = await syncCardsIncrementalToLocalDirectory(activeHandle, [card], {
+          blobsByCardId: blobsByCardId.size > 0 ? blobsByCardId : undefined,
+          isCardActive: (cardId) => !deletedIdsSessionRef.current.has(cardId),
+          extraTombstones: tombstonesRef.current,
+        });
+        const cleanedIndex = { ...res.indexEntries };
+        for (const delId of deletedIdsSessionRef.current) {
+          delete cleanedIndex[delId];
+        }
+        setFolderIndexMap(cleanedIndex);
+        if (res.failed.length > 0) {
+          return { written: false, error: res.failed[0].error };
+        }
+        const syncedCard = res.updatedCardsById.get(card.id);
+        if (res.skippedCount > 0 && res.addedCount === 0 && res.updatedCount === 0) {
+          return {
+            written: false,
+            skippedUnchanged: true,
+            path: buildCardFolderPathSegments(card).join('/'),
+            updatedCard: syncedCard,
+          };
+        }
         return {
-          written: false,
-          skippedUnchanged: true,
+          written: true,
           path: buildCardFolderPathSegments(card).join('/'),
           updatedCard: syncedCard,
         };
-      }
-      return {
-        written: true,
-        path: buildCardFolderPathSegments(card).join('/'),
-        updatedCard: syncedCard,
-      };
+      });
     },
-    [boundDirHandle, dirPermState]
+    [enqueueFolderIo]
   );
 
   const handleSyncScopedCardsToFolder = async (cardsOverride?: WorkflowCollectionCard[]) => {
-    if (!boundDirHandle) {
+    const dirHandle = boundDirHandleRef.current;
+    if (!dirHandle) {
       await handleSelectLocalFolder();
       return;
     }
-    const perm = await ensureDirectoryWritePermission(boundDirHandle, true);
+    const perm = await ensureDirectoryWritePermission(dirHandle, true);
     setDirPermState(perm);
+    dirPermStateRef.current = perm;
     if (perm !== 'granted') {
       setFolderNotice({
         type: 'warn',
-        text: `未获得「${boundDirHandle.name}」写入权限，无法写入磁盘；已保留浏览器缓存并可使用「导出集」下载`,
+        text: `未获得「${dirHandle.name}」写入权限，无法写入磁盘；已保留浏览器缓存并可使用「导出集」下载`,
       });
       return;
     }
-    const targetCards = cardsOverride ?? scopedCards;
+    const targetCards = (cardsOverride ?? scopedCards).filter(
+      (c) => !deletedIdsSessionRef.current.has(c.id)
+    );
     if (targetCards.length === 0) {
       setFolderNotice({
         type: 'warn',
@@ -908,42 +991,56 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       actionLabel: '比对差异',
     });
     try {
-      const res = await syncCardsIncrementalToLocalDirectory(boundDirHandle, targetCards, {
-        isCardActive: (cardId) => !deletedIdsSessionRef.current.has(cardId),
-        extraTombstones: tombstonesRef.current,
-        onProgress: (done, total, currentTitle, actionLabel) => {
-          setSyncProgress({ done, total, currentTitle, actionLabel });
-        },
-      });
-      const cleanedIndex = { ...res.indexEntries };
-      for (const delId of deletedIdsSessionRef.current) {
-        delete cleanedIndex[delId];
-      }
-      setFolderIndexMap(cleanedIndex);
-      if (res.updatedCardsById.size > 0) {
-        commitCards(
-          cardsRef.current.map((c) => res.updatedCardsById.get(c.id) ?? c)
+      await enqueueFolderIo(async () => {
+        const activeCards = targetCards.filter(
+          (c) => !deletedIdsSessionRef.current.has(c.id)
         );
-      }
+        const res = await syncCardsIncrementalToLocalDirectory(dirHandle, activeCards, {
+          isCardActive: (cardId) => !deletedIdsSessionRef.current.has(cardId),
+          extraTombstones: tombstonesRef.current,
+          onProgress: (done, total, currentTitle, actionLabel, detail) => {
+            setSyncProgress({
+              done,
+              total,
+              percent: detail?.percent,
+              currentTitle,
+              actionLabel,
+              addedCount: detail?.addedCount,
+              updatedCount: detail?.updatedCount,
+              skippedCount: detail?.skippedCount,
+            });
+          },
+        });
+        const cleanedIndex = { ...res.indexEntries };
+        for (const delId of deletedIdsSessionRef.current) {
+          delete cleanedIndex[delId];
+        }
+        setFolderIndexMap(cleanedIndex);
+        if (res.updatedCardsById.size > 0) {
+          commitCards(
+            cardsRef.current.map((c) => res.updatedCardsById.get(c.id) ?? c)
+          );
+        }
 
-      if (res.failed.length === 0) {
-        if (res.addedCount === 0 && res.updatedCount === 0) {
-          setFolderNotice({
-            type: 'ok',
-            text: `「${boundDirHandle.name}」已是最新，无需重写（跳过未变更 ${res.skippedCount} 张）`,
-          });
+        if (res.failed.length === 0) {
+          if (res.addedCount === 0 && res.updatedCount === 0) {
+            setFolderNotice({
+              type: 'ok',
+              text: `「${dirHandle.name}」已是最新，无需重写（跳过未变更 ${res.skippedCount} 张）`,
+            });
+          } else {
+            setFolderNotice({
+              type: 'ok',
+              text: `增量同步完成（${dirHandle.name}）：新增 ${res.addedCount} 张、更新 ${res.updatedCount} 张、跳过未变更 ${res.skippedCount} 张`,
+            });
+          }
         } else {
           setFolderNotice({
-            type: 'ok',
-            text: `增量同步完成（${boundDirHandle.name}）：新增 ${res.addedCount} 张、更新 ${res.updatedCount} 张、跳过未变更 ${res.skippedCount} 张`,
+            type: 'warn',
+            text: `增量同步部分完成：新增 ${res.addedCount} 张、更新 ${res.updatedCount} 张、跳过 ${res.skippedCount} 张，${res.failed.length} 张写入失败（${res.failed[0]?.title}: ${res.failed[0]?.error}）`,
           });
         }
-      } else {
-        setFolderNotice({
-          type: 'warn',
-          text: `增量同步部分完成：新增 ${res.addedCount} 张、更新 ${res.updatedCount} 张、跳过 ${res.skippedCount} 张，${res.failed.length} 张写入失败（${res.failed[0]?.title}: ${res.failed[0]?.error}）`,
-        });
-      }
+      });
     } finally {
       setIsSyncingFolder(false);
       setSyncProgress(null);
@@ -951,45 +1048,57 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   };
 
   const handleWriteSingleCardToFolder = async (card: WorkflowCollectionCard) => {
-    if (!boundDirHandle) {
+    const dirHandle = boundDirHandleRef.current;
+    if (!dirHandle) {
       await handleSelectLocalFolder();
       return;
     }
-    const perm = await ensureDirectoryWritePermission(boundDirHandle, true);
+    const perm = await ensureDirectoryWritePermission(dirHandle, true);
     setDirPermState(perm);
+    dirPermStateRef.current = perm;
     if (perm !== 'granted') {
       setFolderNotice({
         type: 'warn',
-        text: `未获得「${boundDirHandle.name}」写入权限，请先授权或改用单卡下载`,
+        text: `未获得「${dirHandle.name}」写入权限，请先授权或改用单卡下载`,
       });
       return;
     }
-    const res = await syncCardsIncrementalToLocalDirectory(boundDirHandle, [card]);
-    setFolderIndexMap(res.indexEntries);
-    if (res.failed.length > 0) {
-      setFolderNotice({
-        type: 'err',
-        text: `写入「${card.title}」失败：${res.failed[0].error}`,
+    await enqueueFolderIo(async () => {
+      if (deletedIdsSessionRef.current.has(card.id)) return;
+      const res = await syncCardsIncrementalToLocalDirectory(dirHandle, [card], {
+        isCardActive: (cardId) => !deletedIdsSessionRef.current.has(cardId),
+        extraTombstones: tombstonesRef.current,
       });
-      return;
-    }
-    const updatedCard = res.updatedCardsById.get(card.id);
-    if (updatedCard) {
-      commitCards(
-        cardsRef.current.map((c) => (c.id === card.id ? updatedCard : c))
-      );
-    }
-    if (res.skippedCount > 0 && res.addedCount === 0 && res.updatedCount === 0) {
-      setFolderNotice({
-        type: 'ok',
-        text: `「${card.title}」与本地文件夹内容一致，已是最新无需重写`,
-      });
-    } else {
-      setFolderNotice({
-        type: 'ok',
-        text: `已将「${card.title}」增量写入「${boundDirHandle.name}/${buildCardFolderPathSegments(card).join('/')}」`,
-      });
-    }
+      const cleanedIndex = { ...res.indexEntries };
+      for (const delId of deletedIdsSessionRef.current) {
+        delete cleanedIndex[delId];
+      }
+      setFolderIndexMap(cleanedIndex);
+      if (res.failed.length > 0) {
+        setFolderNotice({
+          type: 'err',
+          text: `写入「${card.title}」失败：${res.failed[0].error}`,
+        });
+        return;
+      }
+      const updatedCard = res.updatedCardsById.get(card.id);
+      if (updatedCard) {
+        commitCards(
+          cardsRef.current.map((c) => (c.id === card.id ? updatedCard : c))
+        );
+      }
+      if (res.skippedCount > 0 && res.addedCount === 0 && res.updatedCount === 0) {
+        setFolderNotice({
+          type: 'ok',
+          text: `「${card.title}」与本地文件夹内容一致，已是最新无需重写`,
+        });
+      } else {
+        setFolderNotice({
+          type: 'ok',
+          text: `已将「${card.title}」增量写入「${dirHandle.name}/${buildCardFolderPathSegments(card).join('/')}」`,
+        });
+      }
+    });
   };
 
   const handleFilesIngest = useCallback(async (files: FileList | File[]) => {
@@ -1299,6 +1408,12 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       })
     );
     if (res.ok) {
+      setSelectedCardIds((prev) => {
+        if (!prev.has(cardId)) return prev;
+        const next = new Set(prev);
+        next.delete(cardId);
+        return next;
+      });
       if (editingCardId === cardId) {
         setEditIsPrivate(nextPrivate);
       }
@@ -1311,25 +1426,168 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     }
   };
 
+  const scheduleDeletePersistenceFlush = useCallback(() => {
+    if (deleteFlushScheduledRef.current) return;
+    deleteFlushScheduledRef.current = true;
+
+    void enqueueFolderIo(async () => {
+      deleteFlushScheduledRef.current = false;
+      const batchCards = Array.from(pendingDeleteCardsRef.current.values());
+      if (batchCards.length === 0) return;
+      pendingDeleteCardsRef.current.clear();
+
+      const batchIds = batchCards.map((c) => c.id);
+      const deletedAt = Date.now();
+      const batchTombstones: DeletedCardTombstone[] = batchCards.map((c) => ({
+        cardId: c.id,
+        title: c.title,
+        deletedAt,
+        contentFingerprint: c.contentFingerprint || computeCardContentFingerprint(c),
+        imageContentHash: c.imageContentHash,
+        imageName: c.imageName,
+        imageByteSize: c.imageByteSize,
+        relativePath: c.folderSyncedPath || buildCardFolderPathSegments(c).join('/'),
+        diskFilesDeleted: false,
+      }));
+
+      await deleteCardImageBlobsBatch(batchIds);
+      const updatedLocalTombstones = await recordDeletedCardTombstones(batchTombstones);
+      tombstonesRef.current = mergeDeletedTombstonesMaps(
+        tombstonesRef.current,
+        updatedLocalTombstones
+      );
+
+      let removedFilesCount = 0;
+      let folderWarnText: string | null = null;
+      const activeDirHandle = boundDirHandleRef.current;
+
+      if (activeDirHandle) {
+        let perm = dirPermStateRef.current;
+        if (perm !== 'granted') {
+          perm = await ensureDirectoryWritePermission(activeDirHandle, true);
+          setDirPermState(perm);
+          dirPermStateRef.current = perm;
+        }
+        if (perm === 'granted') {
+          const delRes = await deleteCardsFromLocalDirectory(
+            activeDirHandle,
+            batchCards,
+            { extraTombstones: tombstonesRef.current }
+          );
+          removedFilesCount = delRes.removedFilesCount;
+          const cleanedIndex = { ...delRes.indexEntries };
+          for (const delId of deletedIdsSessionRef.current) {
+            delete cleanedIndex[delId];
+          }
+          setFolderIndexMap(cleanedIndex);
+          tombstonesRef.current = mergeDeletedTombstonesMaps(
+            tombstonesRef.current,
+            delRes.deletedTombstones
+          );
+          await saveDeletedCardTombstones(tombstonesRef.current);
+
+          if (delRes.failed.length > 0) {
+            folderWarnText = `已从工作台移除，但部分本地文件清理失败：${delRes.failed[0].error}`;
+          }
+        } else {
+          folderWarnText = `已从浏览器缓存删除 ${batchCards.length} 张卡片并记录删除墓碑（当前未获文件夹写权限，下次扫描不会误复活）`;
+        }
+      }
+
+      // 若在磁盘清理期间又有新的连续删除入队，立即续排并保持提示连贯
+      if (pendingDeleteCardsRef.current.size > 0) {
+        scheduleDeletePersistenceFlush();
+        return;
+      }
+
+      const finalBurstCount = Math.max(burstDeletedTotalRef.current, batchCards.length);
+      burstDeletedTotalRef.current = 0;
+
+      if (folderWarnText) {
+        setDeleteStatus({
+          phase: 'warn',
+          count: finalBurstCount,
+          text: folderWarnText,
+        });
+      } else {
+        const doneText = activeDirHandle
+          ? finalBurstCount === 1
+            ? `已彻底删除「${batchCards[0].title}」（同步移除本地文件 ${removedFilesCount} 个）`
+            : `已连续彻底删除 ${finalBurstCount} 张卡片（同步清理缓存与本地文件）`
+          : finalBurstCount === 1
+          ? `已彻底删除「${batchCards[0].title}」`
+          : `已连续彻底删除 ${finalBurstCount} 张卡片及其缓存原图`;
+        setDeleteStatus({
+          phase: 'done',
+          count: finalBurstCount,
+          text: doneText,
+        });
+        if (deleteToastTimerRef.current !== null) {
+          window.clearTimeout(deleteToastTimerRef.current);
+        }
+        deleteToastTimerRef.current = window.setTimeout(() => {
+          setDeleteStatus((prev) => (prev?.phase === 'done' ? null : prev));
+          deleteToastTimerRef.current = null;
+        }, 3200);
+      }
+    });
+  }, [enqueueFolderIo]);
+
   const performDeleteCards = useCallback(
-    async (cardsToDelete: WorkflowCollectionCard[], isBulk: boolean) => {
-      if (cardsToDelete.length === 0) return;
-      const targetIds = cardsToDelete.map((c) => c.id);
+    (cardsToDelete: WorkflowCollectionCard[], isBulk: boolean) => {
+      const uniqueNewTargets = cardsToDelete.filter(
+        (c) => !deletedIdsSessionRef.current.has(c.id)
+      );
+      if (uniqueNewTargets.length === 0) return;
+
+      // 键盘/连续删卡焦点保护：若当前焦点位于待删除卡片按钮上，删后平滑落回同位置的下一张卡
+      let activeDeleteBtnIndex = -1;
+      const activeEl = typeof document !== 'undefined' ? document.activeElement : null;
+      if (
+        activeEl instanceof HTMLElement &&
+        cardGridRef.current &&
+        cardGridRef.current.contains(activeEl)
+      ) {
+        const deleteBtns = Array.from(
+          cardGridRef.current.querySelectorAll<HTMLButtonElement>('[data-card-delete-btn]')
+        );
+        activeDeleteBtnIndex = deleteBtns.indexOf(activeEl as HTMLButtonElement);
+      }
+
+      const targetIds = uniqueNewTargets.map((c) => c.id);
       const targetIdSet = new Set(targetIds);
       const deletedAt = Date.now();
 
-      for (const id of targetIds) {
-        deletedIdsSessionRef.current.add(id);
+      for (const card of uniqueNewTargets) {
+        deletedIdsSessionRef.current.add(card.id);
+        pendingDeleteCardsRef.current.set(card.id, card);
       }
 
-      if (editingCardId && targetIdSet.has(editingCardId)) {
-        setEditingCardId(null);
+      // 立即同步更新内存墓碑，确保任意并发扫描/导入/同步瞬间可见，绝不复活
+      const immediateTombstones: Record<string, DeletedCardTombstone> = {};
+      for (const c of uniqueNewTargets) {
+        immediateTombstones[c.id] = {
+          cardId: c.id,
+          title: c.title,
+          deletedAt,
+          contentFingerprint: c.contentFingerprint || computeCardContentFingerprint(c),
+          imageContentHash: c.imageContentHash,
+          imageName: c.imageName,
+          imageByteSize: c.imageByteSize,
+          relativePath: c.folderSyncedPath || buildCardFolderPathSegments(c).join('/'),
+          diskFilesDeleted: false,
+        };
       }
-      if (lightboxCardId && targetIdSet.has(lightboxCardId)) {
-        setLightboxCardId(null);
-      }
+      tombstonesRef.current = mergeDeletedTombstonesMaps(
+        tombstonesRef.current,
+        immediateTombstones
+      );
+
+      setEditingCardId((prev) => (prev && targetIdSet.has(prev) ? null : prev));
+      setLightboxCardId((prev) => (prev && targetIdSet.has(prev) ? null : prev));
 
       setSelectedCardIds((prev) => {
+        if (prev.size === 0) return prev;
         let changed = false;
         const next = new Set(prev);
         for (const id of targetIds) {
@@ -1342,11 +1600,10 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       }
 
       invalidateCardImageCache(targetIds);
-      void deleteCardImageBlobsBatch(targetIds);
 
       // 立即从 cardsRef / IndexedDB workflow_cards / localStorage 中彻底移除
       const nextCards = cardsRef.current.filter((c) => !targetIdSet.has(c.id));
-      const saveRes = commitCards(nextCards);
+      commitCards(nextCards);
 
       // 立即移除同步状态索引中的已删条目
       setFolderIndexMap((prev) => {
@@ -1362,96 +1619,64 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         return changed ? next : prev;
       });
 
-      // 立即持久化删除墓碑（先标记 diskFilesDeleted: false，待磁盘清理完成后更新为 true）
-      const initialTombstones: DeletedCardTombstone[] = cardsToDelete.map((c) => ({
-        cardId: c.id,
-        title: c.title,
-        deletedAt,
-        contentFingerprint: c.contentFingerprint || computeCardContentFingerprint(c),
-        imageContentHash: c.imageContentHash,
-        imageName: c.imageName,
-        imageByteSize: c.imageByteSize,
-        relativePath: c.folderSyncedPath || buildCardFolderPathSegments(c).join('/'),
-        diskFilesDeleted: false,
-      }));
-      const updatedLocalTombstones = await recordDeletedCardTombstones(initialTombstones);
-      tombstonesRef.current = mergeDeletedTombstonesMaps(
-        tombstonesRef.current,
-        updatedLocalTombstones
-      );
-
-      // 若已绑定本地文件夹，同步清理磁盘上的 .card.json / .workflow.json / 原图及 .chibiprompt-sync-index.json
-      if (boundDirHandle) {
-        let perm = dirPermState;
-        if (perm !== 'granted') {
-          perm = await ensureDirectoryWritePermission(boundDirHandle, true);
-          setDirPermState(perm);
-        }
-        if (perm === 'granted') {
-          const delRes = await deleteCardsFromLocalDirectory(
-            boundDirHandle,
-            cardsToDelete,
-            { extraTombstones: tombstonesRef.current }
-          );
-          const cleanedIndex = { ...delRes.indexEntries };
-          for (const delId of deletedIdsSessionRef.current) {
-            delete cleanedIndex[delId];
-          }
-          setFolderIndexMap(cleanedIndex);
-          tombstonesRef.current = mergeDeletedTombstonesMaps(
-            tombstonesRef.current,
-            delRes.deletedTombstones
-          );
-          await saveDeletedCardTombstones(tombstonesRef.current);
-
-          if (delRes.failed.length === 0) {
-            const msg = isBulk
-              ? `已批量彻底删除 ${cardsToDelete.length} 张卡片及缓存原图，并同步清理本地文件夹 ${delRes.removedFilesCount} 个文件与索引`
-              : `已彻底删除「${cardsToDelete[0].title}」，并同步移除本地文件夹文件（${delRes.removedFilesCount} 个）与索引`;
-            setImportNotice({ type: 'ok', text: msg });
-            setFolderNotice({ type: 'ok', text: msg });
-          } else {
-            setFolderNotice({
-              type: 'warn',
-              text: `已从工作台删除，但部分本地文件清理失败：${delRes.failed[0].error}`,
-            });
-          }
-          return;
-        }
-
-        if (saveRes.ok) {
-          setImportNotice({
-            type: 'warn',
-            text: isBulk
-              ? `已从浏览器缓存删除 ${cardsToDelete.length} 张卡片并记录删除墓碑（当前未获文件夹写入权限，重新读取时将跳过未清理的旧文件）`
-              : `已从浏览器缓存删除「${cardsToDelete[0].title}」并记录删除墓碑（未获文件夹写权限，下次扫描不会误复活）`,
-          });
-        }
-        return;
+      if (deleteToastTimerRef.current !== null) {
+        window.clearTimeout(deleteToastTimerRef.current);
+        deleteToastTimerRef.current = null;
       }
+      burstDeletedTotalRef.current += uniqueNewTargets.length;
+      const pendingTotal = burstDeletedTotalRef.current;
+      setDeleteStatus({
+        phase: 'pending',
+        count: pendingTotal,
+        text: boundDirHandleRef.current
+          ? `正在同步删除 ${pendingTotal} 张卡片与本地文件夹残留...`
+          : `正在清理 ${pendingTotal} 张卡片缓存...`,
+      });
 
-      if (saveRes.ok && isBulk) {
-        setImportNotice({
-          type: 'ok',
-          text: `已批量彻底删除 ${cardsToDelete.length} 张卡片及其本地缓存原图`,
+      if (activeDeleteBtnIndex >= 0) {
+        window.requestAnimationFrame(() => {
+          if (
+            document.activeElement &&
+            document.activeElement !== document.body
+          ) {
+            return;
+          }
+          const nextBtns = Array.from(
+            cardGridRef.current?.querySelectorAll<HTMLButtonElement>('[data-card-delete-btn]') ??
+              []
+          );
+          if (nextBtns.length > 0) {
+            const targetBtn =
+              nextBtns[Math.min(activeDeleteBtnIndex, nextBtns.length - 1)];
+            targetBtn?.focus({ preventScroll: true });
+          }
         });
       }
+
+      scheduleDeletePersistenceFlush();
     },
-    [boundDirHandle, commitCards, dirPermState, editingCardId, lightboxCardId]
+    [commitCards, scheduleDeletePersistenceFlush]
   );
 
   const handleDeleteCard = (cardId: string) => {
+    if (deletedIdsSessionRef.current.has(cardId)) return;
     const target = cardsRef.current.find((c) => c.id === cardId);
     if (!target) return;
-    void performDeleteCards([target], false);
+    performDeleteCards([target], false);
   };
 
   const handleBulkTogglePrivate = (makePrivate: boolean) => {
     if (selectedCardIds.size === 0) return;
     const now = Date.now();
+    const targetIds = new Set(
+      cardsRef.current
+        .filter((c) => selectedCardIds.has(c.id) && Boolean(c.isPrivate) === privateView)
+        .map((c) => c.id)
+    );
+    if (targetIds.size === 0) return;
     const res = commitCards(
       cardsRef.current.map((c) => {
-        if (!selectedCardIds.has(c.id)) return c;
+        if (!targetIds.has(c.id)) return c;
         const updated: WorkflowCollectionCard = {
           ...c,
           isPrivate: makePrivate,
@@ -1465,10 +1690,11 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       setImportNotice({
         type: 'ok',
         text: makePrivate
-          ? `已将选中的 ${selectedCardIds.size} 张卡片设为私密`
-          : `已将选中的 ${selectedCardIds.size} 张卡片取消私密`,
+          ? `已将选中的 ${targetIds.size} 张卡片设为私密`
+          : `已将选中的 ${targetIds.size} 张卡片取消私密`,
       });
       setSelectedCardIds(new Set());
+      setConfirmBulkDelete(false);
     }
   };
 
@@ -1476,9 +1702,15 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     const tagsToAdd = parseTagsInput(batchTagInput);
     if (selectedCardIds.size === 0 || tagsToAdd.length === 0) return;
     const now = Date.now();
+    const targetIds = new Set(
+      cardsRef.current
+        .filter((c) => selectedCardIds.has(c.id) && Boolean(c.isPrivate) === privateView)
+        .map((c) => c.id)
+    );
+    if (targetIds.size === 0) return;
     const res = commitCards(
       cardsRef.current.map((c) => {
-        if (!selectedCardIds.has(c.id)) return c;
+        if (!targetIds.has(c.id)) return c;
         const mergedTags = Array.from(new Set([...c.tags, ...tagsToAdd]));
         const updated: WorkflowCollectionCard = {
           ...c,
@@ -1493,16 +1725,25 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       setBatchTagInput('');
       setImportNotice({
         type: 'ok',
-        text: `已为选中的 ${selectedCardIds.size} 张卡片批量添加标签：${tagsToAdd.join('、')}`,
+        text: `已为选中的 ${targetIds.size} 张卡片批量添加标签：${tagsToAdd.join('、')}`,
       });
     }
   };
 
   const handleBulkDeleteSelected = () => {
     if (selectedCardIds.size === 0) return;
-    const targets = cardsRef.current.filter((c) => selectedCardIds.has(c.id));
-    if (targets.length === 0) return;
-    void performDeleteCards(targets, true);
+    const targets = cardsRef.current.filter(
+      (c) =>
+        selectedCardIds.has(c.id) &&
+        Boolean(c.isPrivate) === privateView &&
+        !deletedIdsSessionRef.current.has(c.id)
+    );
+    if (targets.length === 0) {
+      setSelectedCardIds(new Set());
+      setConfirmBulkDelete(false);
+      return;
+    }
+    performDeleteCards(targets, true);
   };
 
   const handleDownloadCardOriginalImage = async (card: WorkflowCollectionCard) => {
@@ -1569,13 +1810,15 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         hour12: false,
       });
 
-      commitCards(
-        cardsRef.current.map((c) =>
-          c.id === card.id
-            ? { ...card, lastRunAt: Date.now(), lastPromptId: res.promptId }
-            : c
-        )
-      );
+      if (!deletedIdsSessionRef.current.has(card.id)) {
+        commitCards(
+          cardsRef.current.map((c) =>
+            c.id === card.id
+              ? { ...c, lastRunAt: Date.now(), lastPromptId: res.promptId }
+              : c
+          )
+        );
+      }
 
       setRunStatus({
         state: 'success',
@@ -1994,18 +2237,30 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       let folderSyncSummary = '';
 
       if (changedCards.length > 0) {
-        if (boundDirHandle && dirPermState === 'granted') {
-          const syncRes = await syncCardsIncrementalToLocalDirectory(
-            boundDirHandle,
-            changedCards,
-            {
-              blobsByCardId,
-              isCardActive: (cardId) => !deletedIdsSessionRef.current.has(cardId),
-              extraTombstones: tombstonesRef.current,
-              onProgress: (done, total, currentTitle, actionLabel) => {
-                setSyncProgress({ done, total, currentTitle, actionLabel });
-              },
-            }
+        const activeDirHandle = boundDirHandleRef.current;
+        if (activeDirHandle && dirPermStateRef.current === 'granted') {
+          const syncRes = await enqueueFolderIo(() =>
+            syncCardsIncrementalToLocalDirectory(
+              activeDirHandle,
+              changedCards.filter((c) => !deletedIdsSessionRef.current.has(c.id)),
+              {
+                blobsByCardId,
+                isCardActive: (cardId) => !deletedIdsSessionRef.current.has(cardId),
+                extraTombstones: tombstonesRef.current,
+                onProgress: (done, total, currentTitle, actionLabel, detail) => {
+                  setSyncProgress({
+                    done,
+                    total,
+                    percent: detail?.percent,
+                    currentTitle,
+                    actionLabel,
+                    addedCount: detail?.addedCount,
+                    updatedCount: detail?.updatedCount,
+                    skippedCount: detail?.skippedCount,
+                  });
+                },
+              }
+            )
           );
           setSyncProgress(null);
           const cleanedIndex = { ...syncRes.indexEntries };
@@ -2017,7 +2272,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
             finalCards = finalCards.map((c) => syncRes.updatedCardsById.get(c.id) ?? c);
           }
           if (syncRes.addedCount > 0 || syncRes.updatedCount > 0) {
-            folderSyncSummary = `，已增量写入「${boundDirHandle.name}」（新增 ${syncRes.addedCount} / 更新 ${syncRes.updatedCount}）`;
+            folderSyncSummary = `，已增量写入「${activeDirHandle.name}」（新增 ${syncRes.addedCount} / 更新 ${syncRes.updatedCount}）`;
           }
         }
 
@@ -2026,12 +2281,12 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         );
         const res = commitCards(finalCards);
         if (res.ok) {
-          const dupSkippedCount = mergeRes.skippedDuplicates.length;
-          const tombSkippedCount = mergeRes.skippedTombstones.length;
+          const dupSkippedCount = mergeRes.stats.skippedDuplicateCount;
+          const tombSkippedCount = mergeRes.stats.skippedTombstoneCount;
           const reintroCount = mergeRes.reintroducedFromTombstone.length;
           const invalidCount = invalidSkipped.length;
-          const statsText = `导入完成：新增 ${mergeRes.addedCards.length} 张、更新 ${mergeRes.updatedCards.length} 张、跳过重复 ${dupSkippedCount} 张${
-            tombSkippedCount > 0 ? `、跳过已删除旧备份 ${tombSkippedCount} 张` : ''
+          const statsText = `导入完成：新增 ${mergeRes.stats.addedCount} 张 · 更新 ${mergeRes.stats.updatedCount} 张 · 跳过重复 ${dupSkippedCount} 张${
+            tombSkippedCount > 0 ? ` · 跳过已删除旧备份 ${tombSkippedCount} 张` : ''
           }${
             reintroCount > 0
               ? `（其中 ${reintroCount} 张曾被删除，本次手动导入已重新收录）`
@@ -2061,12 +2316,12 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         }
         const invalidCount = invalidSkipped.length;
         const tombSkipText =
-          mergeRes.skippedTombstones.length > 0
-            ? `、拦截已删除旧备份 ${mergeRes.skippedTombstones.length} 张`
+          mergeRes.stats.skippedTombstoneCount > 0
+            ? ` · 拦截已删除旧备份 ${mergeRes.stats.skippedTombstoneCount} 张`
             : '';
         setImportNotice({
           type: 'warn',
-          text: `未产生重复入库：新增 0 张、更新 0 张、跳过重复/已存在 ${mergeRes.skippedDuplicates.length} 张${tombSkipText}${
+          text: `未产生重复入库（幂等跳过）：新增 0 张 · 更新 0 张 · 跳过重复/已存在 ${mergeRes.stats.skippedDuplicateCount} 张${tombSkipText}${
             invalidCount > 0 ? `（另有 ${invalidCount} 个文件无可用参数被跳过）` : ''
           }`,
         });
@@ -2446,7 +2701,13 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                 <span className="font-mono text-[11px] tabular-nums shrink-0">
                   {scanProgress
                     ? `已扫描 ${scanProgress.scanned} 项`
-                    : `${syncProgress!.done} / ${syncProgress!.total}`}
+                    : `${syncProgress!.done} / ${syncProgress!.total}${
+                        typeof syncProgress!.addedCount === 'number'
+                          ? `（新增 ${syncProgress!.addedCount} · 更新 ${
+                              syncProgress!.updatedCount ?? 0
+                            } · 跳过 ${syncProgress!.skippedCount ?? 0}）`
+                          : ''
+                      }`}
                 </span>
               </div>
               {syncProgress && syncProgress.total > 0 && (
@@ -2454,10 +2715,13 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                   <div
                     className="h-full bg-emerald-500 transition-all duration-150"
                     style={{
-                      width: `${Math.min(
-                        100,
-                        Math.round((syncProgress.done / Math.max(1, syncProgress.total)) * 100)
-                      )}%`,
+                      width: `${
+                        syncProgress.percent ??
+                        Math.min(
+                          100,
+                          Math.round((syncProgress.done / Math.max(1, syncProgress.total)) * 100)
+                        )
+                      }%`,
                     }}
                   />
                 </div>
@@ -2522,6 +2786,8 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                     setPrivateView(false);
                     setActiveTagFilter('ALL');
                     setLightboxCardId(null);
+                    setSelectedCardIds(new Set());
+                    setConfirmBulkDelete(false);
                   }}
                   className="h-7 px-2.5 rounded-[8px] border border-[#E0E0E6] bg-white text-[11.5px] font-medium text-[#4C5264] hover:text-[#1E2028] cursor-pointer whitespace-nowrap"
                 >
@@ -2948,14 +3214,15 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                   onClick={() => {
                     setBatchSelectMode((v) => !v);
                     setSelectedCardIds(new Set());
+                    setConfirmBulkDelete(false);
                   }}
-                  className={`h-8 px-2.5 inline-flex items-center gap-1.5 rounded-[9px] border text-[11.5px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                  className={`min-h-[38px] px-3.5 py-1.5 inline-flex items-center gap-1.5 rounded-[10px] border text-[12px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
                     batchSelectMode
                       ? 'border-[#7C5CFC] bg-[#F4F2FF] text-[#6B48F5]'
-                      : 'border-[#E0E0E6] bg-white text-[#4C5264] hover:border-[#7C5CFC]/40 hover:text-[#6B48F5]'
+                      : 'border-[#E0E0E6] bg-white text-[#4C5264] hover:border-[#7C5CFC]/50 hover:text-[#6B48F5]'
                   }`}
                 >
-                  <CheckSquare className="w-3.5 h-3.5" />
+                  <CheckSquare className="w-4 h-4" />
                   <span>{batchSelectMode ? '退出批量整理' : '批量整理'}</span>
                 </button>
               </div>
@@ -3085,128 +3352,162 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
               )}
             </div>
 
-            {/* 批量整理操作条 */}
+            {/* 批量整理操作条（放大按钮热区 + 拉开间距 + 危险删除视觉隔离与二次确认） */}
             {batchSelectMode && (
-              <div className="rounded-[12px] border border-[#DDD8FA] bg-white px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2.5 text-[11.5px]">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="font-semibold text-[#1E2028] tabular-nums">
-                    已选 {selectedCardIds.size} 张
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setSelectedCardIds((prev) => {
-                        const next = new Set(prev);
-                        for (const c of pagedCards) next.add(c.id);
-                        return next;
-                      })
-                    }
-                    className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-[#FAFAFC] text-[#4C5264] hover:text-[#6B48F5] cursor-pointer whitespace-nowrap"
-                  >
-                    全选本页 ({pagedCards.length})
-                  </button>
-                  {filteredCards.length > pagedCards.length && (
+              <div className="rounded-[13px] border border-[#DDD8FA] bg-white px-3.5 sm:px-4 py-3 flex flex-col gap-3 shadow-[0_2px_10px_rgba(124,92,252,0.06)]">
+                {/* 顶部选区控制与退出按钮 */}
+                <div className="flex flex-wrap items-center justify-between gap-2.5 pb-2.5 border-b border-[#EFEFF4]">
+                  <div className="flex flex-wrap items-center gap-2.5">
+                    <span className="inline-flex items-center min-h-[38px] px-3 rounded-[9px] bg-[#F4F2FF] text-[#5B3DF5] text-[12.5px] font-semibold tabular-nums whitespace-nowrap">
+                      已选 {selectedCardIds.size} 张
+                    </span>
                     <button
                       type="button"
                       onClick={() =>
-                        setSelectedCardIds(new Set(filteredCards.map((c) => c.id)))
+                        setSelectedCardIds((prev) => {
+                          const next = new Set(prev);
+                          for (const c of pagedCards) next.add(c.id);
+                          return next;
+                        })
                       }
-                      className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-[#FAFAFC] text-[#4C5264] hover:text-[#6B48F5] cursor-pointer whitespace-nowrap"
+                      className="min-h-[38px] px-3.5 py-1.5 rounded-[9px] border border-[#E0E0E6] bg-[#FAFAFC] text-[12px] font-medium text-[#4C5264] hover:border-[#7C5CFC]/45 hover:text-[#6B48F5] transition-colors cursor-pointer whitespace-nowrap"
                     >
-                      全选筛选结果 ({filteredCards.length})
+                      全选本页 ({pagedCards.length})
                     </button>
-                  )}
-                  {selectedCardIds.size > 0 && (
-                    <button
-                      type="button"
-                      onClick={() => setSelectedCardIds(new Set())}
-                      className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-white text-[#686E7E] hover:text-[#1E2028] cursor-pointer whitespace-nowrap"
-                    >
-                      清空选择
-                    </button>
-                  )}
-                </div>
-
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <div className="flex items-center gap-1">
-                    <input
-                      type="text"
-                      value={batchTagInput}
-                      onChange={(e) => setBatchTagInput(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') {
-                          e.preventDefault();
-                          handleBulkAddTags();
+                    {filteredCards.length > pagedCards.length && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setSelectedCardIds(new Set(filteredCards.map((c) => c.id)))
                         }
-                      }}
-                      placeholder="批量添加标签（空格/逗号分隔）"
-                      className="w-[175px] h-7 px-2 rounded-[7px] border border-[#E0E0E6] text-[11.5px] focus:outline-none focus:border-[#7C5CFC]"
-                    />
-                    <button
-                      type="button"
-                      disabled={selectedCardIds.size === 0 || !batchTagInput.trim()}
-                      onClick={handleBulkAddTags}
-                      className="h-7 px-2 inline-flex items-center gap-1 rounded-[7px] border border-[#DDD8FA] bg-[#F4F2FF] text-[#6B48F5] font-medium disabled:opacity-40 cursor-pointer whitespace-nowrap"
-                    >
-                      <Tag className="w-3 h-3" />
-                      <span>打标签</span>
-                    </button>
+                        className="min-h-[38px] px-3.5 py-1.5 rounded-[9px] border border-[#E0E0E6] bg-[#FAFAFC] text-[12px] font-medium text-[#4C5264] hover:border-[#7C5CFC]/45 hover:text-[#6B48F5] transition-colors cursor-pointer whitespace-nowrap"
+                      >
+                        全选筛选结果 ({filteredCards.length})
+                      </button>
+                    )}
+                    {selectedCardIds.size > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectedCardIds(new Set());
+                          setConfirmBulkDelete(false);
+                        }}
+                        className="min-h-[38px] px-3.5 py-1.5 rounded-[9px] border border-[#E0E0E6] bg-white text-[12px] font-medium text-[#686E7E] hover:border-[#C5C8D4] hover:text-[#1E2028] transition-colors cursor-pointer whitespace-nowrap"
+                      >
+                        清空选择
+                      </button>
+                    )}
                   </div>
 
                   <button
                     type="button"
-                    disabled={selectedCardIds.size === 0}
-                    onClick={() => handleBulkTogglePrivate(!privateView)}
-                    className="h-7 px-2 inline-flex items-center gap-1 rounded-[7px] border border-[#F5B8C4] bg-[#FFF5F7] text-[#C93B58] font-medium disabled:opacity-40 cursor-pointer whitespace-nowrap"
+                    onClick={() => {
+                      setBatchSelectMode(false);
+                      setSelectedCardIds(new Set());
+                      setConfirmBulkDelete(false);
+                    }}
+                    className="min-h-[38px] px-3.5 py-1.5 inline-flex items-center gap-1.5 rounded-[9px] border border-[#E0E0E6] bg-white text-[12px] font-medium text-[#4C5264] hover:border-[#7C5CFC]/45 hover:text-[#1E2028] transition-colors cursor-pointer whitespace-nowrap"
                   >
-                    {privateView ? <Eye className="w-3 h-3" /> : <EyeOff className="w-3 h-3" />}
-                    <span>{privateView ? '批量取消私密' : '批量设为私密'}</span>
+                    <X className="w-3.5 h-3.5" />
+                    <span>退出批量模式</span>
                   </button>
+                </div>
 
-                  {boundDirHandle && (
-                    <button
-                      type="button"
-                      disabled={selectedCardIds.size === 0 || isSyncingFolder}
-                      onClick={() =>
-                        void handleSyncScopedCardsToFolder(
-                          cards.filter((c) => selectedCardIds.has(c.id))
-                        )
-                      }
-                      className="h-7 px-2 inline-flex items-center gap-1 rounded-[7px] border border-emerald-300 bg-emerald-50 text-emerald-800 font-medium disabled:opacity-40 cursor-pointer whitespace-nowrap"
-                    >
-                      <FolderSync className="w-3 h-3" />
-                      <span>写入文件夹</span>
-                    </button>
-                  )}
-
-                  {confirmBulkDelete ? (
-                    <div className="inline-flex items-center gap-1">
+                {/* 底部常用批量操作 vs 危险删除隔离区 */}
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex flex-wrap items-center gap-2.5 sm:gap-3">
+                    <div className="flex flex-wrap sm:flex-nowrap items-center gap-2 max-w-full">
+                      <input
+                        type="text"
+                        value={batchTagInput}
+                        onChange={(e) => setBatchTagInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            handleBulkAddTags();
+                          }
+                        }}
+                        placeholder="批量添加标签（空格/逗号分隔）"
+                        className="w-full sm:w-[215px] min-h-[38px] px-3 rounded-[9px] border border-[#E0E0E6] bg-[#FAFAFC] text-[12px] text-[#1E2028] focus:bg-white focus:outline-none focus:border-[#7C5CFC]"
+                      />
                       <button
                         type="button"
-                        onClick={handleBulkDeleteSelected}
-                        className="h-7 px-2 rounded-[7px] bg-[#E85D75] text-white font-medium cursor-pointer whitespace-nowrap"
+                        disabled={selectedCardIds.size === 0 || !batchTagInput.trim()}
+                        onClick={handleBulkAddTags}
+                        className="min-h-[38px] px-3.5 py-1.5 inline-flex items-center gap-1.5 rounded-[9px] border border-[#DDD8FA] bg-[#F4F2FF] text-[12px] font-medium text-[#6B48F5] hover:bg-[#EBE6FF] disabled:opacity-40 transition-colors cursor-pointer whitespace-nowrap"
                       >
-                        确认删除 ({selectedCardIds.size})
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setConfirmBulkDelete(false)}
-                        className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-white text-[#686E7E] cursor-pointer whitespace-nowrap"
-                      >
-                        取消
+                        <Tag className="w-3.5 h-3.5" />
+                        <span>批量打标签</span>
                       </button>
                     </div>
-                  ) : (
+
                     <button
                       type="button"
                       disabled={selectedCardIds.size === 0}
-                      onClick={() => setConfirmBulkDelete(true)}
-                      className="h-7 px-2 inline-flex items-center gap-1 rounded-[7px] border border-[#E0E0E6] bg-white text-[#B42343] hover:border-[#E85D75] disabled:opacity-40 cursor-pointer whitespace-nowrap"
+                      onClick={() => handleBulkTogglePrivate(!privateView)}
+                      className="min-h-[38px] px-3.5 py-1.5 inline-flex items-center gap-1.5 rounded-[9px] border border-[#E5C4D6] bg-[#FDF6FA] text-[12px] font-medium text-[#8C3665] hover:bg-[#F9EAF2] hover:border-[#D39BB9] disabled:opacity-40 transition-colors cursor-pointer whitespace-nowrap"
                     >
-                      <Trash2 className="w-3 h-3" />
-                      <span>批量删除</span>
+                      {privateView ? (
+                        <Eye className="w-3.5 h-3.5" />
+                      ) : (
+                        <EyeOff className="w-3.5 h-3.5" />
+                      )}
+                      <span>{privateView ? '批量取消私密' : '批量设为私密'}</span>
                     </button>
-                  )}
+
+                    {boundDirHandle && (
+                      <button
+                        type="button"
+                        disabled={selectedCardIds.size === 0 || isSyncingFolder}
+                        onClick={() =>
+                          void handleSyncScopedCardsToFolder(
+                            scopedCards.filter((c) => selectedCardIds.has(c.id))
+                          )
+                        }
+                        className="min-h-[38px] px-3.5 py-1.5 inline-flex items-center gap-1.5 rounded-[9px] border border-emerald-300 bg-emerald-50 text-[12px] font-medium text-emerald-800 hover:bg-emerald-100/80 disabled:opacity-40 transition-colors cursor-pointer whitespace-nowrap"
+                      >
+                        <FolderSync className="w-3.5 h-3.5" />
+                        <span>批量写入文件夹</span>
+                      </button>
+                    )}
+                  </div>
+
+                  {/* 危险操作独立隔离区 */}
+                  <div className="flex flex-wrap items-center gap-2.5 sm:pl-3 sm:border-l sm:border-[#EAEAEF]">
+                    {confirmBulkDelete ? (
+                      <div className="inline-flex flex-wrap items-center gap-2.5 p-1.5 rounded-[10px] border border-[#F5B8C4] bg-[#FFF1F3]">
+                        <button
+                          type="button"
+                          onClick={handleBulkDeleteSelected}
+                          className="min-h-[38px] px-4 py-1.5 inline-flex items-center gap-1.5 rounded-[8px] bg-[#D92D4B] text-white text-[12px] font-semibold shadow-[0_2px_8px_rgba(217,45,75,0.28)] hover:bg-[#BE1E3A] transition-colors cursor-pointer whitespace-nowrap"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          <span>确认彻底删除 ({selectedCardIds.size})</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmBulkDelete(false)}
+                          className="min-h-[38px] px-3.5 py-1.5 rounded-[8px] border border-[#E0E0E6] bg-white text-[12px] font-medium text-[#4C5264] hover:text-[#1E2028] transition-colors cursor-pointer whitespace-nowrap"
+                        >
+                          取消
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={selectedCardIds.size === 0}
+                        onClick={() => setConfirmBulkDelete(true)}
+                        className="min-h-[38px] px-4 py-1.5 inline-flex items-center gap-1.5 rounded-[9px] border border-[#F5B8C4] bg-[#FFF5F7] text-[12px] font-semibold text-[#B42343] hover:bg-[#FFE6EC] hover:border-[#E85D75] disabled:opacity-40 disabled:hover:bg-[#FFF5F7] transition-colors cursor-pointer whitespace-nowrap"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        <span>
+                          {selectedCardIds.size > 0
+                            ? `批量删除 (${selectedCardIds.size})`
+                            : '批量删除'}
+                        </span>
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
             )}
@@ -3250,7 +3551,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
             </div>
           ) : (
             <>
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3.5">
+              <div ref={cardGridRef} className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3.5">
                 {pagedCards.map((card) => {
                   const isSendingThis =
                     runStatus.state === 'sending' && runStatus.cardId === card.id;
@@ -3268,6 +3569,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                   return (
                     <article
                       key={card.id}
+                      data-card-id={card.id}
                       className={`rounded-[14px] bg-white border overflow-hidden flex flex-col transition-colors ${
                         isSelected
                           ? 'border-[#7C5CFC] ring-2 ring-[#7C5CFC]/20'
@@ -3288,12 +3590,16 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                               });
                             }}
                             aria-label={isSelected ? '取消选择此卡片' : '选择此卡片'}
-                            className="self-start mt-0.5 text-[#7C5CFC] cursor-pointer shrink-0"
+                            className={`self-start w-7 h-7 rounded-[8px] border flex items-center justify-center transition-colors cursor-pointer shrink-0 ${
+                              isSelected
+                                ? 'border-[#7C5CFC] bg-[#F4F2FF] text-[#6B48F5]'
+                                : 'border-[#E0E0E6] bg-[#FAFAFC] text-[#949AA8] hover:border-[#7C5CFC]/50 hover:text-[#6B48F5]'
+                            }`}
                           >
                             {isSelected ? (
                               <CheckSquare className="w-4 h-4" />
                             ) : (
-                              <Square className="w-4 h-4 text-[#949AA8]" />
+                              <Square className="w-4 h-4" />
                             )}
                           </button>
                         )}
@@ -3309,12 +3615,12 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                               <h4 className="text-[13.5px] font-semibold text-[#1E2028] leading-snug line-clamp-2 break-words">
                                 {card.title}
                               </h4>
-                              <div className="flex items-center gap-0.5 shrink-0">
+                              <div className="flex items-center gap-1 shrink-0">
                                 <button
                                   type="button"
                                   onClick={() => handleToggleCardPrivate(card.id)}
                                   title={card.isPrivate ? '取消私密并移回公开列表' : '设为私密（移入私密区）'}
-                                  className={`h-6 px-1.5 inline-flex items-center gap-1 rounded-[6px] border text-[10.5px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                                  className={`h-7 px-2 inline-flex items-center gap-1 rounded-[7px] border text-[10.5px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
                                     card.isPrivate
                                       ? 'border-[#F5B8C4] bg-[#FFF1F3] text-[#C93B58] hover:border-[#E85D75]'
                                       : 'border-[#E0E0E6] bg-white text-[#686E7E] hover:border-[#E85D75]/50 hover:text-[#C93B58]'
@@ -3332,7 +3638,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                                     type="button"
                                     onClick={() => void handleDownloadCardOriginalImage(card)}
                                     title="下载原始参考图"
-                                    className="p-1 text-[#949AA8] hover:text-[#7C5CFC] cursor-pointer"
+                                    className="w-7 h-7 inline-flex items-center justify-center rounded-[7px] text-[#949AA8] hover:bg-[#F4F2FF] hover:text-[#7C5CFC] cursor-pointer"
                                   >
                                     <ImageDown className="w-3.5 h-3.5" />
                                   </button>
@@ -3341,7 +3647,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                                   type="button"
                                   onClick={() => handleDownloadCardJson(card)}
                                   title="下载卡片工作流 JSON"
-                                  className="p-1 text-[#949AA8] hover:text-[#7C5CFC] cursor-pointer"
+                                  className="w-7 h-7 inline-flex items-center justify-center rounded-[7px] text-[#949AA8] hover:bg-[#F4F2FF] hover:text-[#7C5CFC] cursor-pointer"
                                 >
                                   <Download className="w-3.5 h-3.5" />
                                 </button>
@@ -3350,16 +3656,18 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                                     type="button"
                                     onClick={() => void handleWriteSingleCardToFolder(card)}
                                     title="写入当前绑定的本地文件夹"
-                                    className="p-1 text-[#949AA8] hover:text-emerald-600 cursor-pointer"
+                                    className="w-7 h-7 inline-flex items-center justify-center rounded-[7px] text-[#949AA8] hover:bg-emerald-50 hover:text-emerald-600 cursor-pointer"
                                   >
                                     <FolderSync className="w-3.5 h-3.5" />
                                   </button>
                                 )}
                                 <button
                                   type="button"
+                                  data-card-delete-btn={card.id}
                                   onClick={() => handleDeleteCard(card.id)}
                                   title="删除此卡片"
-                                  className="p-1 text-[#949AA8] hover:text-[#E85D75] cursor-pointer"
+                                  aria-label={`删除卡片 ${card.title}`}
+                                  className="w-7 h-7 inline-flex items-center justify-center rounded-[7px] text-[#949AA8] hover:bg-[#FFF1F3] hover:text-[#E85D75] cursor-pointer"
                                 >
                                   <Trash2 className="w-3.5 h-3.5" />
                                 </button>
@@ -4020,6 +4328,48 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
             <div className="shrink-0 pt-2 text-center text-[11px] text-white/55">
               点击空白处或按 Esc 关闭预览 · 左右方向键切换卡片（当前{privateView ? '私密' : '公开'}视图范围）
+            </div>
+          </div>
+        )}
+
+        {/* 连续删卡局部无感浮动反馈（不挤压网格布局、不打断焦点） */}
+        {deleteStatus && (
+          <div className="pointer-events-none absolute bottom-4 right-4 left-4 sm:left-auto z-30 flex justify-end">
+            <div
+              role="status"
+              aria-live="polite"
+              className={`pointer-events-auto max-w-full sm:max-w-[460px] rounded-[11px] border px-3.5 py-2.5 shadow-[0_8px_24px_rgba(18,22,33,0.14)] backdrop-blur-md flex items-center gap-2.5 text-[12px] ${
+                deleteStatus.phase === 'warn'
+                  ? 'border-amber-300 bg-amber-50/95 text-amber-900'
+                  : deleteStatus.phase === 'done'
+                  ? 'border-emerald-300 bg-emerald-50/95 text-emerald-900'
+                  : 'border-[#DDD8FA] bg-white/95 text-[#373C4B]'
+              }`}
+            >
+              {deleteStatus.phase === 'pending' && (
+                <Loader2 className="w-4 h-4 animate-spin shrink-0 text-[#7C5CFC]" />
+              )}
+              {deleteStatus.phase === 'done' && (
+                <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-600" />
+              )}
+              {deleteStatus.phase === 'warn' && (
+                <AlertCircle className="w-4 h-4 shrink-0 text-amber-600" />
+              )}
+              <span className="truncate font-medium">{deleteStatus.text}</span>
+              <button
+                type="button"
+                onClick={() => {
+                  if (deleteToastTimerRef.current !== null) {
+                    window.clearTimeout(deleteToastTimerRef.current);
+                    deleteToastTimerRef.current = null;
+                  }
+                  setDeleteStatus(null);
+                }}
+                aria-label="关闭删除提示"
+                className="p-0.5 opacity-65 hover:opacity-100 cursor-pointer shrink-0"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
             </div>
           </div>
         )}

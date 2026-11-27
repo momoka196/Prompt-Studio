@@ -14,14 +14,19 @@ import {
   splitPromptTags,
 } from './promptBuilder';
 import {
+  computeBlobContentHash,
+  computeCardSyncContentHash,
+  computeFastStringDigest64,
   decodeDataUrlToBlob,
   DeletedCardTombstone,
   encodeBlobToDataUrl,
+  FolderSyncProgress,
   isIndexedDbSupported,
   listStoredCardImageIds,
   loadCardImageBlob,
   mergeDeletedTombstonesMaps,
   normalizeWorkflowCards,
+  runIncrementalFolderSync,
   saveCardImageBlobsBatch,
   StoredCardImageRecord,
 } from './storageCache';
@@ -1950,53 +1955,10 @@ export interface FolderWriteCardResult {
 
 export const FOLDER_SYNC_INDEX_FILENAME = '.chibiprompt-sync-index.json';
 
-export function computeFastDigest64(input: string): string {
-  let h1 = 0x811c9dc5;
-  let h2 = 0x9e3779b9;
-  for (let i = 0; i < input.length; i++) {
-    const code = input.charCodeAt(i);
-    h1 ^= code;
-    h1 = Math.imul(h1, 0x01000193);
-    h2 ^= code + ((i & 0xff) << 3);
-    h2 = Math.imul(h2, 0x85ebca6b);
-  }
-  return `fnv64:${(h1 >>> 0).toString(16).padStart(8, '0')}${(h2 >>> 0)
-    .toString(16)
-    .padStart(8, '0')}:${input.length}`;
-}
+export { computeBlobContentHash };
 
-export async function computeBlobContentHash(blob: Blob): Promise<string> {
-  const buf = await blob.arrayBuffer();
-  if (
-    typeof crypto !== 'undefined' &&
-    crypto.subtle &&
-    typeof crypto.subtle.digest === 'function'
-  ) {
-    try {
-      const digest = await crypto.subtle.digest('SHA-256', buf);
-      const bytes = new Uint8Array(digest);
-      let hex = '';
-      for (let i = 0; i < bytes.length; i++) {
-        hex += bytes[i].toString(16).padStart(2, '0');
-      }
-      return `sha256:${hex}`;
-    } catch {
-      // fall through to deterministic byte hash fallback
-    }
-  }
-  const bytes = new Uint8Array(buf);
-  let h1 = 0x811c9dc5;
-  let h2 = 0x9e3779b9;
-  for (let i = 0; i < bytes.length; i++) {
-    const b = bytes[i];
-    h1 ^= b;
-    h1 = Math.imul(h1, 0x01000193);
-    h2 ^= b + ((i & 0xff) << 1);
-    h2 = Math.imul(h2, 0x85ebca6b);
-  }
-  return `fnv64:${(h1 >>> 0).toString(16).padStart(8, '0')}${(h2 >>> 0)
-    .toString(16)
-    .padStart(8, '0')}:${bytes.length}`;
+export function computeFastDigest64(input: string): string {
+  return computeFastStringDigest64(input);
 }
 
 export function computeWorkflowSignature(
@@ -2005,7 +1967,7 @@ export function computeWorkflowSignature(
     'rawWorkflowJson' | 'apiPromptJson' | 'extractedPositive' | 'extractedNegative'
   >
 ): string {
-  return computeFastDigest64(
+  return computeFastStringDigest64(
     JSON.stringify({
       raw: card.rawWorkflowJson?.trim() || '',
       api: card.apiPromptJson?.trim() || '',
@@ -2016,27 +1978,7 @@ export function computeWorkflowSignature(
 }
 
 export function computeCardContentFingerprint(card: WorkflowCollectionCard): string {
-  const canonical = JSON.stringify({
-    title: card.title.trim(),
-    tags: card.tags.map((t) => t.trim()).filter(Boolean),
-    isPrivate: Boolean(card.isPrivate),
-    workflowFormat: card.workflowFormat,
-    rawWorkflowJson: card.rawWorkflowJson,
-    apiPromptJson: card.apiPromptJson ?? '',
-    extractedPositive: card.extractedPositive,
-    extractedNegative: card.extractedNegative,
-    fineTunedPositive: card.fineTunedPositive,
-    fineTunedNegative: card.fineTunedNegative,
-    positiveNodeId: card.positiveNodeId ?? null,
-    negativeNodeId: card.negativeNodeId ?? null,
-    applyFineTuneOnSend: card.applyFineTuneOnSend,
-    seedMode: card.seedMode ?? 'workflow',
-    fixedSeed: card.seedMode === 'fixed' ? card.fixedSeed ?? null : null,
-    imageName: card.imageName,
-    imageByteSize: card.imageByteSize ?? null,
-    imageContentHash: card.imageContentHash ?? null,
-  });
-  return computeFastDigest64(canonical);
+  return computeCardSyncContentHash(card);
 }
 
 export async function ensureCardContentHashes(
@@ -2457,169 +2399,102 @@ export async function syncCardsIncrementalToLocalDirectory(
       done: number,
       total: number,
       currentTitle: string,
-      actionLabel?: string
+      actionLabel?: string,
+      detail?: FolderSyncProgress
     ) => void;
   }
 ): Promise<IncrementalFolderSyncResult> {
-  const { entries: indexEntries, deletedTombstones: diskTombstones } =
+  const { entries: initialEntries, deletedTombstones: diskTombstones } =
     await readFolderSyncIndex(rootHandle);
-  const deletedTombstones = options?.extraTombstones
+  const initialTombstones = options?.extraTombstones
     ? mergeDeletedTombstonesMaps(diskTombstones, options.extraTombstones)
     : { ...diskTombstones };
-  const succeededIds: string[] = [];
-  const failed: { cardId: string; title: string; error: string }[] = [];
-  const updatedCardsById = new Map<string, WorkflowCollectionCard>();
 
-  let addedCount = 0;
-  let updatedCount = 0;
-  let skippedCount = 0;
-  let indexDirty = false;
-
-  const total = cards.length;
-  for (let i = 0; i < total; i++) {
-    const rawCard = cards[i];
-    if (options?.isCardActive && !options.isCardActive(rawCard.id)) {
-      continue;
-    }
-    const overrideBlob = options?.blobsByCardId?.get(rawCard.id) ?? null;
-    const { card: hashedCard } = await ensureCardContentHashes(rawCard, overrideBlob);
-    if (options?.isCardActive && !options.isCardActive(rawCard.id)) {
-      continue;
-    }
-    const targetRelPath = buildCardFolderPathSegments(hashedCard).join('/');
-    const baseName = sanitizeFilenamePrefix(hashedCard.title).slice(0, 48);
-    const targetFingerprint = hashedCard.contentFingerprint!;
-
-    let prevEntry = indexEntries[hashedCard.id];
-
-    // 若索引尚无该卡记录（例如旧版写入的目录），尝试探测目标子目录的 .card.json 实现无损平滑衔接
-    if (!prevEntry) {
+  const batchResult = await runIncrementalFolderSync<FolderSyncIndexEntry>({
+    cards,
+    initialEntries,
+    initialTombstones,
+    folderStorageKey: rootHandle.name,
+    isCardActive: options?.isCardActive,
+    prepareCard: async (rawCard) => {
+      const overrideBlob = options?.blobsByCardId?.get(rawCard.id) ?? null;
+      const { card: hashedCard } = await ensureCardContentHashes(rawCard, overrideBlob);
+      return {
+        card: hashedCard,
+        targetRelativePath: buildCardFolderPathSegments(hashedCard).join('/'),
+      };
+    },
+    probeFallbackEntry: async (hashedCard, targetRelPath) => {
+      const baseName = sanitizeFilenamePrefix(hashedCard.title).slice(0, 48);
       const targetDir = await getSubdirectoryIfExists(
         rootHandle,
         targetRelPath.split('/').filter(Boolean)
       );
-      if (targetDir) {
-        try {
-          const cardFile = await (
-            await targetDir.getFileHandle(`${baseName}.card.json`, { create: false })
-          ).getFile();
-          const diskMeta = JSON.parse(await cardFile.text()) as Partial<WorkflowCollectionCard>;
-          if (diskMeta.id === hashedCard.id) {
-            const diskFingerprint =
-              diskMeta.contentFingerprint ||
-              computeCardContentFingerprint({
-                ...hashedCard,
-                ...diskMeta,
-                imageContentHash: diskMeta.imageContentHash ?? hashedCard.imageContentHash,
-                contentFingerprint: undefined,
-              } as WorkflowCollectionCard);
-            prevEntry = {
-              cardId: hashedCard.id,
-              relativePath: targetRelPath,
-              contentFingerprint: diskFingerprint,
-              imageContentHash: diskMeta.imageContentHash,
-              imageByteSize: diskMeta.imageByteSize,
-              updatedAt: diskMeta.updatedAt ?? hashedCard.updatedAt,
-              syncedAt: Date.now(),
-            };
-            indexEntries[hashedCard.id] = prevEntry;
-            indexDirty = true;
-          }
-        } catch {
-          // 目标目录尚无对应 .card.json
-        }
-      }
-    }
-
-    const isSamePath = prevEntry?.relativePath === targetRelPath;
-    const isSameFingerprint =
-      Boolean(prevEntry) && prevEntry!.contentFingerprint === targetFingerprint;
-
-    if (prevEntry && isSamePath && isSameFingerprint) {
-      skippedCount += 1;
-      options?.onProgress?.(i + 1, total, hashedCard.title, '跳过未变更');
-      const syncedStateCard: WorkflowCollectionCard = {
-        ...hashedCard,
-        folderSyncedPath: targetRelPath,
-        folderSyncedFingerprint: targetFingerprint,
-        folderSyncedImageHash: hashedCard.imageContentHash,
-        lastFolderSyncAt: hashedCard.lastFolderSyncAt ?? prevEntry.syncedAt,
-      };
-      if (
-        rawCard.contentFingerprint !== syncedStateCard.contentFingerprint ||
-        rawCard.imageContentHash !== syncedStateCard.imageContentHash ||
-        rawCard.folderSyncedFingerprint !== syncedStateCard.folderSyncedFingerprint ||
-        rawCard.folderSyncedPath !== syncedStateCard.folderSyncedPath
-      ) {
-        updatedCardsById.set(hashedCard.id, syncedStateCard);
-      }
-    } else {
-      const isUpdate = Boolean(prevEntry);
-      const skipImageWrite =
-        Boolean(prevEntry) &&
-        isSamePath &&
-        Boolean(hashedCard.imageContentHash) &&
-        prevEntry!.imageContentHash === hashedCard.imageContentHash;
-
-      options?.onProgress?.(
-        i,
-        total,
-        hashedCard.title,
-        isUpdate ? (skipImageWrite ? '更新元数据' : '更新卡片') : '写入新增'
-      );
-
-      const res = await writeCardToLocalDirectory(rootHandle, hashedCard, overrideBlob, {
-        skipImageWrite,
-        previousRelativePath: prevEntry?.relativePath,
-      });
-
-      if (res.ok) {
-        succeededIds.push(hashedCard.id);
-        updatedCardsById.set(hashedCard.id, res.card);
-        indexEntries[hashedCard.id] = {
+      if (!targetDir) return null;
+      try {
+        const cardFile = await (
+          await targetDir.getFileHandle(`${baseName}.card.json`, { create: false })
+        ).getFile();
+        const diskMeta = JSON.parse(await cardFile.text()) as Partial<WorkflowCollectionCard>;
+        if (diskMeta.id !== hashedCard.id) return null;
+        const diskFingerprint =
+          diskMeta.contentFingerprint ||
+          computeCardContentFingerprint({
+            ...hashedCard,
+            ...diskMeta,
+            imageContentHash: diskMeta.imageContentHash ?? hashedCard.imageContentHash,
+            contentFingerprint: undefined,
+          } as WorkflowCollectionCard);
+        return {
           cardId: hashedCard.id,
-          relativePath: res.relativePath,
-          contentFingerprint: res.card.contentFingerprint!,
-          imageContentHash: res.card.imageContentHash,
-          imageByteSize: res.card.imageByteSize,
-          imageFileName: res.writtenImageFileName,
-          updatedAt: res.card.updatedAt,
-          syncedAt: res.card.lastFolderSyncAt ?? Date.now(),
+          relativePath: targetRelPath,
+          contentFingerprint: diskFingerprint,
+          imageContentHash: diskMeta.imageContentHash,
+          imageByteSize: diskMeta.imageByteSize,
+          updatedAt: diskMeta.updatedAt ?? hashedCard.updatedAt,
+          syncedAt: Date.now(),
         };
-        if (hashedCard.id in deletedTombstones) {
-          delete deletedTombstones[hashedCard.id];
-        }
-        indexDirty = true;
-        if (isUpdate) updatedCount += 1;
-        else addedCount += 1;
-      } else {
-        failed.push({
-          cardId: hashedCard.id,
-          title: hashedCard.title,
-          error: res.error || '写入失败',
-        });
+      } catch {
+        return null;
       }
-    }
+    },
+    writeCard: async (hashedCard, writeOpts) => {
+      const overrideBlob = options?.blobsByCardId?.get(hashedCard.id) ?? null;
+      return writeCardToLocalDirectory(rootHandle, hashedCard, overrideBlob, writeOpts);
+    },
+    buildIndexEntry: (syncedCard, relativePath, writtenImageFileName) => ({
+      cardId: syncedCard.id,
+      relativePath,
+      contentFingerprint: syncedCard.contentFingerprint!,
+      imageContentHash: syncedCard.imageContentHash,
+      imageByteSize: syncedCard.imageByteSize,
+      imageFileName: writtenImageFileName,
+      updatedAt: syncedCard.updatedAt,
+      syncedAt: syncedCard.lastFolderSyncAt ?? Date.now(),
+    }),
+    persistIndex: async (entries, deletedTombstones) => {
+      await writeFolderSyncIndex(rootHandle, entries, deletedTombstones);
+    },
+    onProgress: (progress) => {
+      options?.onProgress?.(
+        progress.done,
+        progress.total,
+        progress.currentTitle,
+        progress.actionLabel,
+        progress
+      );
+    },
+  });
 
-    if (i > 0 && i % 5 === 0) {
-      await new Promise((r) => setTimeout(r, 0));
-    }
-  }
-
-  if (indexDirty) {
-    await writeFolderSyncIndex(rootHandle, indexEntries, deletedTombstones);
-  }
-
-  options?.onProgress?.(total, total, '', '完成');
   return {
-    addedCount,
-    updatedCount,
-    skippedCount,
-    succeededIds,
-    failed,
-    updatedCardsById,
-    indexEntries,
-    deletedTombstones,
+    addedCount: batchResult.addedCount,
+    updatedCount: batchResult.updatedCount,
+    skippedCount: batchResult.skippedCount,
+    succeededIds: batchResult.succeededIds,
+    failed: batchResult.failed,
+    updatedCardsById: batchResult.updatedCardsById,
+    indexEntries: batchResult.entries,
+    deletedTombstones: batchResult.deletedTombstones,
   };
 }
 
@@ -2854,6 +2729,16 @@ export interface IncomingCardWithBlob {
   fromCollectionJson?: boolean;
 }
 
+export interface DedupeMergeStats {
+  totalIncoming: number;
+  addedCount: number;
+  updatedCount: number;
+  skippedDuplicateCount: number;
+  skippedTombstoneCount: number;
+  totalSkippedCount: number;
+  restoredImageBlobsCount: number;
+}
+
 export interface DedupeMergeResult {
   mergedCards: WorkflowCollectionCard[];
   addedCards: WorkflowCollectionCard[];
@@ -2869,6 +2754,7 @@ export interface DedupeMergeResult {
   clearedTombstoneIds: string[];
   restoredImageBlobsCount: number;
   blobsToSave: { cardId: string; record: StoredCardImageRecord }[];
+  stats: DedupeMergeStats;
 }
 
 function findMatchingTombstone(
@@ -2907,12 +2793,17 @@ export async function dedupeAndMergeIncomingCards(
 
   const workingCards = existingCards.map((c) => ({ ...c }));
   const cardIndexById = new Map<string, number>();
+  const cardIndexByContentHash = new Map<string, number>();
   const cardIndexByImageHash = new Map<string, number>();
   const cardIndicesByNameSize = new Map<string, number[]>();
   const cardIndexByWorkflowSig = new Map<string, number>();
 
   const registerCardIndex = (idx: number, card: WorkflowCollectionCard) => {
     cardIndexById.set(card.id, idx);
+    const contentHash = card.contentFingerprint || computeCardContentFingerprint(card);
+    if (!cardIndexByContentHash.has(contentHash)) {
+      cardIndexByContentHash.set(contentHash, idx);
+    }
     if (card.imageContentHash) {
       cardIndexByImageHash.set(card.imageContentHash, idx);
     }
@@ -2979,16 +2870,25 @@ export async function dedupeAndMergeIncomingCards(
       thumbnailDataUrl:
         isIndexedDbSupported() && incomingBlob ? '' : item.card.thumbnailDataUrl,
     };
-    normalizedIncoming.contentFingerprint =
-      normalizedIncoming.contentFingerprint ||
-      computeCardContentFingerprint(normalizedIncoming);
+    const incomingContentHash = computeCardContentFingerprint(normalizedIncoming);
+    normalizedIncoming.contentFingerprint = incomingContentHash;
 
-    // 1. 先按 ID 匹配，其次按原图哈希匹配（含老卡片按 filename + byteSize 懒加载比对）
+    // 1. 去重校验：优先按卡片 ID 匹配，其次按内容哈希 (contentFingerprint) 与原图哈希 (imageContentHash) 匹配
     let matchedIdx = cardIndexById.get(normalizedIncoming.id);
+    let matchBasis = matchedIdx !== undefined ? '卡片 ID 相同' : '';
+
+    if (matchedIdx === undefined) {
+      matchedIdx = cardIndexByContentHash.get(incomingContentHash);
+      if (matchedIdx !== undefined) {
+        matchBasis = '内容哈希一致';
+      }
+    }
 
     if (matchedIdx === undefined && incomingHash) {
       matchedIdx = cardIndexByImageHash.get(incomingHash);
-      if (matchedIdx === undefined && normalizedIncoming.imageName && incomingByteSize) {
+      if (matchedIdx !== undefined) {
+        matchBasis = '原图哈希一致';
+      } else if (normalizedIncoming.imageName && incomingByteSize) {
         const nameSizeKey = `${normalizedIncoming.imageName
           .trim()
           .toLowerCase()}::${incomingByteSize}`;
@@ -3001,9 +2901,13 @@ export async function dedupeAndMergeIncomingCards(
             if (enrichedCand.imageContentHash) {
               cardIndexByImageHash.set(enrichedCand.imageContentHash, candIdx);
             }
+            if (enrichedCand.contentFingerprint) {
+              cardIndexByContentHash.set(enrichedCand.contentFingerprint, candIdx);
+            }
           }
           if (workingCards[candIdx].imageContentHash === incomingHash) {
             matchedIdx = candIdx;
+            matchBasis = '原图哈希一致';
             break;
           }
         }
@@ -3019,12 +2923,18 @@ export async function dedupeAndMergeIncomingCards(
         .trim()
         .toLowerCase()}::${computeWorkflowSignature(normalizedIncoming)}`;
       matchedIdx = cardIndexByWorkflowSig.get(sig);
+      if (matchedIdx !== undefined) {
+        matchBasis = '工作流内容一致';
+      }
     }
 
-    // 检查是否与同批次中刚新增的卡片重复
+    // 检查是否与同批次中刚新增的卡片重复（ID / 内容哈希 / 原图哈希 / 工作流签名）
     if (matchedIdx === undefined) {
       const dupInBatch = prependedNewCards.find((p) => {
         if (p.id === normalizedIncoming.id) return true;
+        if (p.contentFingerprint && p.contentFingerprint === incomingContentHash) {
+          return true;
+        }
         if (incomingHash && p.imageContentHash && p.imageContentHash === incomingHash) {
           return true;
         }
@@ -3041,7 +2951,7 @@ export async function dedupeAndMergeIncomingCards(
       if (dupInBatch) {
         skippedDuplicates.push({
           fileName: sourceLabel,
-          reason: `与本批已导入卡片「${dupInBatch.title}」重复，已跳过`,
+          reason: `与本批已导入卡片「${dupInBatch.title}」重复（ID 或内容哈希相同），已跳过`,
           existingTitle: dupInBatch.title,
         });
         continue;
@@ -3179,7 +3089,7 @@ export async function dedupeAndMergeIncomingCards(
       }
       skippedDuplicates.push({
         fileName: sourceLabel,
-        reason: `工作台已存在相同卡片「${existing.title}」，跳过重复`,
+        reason: `工作台已存在相同卡片「${existing.title}」（${matchBasis || '内容哈希一致'}），跳过重复`,
         existingTitle: existing.title,
       });
       continue;
@@ -3288,6 +3198,15 @@ export async function dedupeAndMergeIncomingCards(
     clearedTombstoneIds: Array.from(clearedTombstoneIdsSet),
     restoredImageBlobsCount,
     blobsToSave,
+    stats: {
+      totalIncoming: incomingItems.length,
+      addedCount: addedCards.length,
+      updatedCount: updatedCards.length,
+      skippedDuplicateCount: skippedDuplicates.length,
+      skippedTombstoneCount: skippedTombstones.length,
+      totalSkippedCount: skippedDuplicates.length + skippedTombstones.length,
+      restoredImageBlobsCount,
+    },
   };
 }
 
