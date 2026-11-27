@@ -441,10 +441,9 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   const [newTagInput, setNewTagInput] = useState('');
   const [saveFeedback, setSaveFeedback] = useState<string | null>(null);
 
-  // Apply-to-Character modal state
+  // Recreate Collection Image with Character Card modal state
   const [applyingCardId, setApplyingCardId] = useState<string | null>(null);
   const [applyTargetCharId, setApplyTargetCharId] = useState<string>('');
-  const [applyPreserveIdentity, setApplyPreserveIdentity] = useState<boolean>(true);
   const [applyPromptSource, setApplyPromptSource] = useState<'effective' | 'extracted'>('effective');
   const [applyOutfit, setApplyOutfit] = useState<boolean>(true);
   const [applyOutfitText, setApplyOutfitText] = useState<string>('');
@@ -846,12 +845,11 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   const populateApplyPreparedFields = useCallback(
     (
       card: WorkflowCollectionCard,
-      preserveIdentity: boolean,
       sourceScope: 'effective' | 'extracted'
     ) => {
       const prepared = prepareCardPromptsForCharacterApply(card, {
         knownCharacterHints,
-        preserveIdentityAndHair: preserveIdentity,
+        preserveIdentityAndHair: true,
         sourceScope,
       });
       setApplyOutfitText(prepared.outfitText);
@@ -885,9 +883,8 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       );
 
       setApplyTargetCharId(selectedCharId || characters[0]?.id || '');
-      setApplyPreserveIdentity(true);
       setApplyPromptSource('effective');
-      const prepared = populateApplyPreparedFields(card, true, 'effective');
+      const prepared = populateApplyPreparedFields(card, 'effective');
       setApplyOutfit(Boolean(prepared.outfitText.trim()));
       setApplyOutfitMode('replace');
       setApplyPose(Boolean(prepared.poseText.trim()));
@@ -946,7 +943,6 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         cardId: applyingCard.id,
         cardTitle: applyingCard.title,
         targetCharacterId: applyTargetCharId,
-        preserveIdentityAndHair: applyPreserveIdentity,
         applyOutfit: hasOutfit,
         outfitText: applyOutfitText,
         outfitMode: applyOutfitMode,
@@ -968,7 +964,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       });
 
       if (!res.ok) {
-        setApplyErrorMsg(res.error ?? '套用失败');
+        setApplyErrorMsg(res.error ?? '复刻应用失败');
         return;
       }
 
@@ -978,7 +974,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
           characters.find((c) => c.id === applyTargetCharId)?.name ?? '目标角色';
         setImportNotice({
           type: 'ok',
-          text: `已将「${applyingCard.title}」套用到角色「${targetName}」并切为当前激活角色`,
+          text: `已使用角色「${targetName}」成功复刻收藏图「${applyingCard.title}」`,
         });
       }
     },
@@ -999,7 +995,6 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       applyPose,
       applyPoseMode,
       applyPoseText,
-      applyPreserveIdentity,
       applySamplingParams,
       applySwitchAndClose,
       applyTargetCharId,
@@ -4127,11 +4122,11 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                                 <button
                                   type="button"
                                   onClick={(e) => openApplyToCharacter(card, e)}
-                                  title="将此卡片提示词与生成参数套用到指定角色（默认保留目标角色原外貌与发型，防止串角）"
+                                  title="使用指定角色卡来复刻这张收藏图（保留角色身份，带入图中的服装、动作与工作流参数）"
                                   className="flex-1 min-w-0 h-8 px-2 inline-flex items-center justify-center gap-1 text-[11px] font-medium rounded-[9px] border border-[#F5B8C4] bg-[#FFF5F7] text-[#C93B58] hover:bg-[#FFE8ED] hover:border-[#E85D75] transition-colors whitespace-nowrap cursor-pointer"
                                 >
                                   <UserCheck className="w-3.5 h-3.5 shrink-0" />
-                                  <span className="truncate">应用到角色</span>
+                                  <span className="truncate">用角色复刻</span>
                                 </button>
                               )}
 
@@ -5043,7 +5038,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                     className="h-8 px-2.5 inline-flex items-center gap-1.5 rounded-[8px] bg-[#E85D75]/25 hover:bg-[#E85D75]/40 border border-[#F5B8C4]/50 text-[11.5px] text-white cursor-pointer whitespace-nowrap"
                   >
                     <UserCheck className="w-3.5 h-3.5" />
-                    <span>应用到角色</span>
+                    <span>用角色复刻</span>
                   </button>
                 )}
 
@@ -5119,12 +5114,12 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
           </div>
         )}
 
-        {/* 应用到角色 / 换角使用轻量弹窗 */}
+        {/* 用角色复刻收藏图弹窗 */}
         {applyingCard && onApplyCardToCharacter && (
           <div
             role="dialog"
             aria-modal="true"
-            aria-label={`将卡片「${applyingCard.title}」应用到角色`}
+            aria-label={`用角色卡复刻收藏图「${applyingCard.title}」`}
             className="fixed inset-0 z-[65] flex items-center justify-center bg-[#1E2028]/45 backdrop-blur-[2px] p-3 sm:p-6"
             onClick={(e) => {
               e.stopPropagation();
@@ -5148,7 +5143,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
                       <h3 className="text-[14px] font-bold text-[#1E2028] truncate">
-                        应用到角色 · {applyingCard.title}
+                        用角色卡复刻收藏图 · {applyingCard.title}
                       </h3>
                       {applyingCard.isPrivate && (
                         <span className="px-1.5 py-0.5 rounded-[5px] bg-[#FFF1F3] border border-[#F5B8C4] text-[10px] font-medium text-[#C93B58] shrink-0">
@@ -5157,7 +5152,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                       )}
                     </div>
                     <p className="text-[11px] text-[#686E7E] truncate">
-                      选择目标角色卡与要带入的提示词/参数，支持一键切换过去微调或发送到 ComfyUI
+                      选择要执行复刻的角色卡，带入该角色的外貌与发型设定，并套用收藏图的画面与工作流参数
                     </p>
                   </div>
                 </div>
@@ -5168,7 +5163,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                     e.stopPropagation();
                     setApplyingCardId(null);
                   }}
-                  aria-label="关闭应用到角色弹窗"
+                  aria-label="关闭用角色复刻弹窗"
                   className="h-8 w-8 inline-flex items-center justify-center rounded-[8px] border border-[#E0E0E6] bg-white text-[#5A6072] hover:text-[#1E2028] cursor-pointer shrink-0"
                 >
                   <X className="w-4 h-4" />
@@ -5181,7 +5176,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                 <section className="space-y-2">
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-[12px] font-semibold text-[#1E2028]">
-                      1. 选择目标角色卡
+                      1. 选择执行复刻的角色卡
                     </span>
                     <span className="text-[11px] text-[#686E7E]">
                       共 {characters.length} 个角色可选
@@ -5225,9 +5220,9 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                                 )}
                               </div>
                               <div className="text-[10.5px] text-[#686E7E] truncate">
-                                {ch.outfit.text.trim()
-                                  ? `现有服装：${ch.outfit.text.trim()}`
-                                  : '现有服装：空'}
+                                {ch.appearance.text.trim()
+                                  ? `角色外貌：${ch.appearance.text.trim()}`
+                                  : '角色外貌：默认'}
                               </div>
                             </div>
                           </div>
@@ -5240,69 +5235,15 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                   </div>
                 </section>
 
-                {/* 2. 防串角色与原词来源选项 */}
-                <section className="rounded-[12px] border border-[#DDD8FA] bg-[#FAF9FF] p-3.5 space-y-2.5">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <label className="inline-flex items-center gap-2 text-[12px] font-semibold text-[#373C4B] cursor-pointer select-none">
-                      <input
-                        type="checkbox"
-                        checked={applyPreserveIdentity}
-                        onChange={(e) => {
-                          const next = e.target.checked;
-                          setApplyPreserveIdentity(next);
-                          populateApplyPreparedFields(
-                            applyingCard,
-                            next,
-                            applyPromptSource
-                          );
-                        }}
-                        className="w-4 h-4 accent-[#7C5CFC]"
-                      />
-                      <ShieldCheck className="w-4 h-4 text-[#7C5CFC]" />
-                      <span>保留目标角色原有外貌与发型（防“换人串角色”）</span>
-                    </label>
-
-                    <div className="flex items-center gap-1.5 text-[11px]">
-                      <span className="text-[#686E7E]">提取来源:</span>
-                      <select
-                        value={applyPromptSource}
-                        onChange={(e) => {
-                          const nextSource = e.target.value as 'effective' | 'extracted';
-                          setApplyPromptSource(nextSource);
-                          populateApplyPreparedFields(
-                            applyingCard,
-                            applyPreserveIdentity,
-                            nextSource
-                          );
-                        }}
-                        className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-white text-[11px] text-[#1E2028] focus:outline-none focus:border-[#7C5CFC]"
-                      >
-                        <option value="effective">当前生效词条（含微调）</option>
-                        <option value="extracted">JSON 原提取词条</option>
-                      </select>
-                    </div>
+                {/* 2. 核心提示说明 */}
+                <section className="rounded-[12px] border border-[#DDD8FA] bg-[#FAF9FF] p-3.5 space-y-2">
+                  <div className="flex items-center gap-2 text-[12px] font-semibold text-[#5B3DF5]">
+                    <ShieldCheck className="w-4 h-4 text-[#7C5CFC]" />
+                    <span>“用角色卡复刻收藏图”运行机制</span>
                   </div>
-
-                  {applyPreserveIdentity ? (
-                    <div className="text-[11px] text-[#4C5264] space-y-1">
-                      <p>
-                        套用时<strong>绝不覆盖</strong>目标角色的外貌（appearance）、发型（HAIRSTYLE_PRESETS）、刘海、发饰、体型规范及禁用词；并已自动剔除原卡中的角色名/发色/瞳色/兽耳光环及 solo/构图/塑料质感词。
-                      </p>
-                      {applyStrippedIdentityTags.length > 0 && (
-                        <p className="font-mono text-[10.5px] text-[#6B48F5] break-words">
-                          已自动过滤 {applyStrippedIdentityTags.length} 项防串角/通用词：
-                          {applyStrippedIdentityTags.slice(0, 10).join(', ')}
-                          {applyStrippedIdentityTags.length > 10
-                            ? ` 等 +${applyStrippedIdentityTags.length - 10} 项`
-                            : ''}
-                        </p>
-                      )}
-                    </div>
-                  ) : (
-                    <p className="text-[11px] text-amber-700">
-                      已关闭特征过滤（仍保留目标角色原有外貌/发型槽位，仅将发色/发型等词保留在待写入的服装/动作候选词中，请手动核对避免串角）。
-                    </p>
-                  )}
+                  <p className="text-[11.5px] text-[#4C5264] leading-relaxed">
+                    选择上方角色卡后，系统将<strong>完美保留该角色的身份特征（外貌、发型、发饰与专属设定）</strong>，同时智能过滤原图中的串角色词，并将收藏图的服装、动作、表情、背景及生成参数带入到该角色中，一键切换至该角色并可直接发往 ComfyUI 复刻！
+                  </p>
                 </section>
 
                 {/* 3. 选择带入的内容 */}
@@ -5616,10 +5557,10 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                     >
                       <UserCheck className="w-4 h-4" />
                       <span>
-                        确认套用到「
+                        确认用「
                         {characters.find((c) => c.id === applyTargetCharId)?.name ??
                           '角色'}
-                        」
+                        」复刻收藏图
                       </span>
                     </button>
                   </div>

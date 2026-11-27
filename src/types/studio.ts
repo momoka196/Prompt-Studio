@@ -302,7 +302,7 @@ export interface CardApplyToCharacterPayload {
   cardId: string;
   cardTitle: string;
   targetCharacterId: string;
-  preserveIdentityAndHair: boolean;
+  preserveIdentityAndHair?: boolean;
   applyOutfit: boolean;
   outfitText: string;
   outfitMode: CardSlotWriteMode;
