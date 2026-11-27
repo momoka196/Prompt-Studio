@@ -8,6 +8,7 @@ export const STUDIO_CONFIG_KEY = 'chibiprompt_studio_config_v3';
 export const STUDIO_HISTORY_KEY = 'chibiprompt_studio_history_v3';
 export const STUDIO_UI_CACHE_KEY = 'chibiprompt_studio_ui_cache_v1';
 export const STUDIO_WORKFLOW_CARDS_KEY = 'chibiprompt_studio_workflow_cards_v1';
+export const STUDIO_DELETED_CARD_TOMBSTONES_KEY = 'chibiprompt_deleted_card_tombstones_v1';
 
 export type EditorSlotKey = 'appearance' | 'outfit' | 'pose' | 'expression';
 export type RolePresetTab = 'slots' | 'hairstyle';
@@ -346,7 +347,20 @@ const STUDIO_IDB_CARDS_STORE = 'workflow_cards';
 const STUDIO_IDB_IMAGES_STORE = 'card_images';
 const STUDIO_IDB_FS_STORE = 'fs_handles';
 const STUDIO_IDB_CARDS_KEY = 'cards_v1';
+const STUDIO_IDB_TOMBSTONES_KEY = 'deleted_tombstones_v1';
 const STUDIO_IDB_DIR_KEY = 'bound_workflow_dir';
+
+export interface DeletedCardTombstone {
+  cardId: string;
+  title?: string;
+  deletedAt: number;
+  contentFingerprint?: string;
+  imageContentHash?: string;
+  imageName?: string;
+  imageByteSize?: number;
+  relativePath?: string;
+  diskFilesDeleted: boolean;
+}
 
 export interface StoredCardImageRecord {
   blob: Blob;
@@ -581,47 +595,230 @@ export async function migrateCardInlineImagesToIdb(
   return { cards: nextCards, migrated: true };
 }
 
-export async function loadWorkflowCardsFromIndexedDb(): Promise<WorkflowCollectionCard[]> {
+let idbCardsWriteChain: Promise<boolean> = Promise.resolve(true);
+
+export async function loadWorkflowCardsFromIndexedDbWithState(): Promise<{
+  exists: boolean;
+  cards: WorkflowCollectionCard[];
+}> {
   const db = await openStudioDb();
-  if (!db) return [];
-  const rawCards = await new Promise<WorkflowCollectionCard[]>((resolve) => {
+  if (!db) return { exists: false, cards: [] };
+  const rawResult = await new Promise<{ exists: boolean; raw: unknown }>((resolve) => {
     try {
       const tx = db.transaction(STUDIO_IDB_CARDS_STORE, 'readonly');
       const store = tx.objectStore(STUDIO_IDB_CARDS_STORE);
       const req = store.get(STUDIO_IDB_CARDS_KEY);
       req.onsuccess = () => {
-        resolve(normalizeWorkflowCards(req.result));
+        resolve({
+          exists: Array.isArray(req.result),
+          raw: req.result,
+        });
       };
-      req.onerror = () => resolve([]);
+      req.onerror = () => resolve({ exists: false, raw: undefined });
     } catch {
-      resolve([]);
+      resolve({ exists: false, raw: undefined });
     }
   });
 
-  if (rawCards.length === 0) return [];
+  if (!rawResult.exists) return { exists: false, cards: [] };
+  const rawCards = normalizeWorkflowCards(rawResult.raw);
+  if (rawCards.length === 0) return { exists: true, cards: [] };
   const { cards: migratedCards, migrated } = await migrateCardInlineImagesToIdb(rawCards);
   if (migrated) {
     void saveWorkflowCardsToIndexedDb(migratedCards);
   }
-  return migratedCards;
+  return { exists: true, cards: migratedCards };
 }
 
-export async function saveWorkflowCardsToIndexedDb(
+export async function loadWorkflowCardsFromIndexedDb(): Promise<WorkflowCollectionCard[]> {
+  const res = await loadWorkflowCardsFromIndexedDbWithState();
+  return res.cards;
+}
+
+export function saveWorkflowCardsToIndexedDb(
   cards: WorkflowCollectionCard[]
 ): Promise<boolean> {
+  const snapshot = cards;
+  const nextWrite = idbCardsWriteChain.then(async () => {
+    const db = await openStudioDb();
+    if (!db) return false;
+    return new Promise<boolean>((resolve) => {
+      try {
+        const tx = db.transaction(STUDIO_IDB_CARDS_STORE, 'readwrite');
+        const store = tx.objectStore(STUDIO_IDB_CARDS_STORE);
+        store.put(snapshot, STUDIO_IDB_CARDS_KEY);
+        tx.oncomplete = () => resolve(true);
+        tx.onerror = () => resolve(false);
+        tx.onabort = () => resolve(false);
+      } catch {
+        resolve(false);
+      }
+    });
+  });
+  idbCardsWriteChain = nextWrite.catch(() => false);
+  return nextWrite;
+}
+
+function normalizeDeletedTombstonesMap(
+  raw: unknown
+): Record<string, DeletedCardTombstone> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const result: Record<string, DeletedCardTombstone> = {};
+  for (const [key, val] of Object.entries(raw as Record<string, unknown>)) {
+    if (!val || typeof val !== 'object') continue;
+    const rec = val as Partial<DeletedCardTombstone>;
+    const cardId = typeof rec.cardId === 'string' && rec.cardId ? rec.cardId : key;
+    if (!cardId) continue;
+    result[cardId] = {
+      cardId,
+      title: typeof rec.title === 'string' ? rec.title : undefined,
+      deletedAt:
+        typeof rec.deletedAt === 'number' && Number.isFinite(rec.deletedAt)
+          ? rec.deletedAt
+          : Date.now(),
+      contentFingerprint:
+        typeof rec.contentFingerprint === 'string' ? rec.contentFingerprint : undefined,
+      imageContentHash:
+        typeof rec.imageContentHash === 'string' ? rec.imageContentHash : undefined,
+      imageName: typeof rec.imageName === 'string' ? rec.imageName : undefined,
+      imageByteSize:
+        typeof rec.imageByteSize === 'number' && Number.isFinite(rec.imageByteSize)
+          ? rec.imageByteSize
+          : undefined,
+      relativePath:
+        typeof rec.relativePath === 'string' ? rec.relativePath : undefined,
+      diskFilesDeleted: Boolean(rec.diskFilesDeleted),
+    };
+  }
+  return result;
+}
+
+function trimTombstonesMap(
+  map: Record<string, DeletedCardTombstone>,
+  maxEntries = 2000
+): Record<string, DeletedCardTombstone> {
+  const entries = Object.entries(map);
+  if (entries.length <= maxEntries) return map;
+  entries.sort((a, b) => b[1].deletedAt - a[1].deletedAt);
+  return Object.fromEntries(entries.slice(0, maxEntries));
+}
+
+export function mergeDeletedTombstonesMaps(
+  base: Record<string, DeletedCardTombstone>,
+  incoming: Record<string, DeletedCardTombstone>
+): Record<string, DeletedCardTombstone> {
+  const next: Record<string, DeletedCardTombstone> = { ...base };
+  for (const [id, item] of Object.entries(incoming)) {
+    const prev = next[id];
+    if (!prev) {
+      next[id] = item;
+    } else if (item.deletedAt > prev.deletedAt) {
+      next[id] = {
+        ...prev,
+        ...item,
+        diskFilesDeleted: item.diskFilesDeleted || prev.diskFilesDeleted,
+      };
+    } else if (item.deletedAt === prev.deletedAt && item.diskFilesDeleted && !prev.diskFilesDeleted) {
+      next[id] = { ...prev, diskFilesDeleted: true };
+    }
+  }
+  return trimTombstonesMap(next);
+}
+
+export function loadDeletedCardTombstones(): Record<string, DeletedCardTombstone> {
+  try {
+    const raw = localStorage.getItem(STUDIO_DELETED_CARD_TOMBSTONES_KEY);
+    if (!raw) return {};
+    return normalizeDeletedTombstonesMap(JSON.parse(raw));
+  } catch {
+    return {};
+  }
+}
+
+export async function loadDeletedCardTombstonesFromIndexedDb(): Promise<
+  Record<string, DeletedCardTombstone>
+> {
+  const localMap = loadDeletedCardTombstones();
   const db = await openStudioDb();
-  if (!db) return false;
-  return new Promise((resolve) => {
+  if (!db) return localMap;
+  const idbMap = await new Promise<Record<string, DeletedCardTombstone>>((resolve) => {
+    try {
+      const tx = db.transaction(STUDIO_IDB_CARDS_STORE, 'readonly');
+      const store = tx.objectStore(STUDIO_IDB_CARDS_STORE);
+      const req = store.get(STUDIO_IDB_TOMBSTONES_KEY);
+      req.onsuccess = () => resolve(normalizeDeletedTombstonesMap(req.result));
+      req.onerror = () => resolve({});
+    } catch {
+      resolve({});
+    }
+  });
+  return mergeDeletedTombstonesMaps(localMap, idbMap);
+}
+
+export async function saveDeletedCardTombstones(
+  map: Record<string, DeletedCardTombstone>
+): Promise<void> {
+  const trimmed = trimTombstonesMap(map);
+  try {
+    localStorage.setItem(STUDIO_DELETED_CARD_TOMBSTONES_KEY, JSON.stringify(trimmed));
+  } catch {
+    // 忽略 localStorage 配额异常，以 IndexedDB 为准
+  }
+  const db = await openStudioDb();
+  if (!db) return;
+  await new Promise<void>((resolve) => {
     try {
       const tx = db.transaction(STUDIO_IDB_CARDS_STORE, 'readwrite');
       const store = tx.objectStore(STUDIO_IDB_CARDS_STORE);
-      const req = store.put(cards, STUDIO_IDB_CARDS_KEY);
-      req.onsuccess = () => resolve(true);
-      req.onerror = () => resolve(false);
+      store.put(trimmed, STUDIO_IDB_TOMBSTONES_KEY);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+      tx.onabort = () => resolve();
     } catch {
-      resolve(false);
+      resolve();
     }
   });
+}
+
+export async function recordDeletedCardTombstones(
+  items: DeletedCardTombstone[]
+): Promise<Record<string, DeletedCardTombstone>> {
+  const current = await loadDeletedCardTombstonesFromIndexedDb();
+  const next = { ...current };
+  for (const item of items) {
+    if (!item.cardId) continue;
+    const prev = next[item.cardId];
+    next[item.cardId] = prev
+      ? {
+          ...prev,
+          ...item,
+          deletedAt: Math.max(prev.deletedAt, item.deletedAt),
+          diskFilesDeleted: Boolean(item.diskFilesDeleted || prev.diskFilesDeleted),
+        }
+      : item;
+  }
+  const trimmed = trimTombstonesMap(next);
+  await saveDeletedCardTombstones(trimmed);
+  return trimmed;
+}
+
+export async function removeDeletedCardTombstones(
+  cardIds: string[]
+): Promise<Record<string, DeletedCardTombstone>> {
+  const current = await loadDeletedCardTombstonesFromIndexedDb();
+  if (cardIds.length === 0) return current;
+  let changed = false;
+  const next = { ...current };
+  for (const id of cardIds) {
+    if (id in next) {
+      delete next[id];
+      changed = true;
+    }
+  }
+  if (changed) {
+    await saveDeletedCardTombstones(next);
+  }
+  return next;
 }
 
 export async function saveBoundDirectoryHandle(
@@ -685,6 +882,15 @@ export function saveWorkflowCardsSafely(cards: WorkflowCollectionCard[]): {
     void saveWorkflowCardsToIndexedDb(cards);
   }
 
+  if (cards.length === 0) {
+    try {
+      localStorage.setItem(STUDIO_WORKFLOW_CARDS_KEY, '[]');
+    } catch {
+      // 忽略异常
+    }
+    return { ok: true };
+  }
+
   // 当卡片数量较大或存在大图时，优先持久化轻量索引到 localStorage，避免 JSON.stringify 数百张原图阻塞主线程
   const hasAnyInlineOriginal = cards.some((c) => Boolean(c.originalImageDataUrl));
   if (idbAvailable && (cards.length > 30 || hasAnyInlineOriginal)) {
@@ -692,9 +898,17 @@ export function saveWorkflowCardsSafely(cards: WorkflowCollectionCard[]): {
       const lightPayload = JSON.stringify(buildLightweightCardsForLocalStorage(cards));
       if (lightPayload.length < 2_500_000) {
         localStorage.setItem(STUDIO_WORKFLOW_CARDS_KEY, lightPayload);
+      } else {
+        // 避免 localStorage 残留过期的旧列表而在刷新时复活已删除卡片
+        localStorage.removeItem(STUDIO_WORKFLOW_CARDS_KEY);
       }
     } catch {
       // IndexedDB 已完成持久化，忽略 localStorage 配额限制
+      try {
+        localStorage.removeItem(STUDIO_WORKFLOW_CARDS_KEY);
+      } catch {
+        // ignore
+      }
     }
     return { ok: true };
   }

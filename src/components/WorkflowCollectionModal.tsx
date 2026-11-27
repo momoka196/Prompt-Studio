@@ -52,6 +52,7 @@ import {
   computeBlobContentHash,
   computeCardContentFingerprint,
   dedupeAndMergeIncomingCards,
+  deleteCardsFromLocalDirectory,
   ensureDirectoryWritePermission,
   extractComfyMetadataFromPngFile,
   findDuplicateCardForSingleDraft,
@@ -59,7 +60,7 @@ import {
   IncomingCardWithBlob,
   isFileSystemAccessSupported,
   isInRestrictedIframe,
-  loadFolderSyncIndexSnapshot,
+  loadFolderSyncStateSnapshot,
   parseComfyWorkflowSource,
   parsePromptToTagItems,
   pickLocalWorkflowDirectory,
@@ -79,13 +80,19 @@ import {
 import {
   copyCardImageBlob,
   deleteCardImageBlobsBatch,
+  DeletedCardTombstone,
   encodeBlobToDataUrl,
   isIndexedDbSupported,
   loadBoundDirectoryHandle,
-  migrateCardInlineImagesToIdb,
+  loadDeletedCardTombstones,
+  loadDeletedCardTombstonesFromIndexedDb,
+  mergeDeletedTombstonesMaps,
   normalizeWorkflowCards,
+  recordDeletedCardTombstones,
+  removeDeletedCardTombstones,
   saveBoundDirectoryHandle,
   saveCardImageBlob,
+  saveDeletedCardTombstones,
 } from '../utils/storageCache';
 
 interface WorkflowCollectionModalProps {
@@ -409,6 +416,10 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   const draftPreviewUrlRef = useRef<string | undefined>(undefined);
   const cardsRef = useRef<WorkflowCollectionCard[]>(cards);
   cardsRef.current = cards;
+  const tombstonesRef = useRef<Record<string, DeletedCardTombstone>>(
+    loadDeletedCardTombstones()
+  );
+  const deletedIdsSessionRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     draftPreviewUrlRef.current = draft.previewObjectUrl;
@@ -438,6 +449,13 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   useEffect(() => {
     let cancelled = false;
     void (async () => {
+      const idbTombstones = await loadDeletedCardTombstonesFromIndexedDb();
+      if (!cancelled) {
+        tombstonesRef.current = mergeDeletedTombstonesMaps(
+          tombstonesRef.current,
+          idbTombstones
+        );
+      }
       const savedHandle = await loadBoundDirectoryHandle();
       if (cancelled || !savedHandle) return;
       const perm = await ensureDirectoryWritePermission(savedHandle, false);
@@ -445,9 +463,17 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       setBoundDirHandle(savedHandle);
       setDirPermState(perm);
       if (perm === 'granted') {
-        const snapshot = await loadFolderSyncIndexSnapshot(savedHandle);
+        const snapshot = await loadFolderSyncStateSnapshot(savedHandle);
         if (!cancelled) {
-          setFolderIndexMap(snapshot);
+          setFolderIndexMap(snapshot.entries);
+          if (Object.keys(snapshot.deletedTombstones).length > 0) {
+            const merged = mergeDeletedTombstonesMaps(
+              tombstonesRef.current,
+              snapshot.deletedTombstones
+            );
+            tombstonesRef.current = merged;
+            void saveDeletedCardTombstones(merged);
+          }
         }
       }
     })();
@@ -620,6 +646,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
   const commitCards = useCallback(
     (next: WorkflowCollectionCard[]) => {
+      cardsRef.current = next;
       const res = onChangeCards(next);
       if (!res.ok && res.error) {
         setStorageWarning(res.error);
@@ -638,18 +665,69 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     ) => {
       setIsScanningFolder(true);
       setScanProgress({ scanned: 0, currentPath: dirHandle.name });
+      const scanStartedAt = Date.now();
       try {
         const res = await scanLocalDirectoryAndMerge(dirHandle, cardsRef.current, {
+          tombstones: tombstonesRef.current,
           onProgress: (scanned, currentPath) => {
             setScanProgress({ scanned, currentPath });
           },
         });
-        setFolderIndexMap(res.indexEntries);
-        if (res.addedCards.length > 0 || res.updatedCards.length > 0 || res.restoredImageBlobsCount > 0) {
-          commitCards(res.mergedCards);
+
+        // 并发安全：防止扫描过程中被用户手动删除的卡片在异步返回时复活
+        const currentTombstones = tombstonesRef.current;
+        const deletedDuringScanIds = new Set<string>();
+        for (const [id, tomb] of Object.entries(currentTombstones)) {
+          if (tomb.deletedAt >= scanStartedAt) {
+            deletedDuringScanIds.add(id);
+          }
+        }
+        for (const id of deletedIdsSessionRef.current) {
+          const tomb = currentTombstones[id];
+          if (!tomb || tomb.deletedAt >= scanStartedAt) {
+            deletedDuringScanIds.add(id);
+          }
         }
 
-        if (res.discoveredCardsCount === 0) {
+        const safeTombstones = mergeDeletedTombstonesMaps(
+          res.tombstones,
+          currentTombstones
+        );
+        for (const clearedId of res.clearedTombstoneIds) {
+          if (!deletedDuringScanIds.has(clearedId)) {
+            deletedIdsSessionRef.current.delete(clearedId);
+          }
+        }
+        tombstonesRef.current = safeTombstones;
+        void saveDeletedCardTombstones(safeTombstones);
+
+        const safeIndexEntries = { ...res.indexEntries };
+        for (const delId of deletedDuringScanIds) {
+          delete safeIndexEntries[delId];
+        }
+        setFolderIndexMap(safeIndexEntries);
+
+        const safeMergedCards = res.mergedCards.filter(
+          (c) => !deletedDuringScanIds.has(c.id)
+        );
+        const safeMergedIdSet = new Set(safeMergedCards.map((c) => c.id));
+        const locallyAddedDuringScan = cardsRef.current.filter(
+          (c) => !safeMergedIdSet.has(c.id) && !deletedDuringScanIds.has(c.id)
+        );
+        const finalMergedCards = [...locallyAddedDuringScan, ...safeMergedCards];
+
+        const safeAdded = res.addedCards.filter((c) => !deletedDuringScanIds.has(c.id));
+        const safeUpdated = res.updatedCards.filter((c) => !deletedDuringScanIds.has(c.id));
+
+        if (
+          safeAdded.length > 0 ||
+          safeUpdated.length > 0 ||
+          res.restoredImageBlobsCount > 0
+        ) {
+          commitCards(finalMergedCards);
+        }
+
+        if (res.discoveredCardsCount === 0 && res.skippedTombstones.length === 0) {
           if (!options?.silentIfEmpty) {
             setFolderNotice({
               type: 'ok',
@@ -663,9 +741,17 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
           res.restoredImageBlobsCount > 0
             ? `（含补齐原图 ${res.restoredImageBlobsCount} 张）`
             : '';
+        const tombstoneSkipNote =
+          res.skippedTombstones.length > 0
+            ? `，拦截已删除卡片 ${res.skippedTombstones.length} 张`
+            : '';
+        const reintroNote =
+          res.reintroducedFromTombstone.length > 0
+            ? `（检测到文件夹中重新放入曾删除的同名/同源新文件 ${res.reintroducedFromTombstone.length} 张，已重新收录）`
+            : '';
         setFolderNotice({
-          type: 'ok',
-          text: `已从「${dirHandle.name}」扫描 ${res.discoveredCardsCount} 张卡片：新增 ${res.addedCards.length} 张、更新 ${res.updatedCards.length} 张${extraRestoreNote}、跳过重复/未变更 ${res.skippedDuplicates.length} 张`,
+          type: res.reintroducedFromTombstone.length > 0 ? 'warn' : 'ok',
+          text: `已从「${dirHandle.name}」扫描 ${res.discoveredCardsCount} 张卡片：新增 ${safeAdded.length} 张、更新 ${safeUpdated.length} 张${extraRestoreNote}、跳过重复/未变更 ${res.skippedDuplicates.length} 张${tombstoneSkipNote}${reintroNote}`,
         });
         return res;
       } catch (err) {
@@ -762,8 +848,14 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       }
       const res = await syncCardsIncrementalToLocalDirectory(boundDirHandle, [card], {
         blobsByCardId: blobsByCardId.size > 0 ? blobsByCardId : undefined,
+        isCardActive: (cardId) => !deletedIdsSessionRef.current.has(cardId),
+        extraTombstones: tombstonesRef.current,
       });
-      setFolderIndexMap(res.indexEntries);
+      const cleanedIndex = { ...res.indexEntries };
+      for (const delId of deletedIdsSessionRef.current) {
+        delete cleanedIndex[delId];
+      }
+      setFolderIndexMap(cleanedIndex);
       if (res.failed.length > 0) {
         return { written: false, error: res.failed[0].error };
       }
@@ -817,11 +909,17 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     });
     try {
       const res = await syncCardsIncrementalToLocalDirectory(boundDirHandle, targetCards, {
+        isCardActive: (cardId) => !deletedIdsSessionRef.current.has(cardId),
+        extraTombstones: tombstonesRef.current,
         onProgress: (done, total, currentTitle, actionLabel) => {
           setSyncProgress({ done, total, currentTitle, actionLabel });
         },
       });
-      setFolderIndexMap(res.indexEntries);
+      const cleanedIndex = { ...res.indexEntries };
+      for (const delId of deletedIdsSessionRef.current) {
+        delete cleanedIndex[delId];
+      }
+      setFolderIndexMap(cleanedIndex);
       if (res.updatedCardsById.size > 0) {
         commitCards(
           cardsRef.current.map((c) => res.updatedCardsById.get(c.id) ?? c)
@@ -1151,6 +1249,19 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       });
     }
 
+    deletedIdsSessionRef.current.delete(newCard.id);
+    if (imageContentHash) {
+      const matchingOldTombIds = Object.values(tombstonesRef.current)
+        .filter((t) => t.imageContentHash === imageContentHash)
+        .map((t) => t.cardId);
+      if (matchingOldTombIds.length > 0) {
+        const nextTombs = { ...tombstonesRef.current };
+        for (const id of matchingOldTombIds) delete nextTombs[id];
+        tombstonesRef.current = nextTombs;
+        void removeDeletedCardTombstones(matchingOldTombIds);
+      }
+    }
+
     const saveRes = commitCards([newCard, ...cardsRef.current]);
     if (saveRes.ok) {
       if (draft.previewObjectUrl) {
@@ -1200,22 +1311,139 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     }
   };
 
+  const performDeleteCards = useCallback(
+    async (cardsToDelete: WorkflowCollectionCard[], isBulk: boolean) => {
+      if (cardsToDelete.length === 0) return;
+      const targetIds = cardsToDelete.map((c) => c.id);
+      const targetIdSet = new Set(targetIds);
+      const deletedAt = Date.now();
+
+      for (const id of targetIds) {
+        deletedIdsSessionRef.current.add(id);
+      }
+
+      if (editingCardId && targetIdSet.has(editingCardId)) {
+        setEditingCardId(null);
+      }
+      if (lightboxCardId && targetIdSet.has(lightboxCardId)) {
+        setLightboxCardId(null);
+      }
+
+      setSelectedCardIds((prev) => {
+        let changed = false;
+        const next = new Set(prev);
+        for (const id of targetIds) {
+          if (next.delete(id)) changed = true;
+        }
+        return changed ? next : prev;
+      });
+      if (isBulk) {
+        setConfirmBulkDelete(false);
+      }
+
+      invalidateCardImageCache(targetIds);
+      void deleteCardImageBlobsBatch(targetIds);
+
+      // 立即从 cardsRef / IndexedDB workflow_cards / localStorage 中彻底移除
+      const nextCards = cardsRef.current.filter((c) => !targetIdSet.has(c.id));
+      const saveRes = commitCards(nextCards);
+
+      // 立即移除同步状态索引中的已删条目
+      setFolderIndexMap((prev) => {
+        if (!prev) return prev;
+        let changed = false;
+        const next = { ...prev };
+        for (const id of targetIds) {
+          if (id in next) {
+            delete next[id];
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+
+      // 立即持久化删除墓碑（先标记 diskFilesDeleted: false，待磁盘清理完成后更新为 true）
+      const initialTombstones: DeletedCardTombstone[] = cardsToDelete.map((c) => ({
+        cardId: c.id,
+        title: c.title,
+        deletedAt,
+        contentFingerprint: c.contentFingerprint || computeCardContentFingerprint(c),
+        imageContentHash: c.imageContentHash,
+        imageName: c.imageName,
+        imageByteSize: c.imageByteSize,
+        relativePath: c.folderSyncedPath || buildCardFolderPathSegments(c).join('/'),
+        diskFilesDeleted: false,
+      }));
+      const updatedLocalTombstones = await recordDeletedCardTombstones(initialTombstones);
+      tombstonesRef.current = mergeDeletedTombstonesMaps(
+        tombstonesRef.current,
+        updatedLocalTombstones
+      );
+
+      // 若已绑定本地文件夹，同步清理磁盘上的 .card.json / .workflow.json / 原图及 .chibiprompt-sync-index.json
+      if (boundDirHandle) {
+        let perm = dirPermState;
+        if (perm !== 'granted') {
+          perm = await ensureDirectoryWritePermission(boundDirHandle, true);
+          setDirPermState(perm);
+        }
+        if (perm === 'granted') {
+          const delRes = await deleteCardsFromLocalDirectory(
+            boundDirHandle,
+            cardsToDelete,
+            { extraTombstones: tombstonesRef.current }
+          );
+          const cleanedIndex = { ...delRes.indexEntries };
+          for (const delId of deletedIdsSessionRef.current) {
+            delete cleanedIndex[delId];
+          }
+          setFolderIndexMap(cleanedIndex);
+          tombstonesRef.current = mergeDeletedTombstonesMaps(
+            tombstonesRef.current,
+            delRes.deletedTombstones
+          );
+          await saveDeletedCardTombstones(tombstonesRef.current);
+
+          if (delRes.failed.length === 0) {
+            const msg = isBulk
+              ? `已批量彻底删除 ${cardsToDelete.length} 张卡片及缓存原图，并同步清理本地文件夹 ${delRes.removedFilesCount} 个文件与索引`
+              : `已彻底删除「${cardsToDelete[0].title}」，并同步移除本地文件夹文件（${delRes.removedFilesCount} 个）与索引`;
+            setImportNotice({ type: 'ok', text: msg });
+            setFolderNotice({ type: 'ok', text: msg });
+          } else {
+            setFolderNotice({
+              type: 'warn',
+              text: `已从工作台删除，但部分本地文件清理失败：${delRes.failed[0].error}`,
+            });
+          }
+          return;
+        }
+
+        if (saveRes.ok) {
+          setImportNotice({
+            type: 'warn',
+            text: isBulk
+              ? `已从浏览器缓存删除 ${cardsToDelete.length} 张卡片并记录删除墓碑（当前未获文件夹写入权限，重新读取时将跳过未清理的旧文件）`
+              : `已从浏览器缓存删除「${cardsToDelete[0].title}」并记录删除墓碑（未获文件夹写权限，下次扫描不会误复活）`,
+          });
+        }
+        return;
+      }
+
+      if (saveRes.ok && isBulk) {
+        setImportNotice({
+          type: 'ok',
+          text: `已批量彻底删除 ${cardsToDelete.length} 张卡片及其本地缓存原图`,
+        });
+      }
+    },
+    [boundDirHandle, commitCards, dirPermState, editingCardId, lightboxCardId]
+  );
+
   const handleDeleteCard = (cardId: string) => {
-    if (editingCardId === cardId) {
-      setEditingCardId(null);
-    }
-    if (lightboxCardId === cardId) {
-      setLightboxCardId(null);
-    }
-    setSelectedCardIds((prev) => {
-      if (!prev.has(cardId)) return prev;
-      const next = new Set(prev);
-      next.delete(cardId);
-      return next;
-    });
-    invalidateCardImageCache([cardId]);
-    void deleteCardImageBlobsBatch([cardId]);
-    commitCards(cardsRef.current.filter((c) => c.id !== cardId));
+    const target = cardsRef.current.find((c) => c.id === cardId);
+    if (!target) return;
+    void performDeleteCards([target], false);
   };
 
   const handleBulkTogglePrivate = (makePrivate: boolean) => {
@@ -1272,24 +1500,9 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
   const handleBulkDeleteSelected = () => {
     if (selectedCardIds.size === 0) return;
-    const ids = Array.from(selectedCardIds);
-    if (editingCardId && selectedCardIds.has(editingCardId)) {
-      setEditingCardId(null);
-    }
-    if (lightboxCardId && selectedCardIds.has(lightboxCardId)) {
-      setLightboxCardId(null);
-    }
-    invalidateCardImageCache(ids);
-    void deleteCardImageBlobsBatch(ids);
-    const res = commitCards(cards.filter((c) => !selectedCardIds.has(c.id)));
-    if (res.ok) {
-      setSelectedCardIds(new Set());
-      setConfirmBulkDelete(false);
-      setImportNotice({
-        type: 'ok',
-        text: `已批量删除 ${ids.length} 张卡片及其本地缓存原图`,
-      });
-    }
+    const targets = cardsRef.current.filter((c) => selectedCardIds.has(c.id));
+    if (targets.length === 0) return;
+    void performDeleteCards(targets, true);
   };
 
   const handleDownloadCardOriginalImage = async (card: WorkflowCollectionCard) => {
@@ -1701,6 +1914,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
               incomingItems.push({
                 card: c,
                 sourceLabel: `${file.name} · ${c.title}`,
+                fromCollectionJson: true,
               });
             }
           } catch {
@@ -1722,6 +1936,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
               imageBlob: pngResult.imageBlob,
               mimeType: pngResult.mimeType,
               sourceLabel: file.name,
+              fileModifiedAt: file.lastModified,
             });
           } else {
             invalidSkipped.push({
@@ -1744,13 +1959,31 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       const mergeRes = await dedupeAndMergeIncomingCards(
         cardsRef.current,
         incomingItems,
-        { preferIncomingOnSameIdUpdate: true }
+        {
+          preferIncomingOnSameIdUpdate: true,
+          tombstones: tombstonesRef.current,
+          sourceMode: 'manual-import',
+        }
       );
+
+      if (mergeRes.clearedTombstoneIds.length > 0) {
+        const nextTombs = { ...tombstonesRef.current };
+        for (const id of mergeRes.clearedTombstoneIds) {
+          delete nextTombs[id];
+          deletedIdsSessionRef.current.delete(id);
+        }
+        tombstonesRef.current = nextTombs;
+        void removeDeletedCardTombstones(mergeRes.clearedTombstoneIds);
+      }
 
       const allSkippedDetails = [
         ...mergeRes.skippedDuplicates.map((d) => ({
           fileName: d.fileName,
           reason: d.reason,
+        })),
+        ...mergeRes.skippedTombstones.map((t) => ({
+          fileName: t.fileName,
+          reason: t.reason,
         })),
         ...invalidSkipped,
       ];
@@ -1767,13 +2000,19 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
             changedCards,
             {
               blobsByCardId,
+              isCardActive: (cardId) => !deletedIdsSessionRef.current.has(cardId),
+              extraTombstones: tombstonesRef.current,
               onProgress: (done, total, currentTitle, actionLabel) => {
                 setSyncProgress({ done, total, currentTitle, actionLabel });
               },
             }
           );
           setSyncProgress(null);
-          setFolderIndexMap(syncRes.indexEntries);
+          const cleanedIndex = { ...syncRes.indexEntries };
+          for (const delId of deletedIdsSessionRef.current) {
+            delete cleanedIndex[delId];
+          }
+          setFolderIndexMap(cleanedIndex);
           if (syncRes.updatedCardsById.size > 0) {
             finalCards = finalCards.map((c) => syncRes.updatedCardsById.get(c.id) ?? c);
           }
@@ -1782,11 +2021,22 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
           }
         }
 
+        finalCards = finalCards.filter(
+          (c) => !deletedIdsSessionRef.current.has(c.id)
+        );
         const res = commitCards(finalCards);
         if (res.ok) {
           const dupSkippedCount = mergeRes.skippedDuplicates.length;
+          const tombSkippedCount = mergeRes.skippedTombstones.length;
+          const reintroCount = mergeRes.reintroducedFromTombstone.length;
           const invalidCount = invalidSkipped.length;
           const statsText = `导入完成：新增 ${mergeRes.addedCards.length} 张、更新 ${mergeRes.updatedCards.length} 张、跳过重复 ${dupSkippedCount} 张${
+            tombSkippedCount > 0 ? `、跳过已删除旧备份 ${tombSkippedCount} 张` : ''
+          }${
+            reintroCount > 0
+              ? `（其中 ${reintroCount} 张曾被删除，本次手动导入已重新收录）`
+              : ''
+          }${
             invalidCount > 0 ? `（另有 ${invalidCount} 个无效/无参数文件被跳过）` : ''
           }`;
           const importedPrivateCount = changedCards.filter((c) =>
@@ -1801,15 +2051,22 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
             text: `${statsText}${folderSyncSummary}${privateSuffix}`,
           });
         }
-      } else if (mergeRes.skippedDuplicates.length > 0) {
+      } else if (
+        mergeRes.skippedDuplicates.length > 0 ||
+        mergeRes.skippedTombstones.length > 0
+      ) {
         // 即使没有新增/更新，若后台补齐了旧卡片 hash 也可安全同步索引
         if (mergeRes.mergedCards !== cardsRef.current) {
           commitCards(mergeRes.mergedCards);
         }
         const invalidCount = invalidSkipped.length;
+        const tombSkipText =
+          mergeRes.skippedTombstones.length > 0
+            ? `、拦截已删除旧备份 ${mergeRes.skippedTombstones.length} 张`
+            : '';
         setImportNotice({
           type: 'warn',
-          text: `未产生重复入库：新增 0 张、更新 0 张、跳过重复/已存在 ${mergeRes.skippedDuplicates.length} 张${
+          text: `未产生重复入库：新增 0 张、更新 0 张、跳过重复/已存在 ${mergeRes.skippedDuplicates.length} 张${tombSkipText}${
             invalidCount > 0 ? `（另有 ${invalidCount} 个文件无可用参数被跳过）` : ''
           }`,
         });

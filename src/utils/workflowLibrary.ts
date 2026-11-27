@@ -15,10 +15,12 @@ import {
 } from './promptBuilder';
 import {
   decodeDataUrlToBlob,
+  DeletedCardTombstone,
   encodeBlobToDataUrl,
   isIndexedDbSupported,
   listStoredCardImageIds,
   loadCardImageBlob,
+  mergeDeletedTombstonesMaps,
   normalizeWorkflowCards,
   saveCardImageBlobsBatch,
   StoredCardImageRecord,
@@ -2088,11 +2090,14 @@ export interface FolderSyncIndexFile {
   schema: 'chibiprompt-folder-sync-index-v1';
   updatedAt: number;
   entries: Record<string, FolderSyncIndexEntry>;
+  deletedTombstones?: Record<string, DeletedCardTombstone>;
 }
 
-async function readFolderSyncIndex(
-  rootHandle: FileSystemDirectoryHandle
-): Promise<{ entries: Record<string, FolderSyncIndexEntry>; exists: boolean }> {
+async function readFolderSyncIndex(rootHandle: FileSystemDirectoryHandle): Promise<{
+  entries: Record<string, FolderSyncIndexEntry>;
+  deletedTombstones: Record<string, DeletedCardTombstone>;
+  exists: boolean;
+}> {
   try {
     const fileHandle = await rootHandle.getFileHandle(FOLDER_SYNC_INDEX_FILENAME, {
       create: false,
@@ -2100,23 +2105,35 @@ async function readFolderSyncIndex(
     const file = await fileHandle.getFile();
     const parsed = JSON.parse(await file.text()) as Partial<FolderSyncIndexFile>;
     if (parsed && parsed.entries && typeof parsed.entries === 'object') {
-      return { entries: { ...parsed.entries }, exists: true };
+      const rawTombstones =
+        parsed.deletedTombstones && typeof parsed.deletedTombstones === 'object'
+          ? (parsed.deletedTombstones as Record<string, DeletedCardTombstone>)
+          : {};
+      return {
+        entries: { ...parsed.entries },
+        deletedTombstones: mergeDeletedTombstonesMaps({}, rawTombstones),
+        exists: true,
+      };
     }
   } catch {
     // ignore missing or malformed index file
   }
-  return { entries: {}, exists: false };
+  return { entries: {}, deletedTombstones: {}, exists: false };
 }
 
 async function writeFolderSyncIndex(
   rootHandle: FileSystemDirectoryHandle,
-  entries: Record<string, FolderSyncIndexEntry>
+  entries: Record<string, FolderSyncIndexEntry>,
+  deletedTombstones?: Record<string, DeletedCardTombstone>
 ): Promise<void> {
   try {
     const payload: FolderSyncIndexFile = {
       schema: 'chibiprompt-folder-sync-index-v1',
       updatedAt: Date.now(),
       entries,
+      ...(deletedTombstones && Object.keys(deletedTombstones).length > 0
+        ? { deletedTombstones }
+        : {}),
     };
     await writeFileInDirectory(
       rootHandle,
@@ -2155,18 +2172,60 @@ async function fileExistsInDirectory(
   }
 }
 
-async function tryCleanupMovedCardFiles(
-  rootHandle: FileSystemDirectoryHandle,
-  oldRelativePath: string,
-  expectedCardId: string
-): Promise<void> {
-  const segments = oldRelativePath.split('/').filter(Boolean);
-  if (segments.length === 0) return;
-  const oldDir = await getSubdirectoryIfExists(rootHandle, segments);
-  if (!oldDir) return;
+async function isDirectoryEmpty(dirHandle: FileSystemDirectoryHandle): Promise<boolean> {
   try {
     const iter = (
-      oldDir as unknown as {
+      dirHandle as unknown as {
+        values: () => AsyncIterable<FileSystemHandle>;
+      }
+    ).values();
+    for await (const _entry of iter) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function tryRemoveEmptyAncestorDirs(
+  rootHandle: FileSystemDirectoryHandle,
+  segments: string[]
+): Promise<void> {
+  for (let len = segments.length; len >= 1; len--) {
+    const parentSegs = segments.slice(0, len - 1);
+    const leafName = segments[len - 1];
+    // 保留 _私密区 根目录容器仅在彻底为空时可删（或若为空也可清理）
+    const parentDir =
+      parentSegs.length > 0
+        ? await getSubdirectoryIfExists(rootHandle, parentSegs)
+        : rootHandle;
+    const leafDir =
+      parentDir ? await getSubdirectoryIfExists(parentDir, [leafName]) : null;
+    if (!parentDir || !leafDir) continue;
+    if (await isDirectoryEmpty(leafDir)) {
+      await parentDir.removeEntry(leafName).catch(() => undefined);
+    } else {
+      break;
+    }
+  }
+}
+
+async function removeMatchedCardFilesInDir(
+  rootHandle: FileSystemDirectoryHandle,
+  segments: string[],
+  expectedCardId: string,
+  extraKnownImageNames?: string[]
+): Promise<{ matched: boolean; removedCount: number }> {
+  const targetDir =
+    segments.length > 0
+      ? await getSubdirectoryIfExists(rootHandle, segments)
+      : rootHandle;
+  if (!targetDir) return { matched: false, removedCount: 0 };
+
+  try {
+    const iter = (
+      targetDir as unknown as {
         values: () => AsyncIterable<FileSystemHandle>;
       }
     ).values();
@@ -2174,41 +2233,75 @@ async function tryCleanupMovedCardFiles(
     for await (const handle of iter) {
       entries.push(handle);
     }
-    const cardJsonHandle = entries.find(
+
+    const cardJsonHandles = entries.filter(
       (h): h is FileSystemFileHandle =>
         h.kind === 'file' && h.name.toLowerCase().endsWith('.card.json')
     );
-    if (!cardJsonHandle) return;
-    const metaRaw = JSON.parse(
-      await (await cardJsonHandle.getFile()).text()
-    ) as Partial<WorkflowCollectionCard>;
-    if (metaRaw.id !== expectedCardId) return;
+    if (cardJsonHandles.length === 0) return { matched: false, removedCount: 0 };
 
-    const baseName = cardJsonHandle.name.replace(/\.card\.json$/i, '');
-    for (const entry of entries) {
-      if (entry.kind !== 'file') continue;
-      if (
-        entry.name === cardJsonHandle.name ||
-        entry.name === `${baseName}.workflow.json` ||
-        entry.name.startsWith(`${baseName}.`)
-      ) {
-        await oldDir.removeEntry(entry.name).catch(() => undefined);
+    let totalRemoved = 0;
+    let matched = false;
+
+    for (const cardJsonHandle of cardJsonHandles) {
+      let metaRaw: Partial<WorkflowCollectionCard> | null = null;
+      try {
+        metaRaw = JSON.parse(
+          await (await cardJsonHandle.getFile()).text()
+        ) as Partial<WorkflowCollectionCard>;
+      } catch {
+        metaRaw = null;
+      }
+      if (!metaRaw || metaRaw.id !== expectedCardId) continue;
+
+      matched = true;
+      const baseName = cardJsonHandle.name.replace(/\.card\.json$/i, '');
+      const baseLower = baseName.toLowerCase();
+      const candidateImageNames = new Set<string>(
+        [
+          ...(extraKnownImageNames ?? []),
+          typeof metaRaw.imageName === 'string' ? metaRaw.imageName : '',
+        ]
+          .map((n) => n.trim().toLowerCase())
+          .filter(Boolean)
+      );
+
+      for (const entry of entries) {
+        if (entry.kind !== 'file') continue;
+        const lower = entry.name.toLowerCase();
+        const isMatchedImage =
+          (IMAGE_FILE_EXT_RE.test(lower) &&
+            (lower.replace(IMAGE_FILE_EXT_RE, '') === baseLower ||
+              candidateImageNames.has(lower))) ||
+          lower === `${baseLower}.workflow.json` ||
+          lower === `${baseLower}.json` ||
+          entry.name === cardJsonHandle.name ||
+          entry.name.startsWith(`${baseName}.`);
+
+        if (isMatchedImage) {
+          await targetDir.removeEntry(entry.name).catch(() => undefined);
+          totalRemoved += 1;
+        }
       }
     }
-    if (segments.length >= 1) {
-      const parentSegs = segments.slice(0, -1);
-      const leafName = segments[segments.length - 1];
-      const parentDir =
-        parentSegs.length > 0
-          ? await getSubdirectoryIfExists(rootHandle, parentSegs)
-          : rootHandle;
-      if (parentDir) {
-        await parentDir.removeEntry(leafName).catch(() => undefined);
-      }
+
+    if (matched && segments.length >= 1) {
+      await tryRemoveEmptyAncestorDirs(rootHandle, segments);
     }
+    return { matched, removedCount: totalRemoved };
   } catch {
-    // ignore cleanup failure
+    return { matched: false, removedCount: 0 };
   }
+}
+
+async function tryCleanupMovedCardFiles(
+  rootHandle: FileSystemDirectoryHandle,
+  oldRelativePath: string,
+  expectedCardId: string
+): Promise<void> {
+  const segments = oldRelativePath.split('/').filter(Boolean);
+  if (segments.length === 0) return;
+  await removeMatchedCardFilesInDir(rootHandle, segments, expectedCardId);
 }
 
 export async function writeCardToLocalDirectory(
@@ -2350,6 +2443,7 @@ export interface IncrementalFolderSyncResult {
   failed: { cardId: string; title: string; error: string }[];
   updatedCardsById: Map<string, WorkflowCollectionCard>;
   indexEntries: Record<string, FolderSyncIndexEntry>;
+  deletedTombstones: Record<string, DeletedCardTombstone>;
 }
 
 export async function syncCardsIncrementalToLocalDirectory(
@@ -2357,6 +2451,8 @@ export async function syncCardsIncrementalToLocalDirectory(
   cards: WorkflowCollectionCard[],
   options?: {
     blobsByCardId?: Map<string, Blob>;
+    isCardActive?: (cardId: string) => boolean;
+    extraTombstones?: Record<string, DeletedCardTombstone>;
     onProgress?: (
       done: number,
       total: number,
@@ -2365,7 +2461,11 @@ export async function syncCardsIncrementalToLocalDirectory(
     ) => void;
   }
 ): Promise<IncrementalFolderSyncResult> {
-  const { entries: indexEntries } = await readFolderSyncIndex(rootHandle);
+  const { entries: indexEntries, deletedTombstones: diskTombstones } =
+    await readFolderSyncIndex(rootHandle);
+  const deletedTombstones = options?.extraTombstones
+    ? mergeDeletedTombstonesMaps(diskTombstones, options.extraTombstones)
+    : { ...diskTombstones };
   const succeededIds: string[] = [];
   const failed: { cardId: string; title: string; error: string }[] = [];
   const updatedCardsById = new Map<string, WorkflowCollectionCard>();
@@ -2378,8 +2478,14 @@ export async function syncCardsIncrementalToLocalDirectory(
   const total = cards.length;
   for (let i = 0; i < total; i++) {
     const rawCard = cards[i];
+    if (options?.isCardActive && !options.isCardActive(rawCard.id)) {
+      continue;
+    }
     const overrideBlob = options?.blobsByCardId?.get(rawCard.id) ?? null;
     const { card: hashedCard } = await ensureCardContentHashes(rawCard, overrideBlob);
+    if (options?.isCardActive && !options.isCardActive(rawCard.id)) {
+      continue;
+    }
     const targetRelPath = buildCardFolderPathSegments(hashedCard).join('/');
     const baseName = sanitizeFilenamePrefix(hashedCard.title).slice(0, 48);
     const targetFingerprint = hashedCard.contentFingerprint!;
@@ -2480,6 +2586,9 @@ export async function syncCardsIncrementalToLocalDirectory(
           updatedAt: res.card.updatedAt,
           syncedAt: res.card.lastFolderSyncAt ?? Date.now(),
         };
+        if (hashedCard.id in deletedTombstones) {
+          delete deletedTombstones[hashedCard.id];
+        }
         indexDirty = true;
         if (isUpdate) updatedCount += 1;
         else addedCount += 1;
@@ -2498,7 +2607,7 @@ export async function syncCardsIncrementalToLocalDirectory(
   }
 
   if (indexDirty) {
-    await writeFolderSyncIndex(rootHandle, indexEntries);
+    await writeFolderSyncIndex(rootHandle, indexEntries, deletedTombstones);
   }
 
   options?.onProgress?.(total, total, '', '完成');
@@ -2510,6 +2619,197 @@ export async function syncCardsIncrementalToLocalDirectory(
     failed,
     updatedCardsById,
     indexEntries,
+    deletedTombstones,
+  };
+}
+
+export interface FolderDeleteResult {
+  deletedIds: string[];
+  removedFilesCount: number;
+  failed: { cardId: string; title: string; error: string }[];
+  indexEntries: Record<string, FolderSyncIndexEntry>;
+  deletedTombstones: Record<string, DeletedCardTombstone>;
+}
+
+export async function deleteCardsFromLocalDirectory(
+  rootHandle: FileSystemDirectoryHandle,
+  cardsToDelete: WorkflowCollectionCard[],
+  options?: {
+    extraTombstones?: Record<string, DeletedCardTombstone>;
+  }
+): Promise<FolderDeleteResult> {
+  const { entries: indexEntries, deletedTombstones: diskTombstones } =
+    await readFolderSyncIndex(rootHandle);
+  const deletedTombstones = options?.extraTombstones
+    ? mergeDeletedTombstonesMaps(diskTombstones, options.extraTombstones)
+    : { ...diskTombstones };
+
+  const deletedIds: string[] = [];
+  const failed: { cardId: string; title: string; error: string }[] = [];
+  const unresolvedCards = new Map<string, WorkflowCollectionCard>();
+  let removedFilesCount = 0;
+  let indexDirty = false;
+  const now = Date.now();
+
+  for (const card of cardsToDelete) {
+    const entry = indexEntries[card.id];
+    const candidateRelPaths = Array.from(
+      new Set(
+        [
+          entry?.relativePath,
+          card.folderSyncedPath,
+          buildCardFolderPathSegments(card).join('/'),
+          buildCardFolderPathSegments({ ...card, isPrivate: !card.isPrivate }).join('/'),
+        ].filter((p): p is string => Boolean(p && p.trim()))
+      )
+    );
+
+    const extraImgs = [entry?.imageFileName, card.imageName].filter((s): s is string =>
+      Boolean(s)
+    );
+
+    let cardMatched = false;
+    try {
+      for (const relPath of candidateRelPaths) {
+        const res = await removeMatchedCardFilesInDir(
+          rootHandle,
+          relPath.split('/').filter(Boolean),
+          card.id,
+          extraImgs
+        );
+        if (res.matched) {
+          cardMatched = true;
+          removedFilesCount += res.removedCount;
+        }
+      }
+      if (!cardMatched) {
+        unresolvedCards.set(card.id, card);
+      } else {
+        deletedIds.push(card.id);
+      }
+    } catch (err) {
+      failed.push({
+        cardId: card.id,
+        title: card.title,
+        error: err instanceof Error ? err.message : '删除本地文件失败',
+      });
+    }
+
+    if (card.id in indexEntries) {
+      delete indexEntries[card.id];
+      indexDirty = true;
+    }
+
+    deletedTombstones[card.id] = {
+      cardId: card.id,
+      title: card.title,
+      deletedAt: now,
+      contentFingerprint: card.contentFingerprint || computeCardContentFingerprint(card),
+      imageContentHash: card.imageContentHash,
+      imageName: card.imageName,
+      imageByteSize: card.imageByteSize,
+      relativePath: entry?.relativePath || card.folderSyncedPath,
+      diskFilesDeleted: cardMatched,
+    };
+    indexDirty = true;
+  }
+
+  // 若卡片此前被重命名/转移过目录而不在预测路径中，执行一次快速遍历精准清理残留 .card.json 及同级文件
+  if (unresolvedCards.size > 0) {
+    const matchedDirPaths = new Map<string, { segments: string[]; cardIds: string[] }>();
+
+    async function walkFindCards(
+      dirHandle: FileSystemDirectoryHandle,
+      relSegments: string[],
+      depth: number
+    ): Promise<void> {
+      if (depth > 8 || unresolvedCards.size === 0) return;
+      const subDirs: { name: string; handle: FileSystemDirectoryHandle }[] = [];
+      const iter = (
+        dirHandle as unknown as {
+          values: () => AsyncIterable<FileSystemHandle>;
+        }
+      ).values();
+
+      for await (const handle of iter) {
+        const name = handle.name;
+        const lower = name.toLowerCase();
+        if (handle.kind === 'directory') {
+          if (name.startsWith('.') || lower === 'node_modules') continue;
+          subDirs.push({ name, handle: handle as FileSystemDirectoryHandle });
+        } else if (handle.kind === 'file' && lower.endsWith('.card.json')) {
+          try {
+            const rawMeta = JSON.parse(
+              await (await (handle as FileSystemFileHandle).getFile()).text()
+            ) as Partial<WorkflowCollectionCard>;
+            if (rawMeta.id && unresolvedCards.has(rawMeta.id)) {
+              const key = relSegments.join('/');
+              const bucket = matchedDirPaths.get(key) ?? {
+                segments: relSegments,
+                cardIds: [],
+              };
+              bucket.cardIds.push(rawMeta.id);
+              matchedDirPaths.set(key, bucket);
+            }
+          } catch {
+            // ignore corrupt .card.json
+          }
+        }
+      }
+
+      for (const sub of subDirs) {
+        await walkFindCards(sub.handle, [...relSegments, sub.name], depth + 1);
+      }
+    }
+
+    await walkFindCards(rootHandle, [], 0);
+
+    for (const bucket of matchedDirPaths.values()) {
+      for (const cardId of bucket.cardIds) {
+        const card = unresolvedCards.get(cardId);
+        if (!card) continue;
+        const res = await removeMatchedCardFilesInDir(
+          rootHandle,
+          bucket.segments,
+          cardId,
+          card.imageName ? [card.imageName] : undefined
+        );
+        if (res.matched) {
+          removedFilesCount += res.removedCount;
+        }
+        unresolvedCards.delete(cardId);
+        deletedIds.push(cardId);
+        if (deletedTombstones[cardId]) {
+          deletedTombstones[cardId] = {
+            ...deletedTombstones[cardId],
+            diskFilesDeleted: true,
+          };
+        }
+      }
+    }
+
+    // 其余在磁盘上本就不存在的卡片也标记为磁盘已无残留
+    for (const [cardId] of unresolvedCards.entries()) {
+      deletedIds.push(cardId);
+      if (deletedTombstones[cardId]) {
+        deletedTombstones[cardId] = {
+          ...deletedTombstones[cardId],
+          diskFilesDeleted: true,
+        };
+      }
+    }
+  }
+
+  if (indexDirty) {
+    await writeFolderSyncIndex(rootHandle, indexEntries, deletedTombstones);
+  }
+
+  return {
+    deletedIds,
+    removedFilesCount,
+    failed,
+    indexEntries,
+    deletedTombstones,
   };
 }
 
@@ -2550,6 +2850,8 @@ export interface IncomingCardWithBlob {
   mimeType?: string;
   sourceLabel?: string;
   relativeFolderPath?: string;
+  fileModifiedAt?: number;
+  fromCollectionJson?: boolean;
 }
 
 export interface DedupeMergeResult {
@@ -2557,8 +2859,35 @@ export interface DedupeMergeResult {
   addedCards: WorkflowCollectionCard[];
   updatedCards: WorkflowCollectionCard[];
   skippedDuplicates: { fileName: string; reason: string; existingTitle: string }[];
+  skippedTombstones: { fileName: string; reason: string; title: string; cardId: string }[];
+  reintroducedFromTombstone: {
+    fileName: string;
+    title: string;
+    cardId: string;
+    reason: string;
+  }[];
+  clearedTombstoneIds: string[];
   restoredImageBlobsCount: number;
   blobsToSave: { cardId: string; record: StoredCardImageRecord }[];
+}
+
+function findMatchingTombstone(
+  tombstones: Record<string, DeletedCardTombstone> | undefined,
+  card: WorkflowCollectionCard,
+  incomingHash?: string
+): DeletedCardTombstone | null {
+  if (!tombstones) return null;
+  if (tombstones[card.id]) return tombstones[card.id];
+  const fp = card.contentFingerprint;
+  for (const t of Object.values(tombstones)) {
+    if (incomingHash && t.imageContentHash && t.imageContentHash === incomingHash) {
+      return t;
+    }
+    if (fp && t.contentFingerprint && t.contentFingerprint === fp) {
+      return t;
+    }
+  }
+  return null;
 }
 
 export async function dedupeAndMergeIncomingCards(
@@ -2568,6 +2897,8 @@ export async function dedupeAndMergeIncomingCards(
     storedImageIds?: Set<string>;
     preferIncomingOnSameIdUpdate?: boolean;
     markAsFolderSynced?: boolean;
+    tombstones?: Record<string, DeletedCardTombstone>;
+    sourceMode?: 'folder-scan' | 'manual-import';
   }
 ): Promise<DedupeMergeResult> {
   const storedIds =
@@ -2602,10 +2933,19 @@ export async function dedupeAndMergeIncomingCards(
   const addedCards: WorkflowCollectionCard[] = [];
   const updatedCards: WorkflowCollectionCard[] = [];
   const skippedDuplicates: { fileName: string; reason: string; existingTitle: string }[] = [];
+  const skippedTombstones: { fileName: string; reason: string; title: string; cardId: string }[] = [];
+  const reintroducedFromTombstone: {
+    fileName: string;
+    title: string;
+    cardId: string;
+    reason: string;
+  }[] = [];
+  const clearedTombstoneIdsSet = new Set<string>();
   const blobsToSave: { cardId: string; record: StoredCardImageRecord }[] = [];
   let restoredImageBlobsCount = 0;
 
   const prependedNewCards: WorkflowCollectionCard[] = [];
+  const sourceMode = options?.sourceMode ?? 'manual-import';
 
   for (let i = 0; i < incomingItems.length; i++) {
     const item = incomingItems[i];
@@ -2622,7 +2962,7 @@ export async function dedupeAndMergeIncomingCards(
     }
 
     let incomingHash = item.card.imageContentHash;
-    let incomingByteSize = item.card.imageByteSize ?? incomingBlob?.size;
+    const incomingByteSize = item.card.imageByteSize ?? incomingBlob?.size;
     if (!incomingHash && incomingBlob) {
       incomingHash = await computeBlobContentHash(incomingBlob);
     }
@@ -2631,7 +2971,9 @@ export async function dedupeAndMergeIncomingCards(
       ...item.card,
       imageContentHash: incomingHash,
       imageByteSize: incomingByteSize,
-      hasOriginalImageBlob: Boolean(incomingBlob || item.card.hasOriginalImageBlob || item.card.originalImageDataUrl),
+      hasOriginalImageBlob: Boolean(
+        incomingBlob || item.card.hasOriginalImageBlob || item.card.originalImageDataUrl
+      ),
       originalImageDataUrl:
         isIndexedDbSupported() && incomingBlob ? undefined : item.card.originalImageDataUrl,
       thumbnailDataUrl:
@@ -2703,6 +3045,56 @@ export async function dedupeAndMergeIncomingCards(
           existingTitle: dupInBatch.title,
         });
         continue;
+      }
+
+      // 2. 已删除卡片墓碑校验：防止目录扫描或旧备份 JSON 将已删除卡片复活
+      const matchedTombstone = findMatchingTombstone(
+        options?.tombstones,
+        normalizedIncoming,
+        incomingHash
+      );
+      if (matchedTombstone) {
+        if (sourceMode === 'folder-scan') {
+          const modifiedAfterDelete =
+            (item.fileModifiedAt ?? 0) > matchedTombstone.deletedAt + 2000;
+          const replacedAfterDiskDelete = matchedTombstone.diskFilesDeleted;
+          if (!modifiedAfterDelete && !replacedAfterDiskDelete) {
+            skippedTombstones.push({
+              cardId: normalizedIncoming.id,
+              title: normalizedIncoming.title,
+              fileName: sourceLabel,
+              reason: `该卡片已于此前删除（本地旧文件未清理），已按删除记录跳过以防复活`,
+            });
+            continue;
+          }
+          clearedTombstoneIdsSet.add(matchedTombstone.cardId);
+          reintroducedFromTombstone.push({
+            cardId: normalizedIncoming.id,
+            title: normalizedIncoming.title,
+            fileName: sourceLabel,
+            reason: '检测到本地文件夹中重新放入了曾删除的同名/同源新文件，已重新收录',
+          });
+        } else {
+          if (
+            item.fromCollectionJson &&
+            normalizedIncoming.updatedAt <= matchedTombstone.deletedAt
+          ) {
+            skippedTombstones.push({
+              cardId: normalizedIncoming.id,
+              title: normalizedIncoming.title,
+              fileName: sourceLabel,
+              reason: `该卡片已被用户删除（此 JSON 为删除前旧备份），已跳过以防复活`,
+            });
+            continue;
+          }
+          clearedTombstoneIdsSet.add(matchedTombstone.cardId);
+          reintroducedFromTombstone.push({
+            cardId: normalizedIncoming.id,
+            title: normalizedIncoming.title,
+            fileName: sourceLabel,
+            reason: '曾被删除的卡片已通过手动导入重新收录并清除删除记录',
+          });
+        }
       }
 
       // 全新卡片：入库
@@ -2891,6 +3283,9 @@ export async function dedupeAndMergeIncomingCards(
     addedCards,
     updatedCards,
     skippedDuplicates,
+    skippedTombstones,
+    reintroducedFromTombstone,
+    clearedTombstoneIds: Array.from(clearedTombstoneIdsSet),
     restoredImageBlobsCount,
     blobsToSave,
   };
@@ -2941,6 +3336,7 @@ export interface LocalFolderScanMergeResult extends DedupeMergeResult {
   scannedFilesCount: number;
   discoveredCardsCount: number;
   indexEntries: Record<string, FolderSyncIndexEntry>;
+  tombstones: Record<string, DeletedCardTombstone>;
 }
 
 const IMAGE_FILE_EXT_RE = /\.(png|jpe?g|webp)$/i;
@@ -2949,9 +3345,17 @@ export async function scanLocalDirectoryAndMerge(
   rootHandle: FileSystemDirectoryHandle,
   existingCards: WorkflowCollectionCard[],
   options?: {
+    tombstones?: Record<string, DeletedCardTombstone>;
     onProgress?: (scannedCount: number, currentPath: string) => void;
   }
 ): Promise<LocalFolderScanMergeResult> {
+  const { entries: existingIndexEntries, deletedTombstones: diskTombstones } =
+    await readFolderSyncIndex(rootHandle);
+  const effectiveTombstones = mergeDeletedTombstonesMaps(
+    diskTombstones,
+    options?.tombstones ?? {}
+  );
+
   const incomingItems: IncomingCardWithBlob[] = [];
   let scannedFilesCount = 0;
 
@@ -3132,6 +3536,10 @@ export async function scanLocalDirectoryAndMerge(
             const restoredCard = normalizedList[0];
             restoredCard.contentFingerprint =
               computeCardContentFingerprint(restoredCard);
+            const fileModifiedAt = Math.max(
+              cardFile.lastModified || 0,
+              imgFile?.lastModified || 0
+            );
             incomingItems.push({
               card: restoredCard,
               imageBlob: imgFile,
@@ -3140,6 +3548,7 @@ export async function scanLocalDirectoryAndMerge(
                 ? `${relFolderPath}/${cardHandle.name}`
                 : cardHandle.name,
               relativeFolderPath: relFolderPath,
+              fileModifiedAt,
             });
           }
         } catch {
@@ -3162,12 +3571,29 @@ export async function scanLocalDirectoryAndMerge(
   const mergeResult = await dedupeAndMergeIncomingCards(existingCards, incomingItems, {
     preferIncomingOnSameIdUpdate: false,
     markAsFolderSynced: true,
+    tombstones: effectiveTombstones,
+    sourceMode: 'folder-scan',
   });
 
-  // 同时刷新/合并本地同步索引，保证刚扫描恢复的卡片在下次点击「增量同步」时无需重复写盘
-  const { entries: indexEntries } = await readFolderSyncIndex(rootHandle);
-  let indexUpdated = false;
+  // 清除已重新放入文件夹的墓碑记录
+  const nextTombstones = { ...effectiveTombstones };
+  let indexUpdated = mergeResult.skippedTombstones.length > 0;
+  for (const clearedId of mergeResult.clearedTombstoneIds) {
+    if (clearedId in nextTombstones) {
+      delete nextTombstones[clearedId];
+      indexUpdated = true;
+    }
+  }
+
+  const skippedTombstoneIdSet = new Set(
+    mergeResult.skippedTombstones.map((s) => s.cardId)
+  );
+  const discoveredActiveIds = new Set<string>();
+  const indexEntries = { ...existingIndexEntries };
+
   for (const item of incomingItems) {
+    if (skippedTombstoneIdSet.has(item.card.id)) continue;
+    discoveredActiveIds.add(item.card.id);
     const fp =
       item.card.contentFingerprint || computeCardContentFingerprint(item.card);
     const existingEntry = indexEntries[item.card.id];
@@ -3190,8 +3616,17 @@ export async function scanLocalDirectoryAndMerge(
       indexUpdated = true;
     }
   }
-  if (indexUpdated && incomingItems.length > 0) {
-    await writeFolderSyncIndex(rootHandle, indexEntries);
+
+  // 清理磁盘上已实际不存在的过期索引条目，防止幽灵记录残留
+  for (const indexedId of Object.keys(indexEntries)) {
+    if (!discoveredActiveIds.has(indexedId)) {
+      delete indexEntries[indexedId];
+      indexUpdated = true;
+    }
+  }
+
+  if (indexUpdated) {
+    await writeFolderSyncIndex(rootHandle, indexEntries, nextTombstones);
   }
 
   return {
@@ -3199,6 +3634,7 @@ export async function scanLocalDirectoryAndMerge(
     scannedFilesCount,
     discoveredCardsCount: incomingItems.length,
     indexEntries,
+    tombstones: nextTombstones,
   };
 }
 
@@ -3207,6 +3643,16 @@ export async function loadFolderSyncIndexSnapshot(
 ): Promise<Record<string, FolderSyncIndexEntry>> {
   const { entries } = await readFolderSyncIndex(rootHandle);
   return entries;
+}
+
+export async function loadFolderSyncStateSnapshot(
+  rootHandle: FileSystemDirectoryHandle
+): Promise<{
+  entries: Record<string, FolderSyncIndexEntry>;
+  deletedTombstones: Record<string, DeletedCardTombstone>;
+}> {
+  const { entries, deletedTombstones } = await readFolderSyncIndex(rootHandle);
+  return { entries, deletedTombstones };
 }
 
 

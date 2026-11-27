@@ -55,7 +55,7 @@ import { WorkflowCollectionModal } from './components/WorkflowCollectionModal';
 import {
   loadUiCache,
   loadWorkflowCards,
-  loadWorkflowCardsFromIndexedDb,
+  loadWorkflowCardsFromIndexedDbWithState,
   migrateCardInlineImagesToIdb,
   normalizeWorkflowCards,
   patchUiCache,
@@ -389,10 +389,10 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      const idbCards = await loadWorkflowCardsFromIndexedDb();
+      const idbState = await loadWorkflowCardsFromIndexedDbWithState();
       if (cancelled || cardsMutatedRef.current) return;
-      if (idbCards.length > 0) {
-        setWorkflowCards(idbCards);
+      if (idbState.exists) {
+        setWorkflowCards(idbState.cards);
       } else {
         const legacyLocal = loadWorkflowCards();
         if (legacyLocal.length > 0) {
