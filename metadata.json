@@ -1,0 +1,6 @@
+{
+  "name": "ChibiPrompt Studio",
+  "description": "English cute-style prompt preset studio for fixed anime characters with outfits, poses, expressions, and backgrounds.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

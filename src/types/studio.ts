@@ -1,0 +1,178 @@
+export type PresetCategory = 'outfit' | 'pose' | 'expression';
+
+export interface SimplePresetItem {
+  id: string;
+  category: PresetCategory;
+  zhName: string;
+  vibe: string;
+  tags: string;
+  defaultWeight: number;
+  isCustom?: boolean;
+}
+
+export interface MinimalBackgroundPreset {
+  id: string;
+  zhName: string;
+  note: string;
+  tags: string;
+  isCustom?: boolean;
+}
+
+export interface WeightedSlot {
+  text: string;
+  weight: number;
+}
+
+export interface CharacterConfig {
+  id: string;
+  name: string;
+  appearance: WeightedSlot;
+  outfit: WeightedSlot;
+  pose: WeightedSlot;
+  expression: WeightedSlot;
+  enableFourthLora?: boolean;
+  forbiddenTags?: string;
+}
+
+export interface NegativeTagItem {
+  id: string;
+  text: string;
+  weight: number;
+}
+
+export type NegativeGroupId =
+  | 'anti-split'
+  | 'anti-outfit-bleed'
+  | 'anti-blank-bg'
+  | 'anti-color-cast'
+  | 'anti-stiff'
+  | 'general-quality';
+
+export interface NegativeGroup {
+  id: NegativeGroupId;
+  name: string;
+  description: string;
+  enabled: boolean;
+  tags: NegativeTagItem[];
+}
+
+export interface SharedConfig {
+  styleAnchor: WeightedSlot;
+  background: WeightedSlot;
+  selectedBackgroundId?: string | null;
+  selectedBackgroundName?: string | null;
+  composition: WeightedSlot;
+  bodyType?: WeightedSlot;
+  negativeGroups: NegativeGroup[];
+  manualNegativeOverride: string | null;
+}
+
+export interface ComfySamplerConfig {
+  width: number;
+  height: number;
+  steps: number;
+  cfg: number;
+  samplerName: string;
+  scheduler: string;
+  denoise: number;
+  enableLoraChain: boolean;
+}
+
+export type ComfyArchitecture = 'anima' | 'sdxl' | 'illustrious' | 'sd15' | 'custom';
+
+export type ComfyLoaderKey = 'checkpoint' | 'unet' | 'clip' | 'vae';
+
+export interface ComfyLoadersConfig {
+  checkpoint?: string;
+  unet?: string;
+  clip?: string;
+  vae?: string;
+  clipType?: string;
+  enableCheckpoint?: boolean;
+  enableUnet?: boolean;
+  enableClip?: boolean;
+  enableVae?: boolean;
+}
+
+export interface ComfyLoraItem {
+  id?: string;
+  name: string;
+  model: number;
+  clip: number;
+  condition: 'ibuki_only' | null;
+}
+
+export interface ComfySamplingParams {
+  width: number;
+  height: number;
+  steps: number;
+  cfg: number;
+  sampler: string;
+  scheduler: string;
+  denoise?: number;
+}
+
+export interface ComfyProfile {
+  id: string;
+  name: string;
+  architecture: ComfyArchitecture;
+  loaders: ComfyLoadersConfig;
+  loras: ComfyLoraItem[];
+  sampling: ComfySamplingParams;
+  manualSamplingFields?: (keyof ComfySamplingParams)[];
+}
+
+export interface LoaderValidationEntry {
+  status: 'unchecked' | 'checking' | 'valid' | 'invalid' | 'error';
+  available: string[];
+  message?: string;
+}
+
+export type ComfyValidationMap = Record<ComfyLoaderKey, LoaderValidationEntry> & {
+  loraAvailable: string[];
+};
+
+export interface StudioConfig {
+  shared: SharedConfig;
+  characters: CharacterConfig[];
+  comfyUrl: string;
+  comfyUnetName: string;
+  comfyClipName: string;
+  comfyVaeName: string;
+  comfySampler?: ComfySamplerConfig;
+  comfyProfiles?: ComfyProfile[];
+  activeComfyProfileId?: string;
+  customBackgrounds?: MinimalBackgroundPreset[];
+  customPresets?: SimplePresetItem[];
+}
+
+export interface PromptSegment {
+  key: string;
+  label: string;
+  layer: 'shared' | 'character';
+  rawText: string;
+  weight: number;
+  formatted: string;
+}
+
+export interface BuiltCharacterPrompt {
+  fullText: string;
+  segments: PromptSegment[];
+}
+
+export interface ConflictItem {
+  id: string;
+  severity: 'error' | 'warning';
+  title: string;
+  detail: string;
+  characterId?: string;
+  fixType?: 'remove-solo' | 'remove-negative-tag' | 'remove-forbidden-tag';
+  targetTag?: string;
+}
+
+export interface HistorySnapshot {
+  id: string;
+  createdAt: number;
+  label: string;
+  config: StudioConfig;
+}

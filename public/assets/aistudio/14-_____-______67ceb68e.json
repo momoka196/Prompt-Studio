@@ -1,0 +1,62 @@
+{
+  "_说明": "ChibiPrompt Studio 导入包 v2 · 姿势 16 条 + 服装 24 套（衣服参考 README 全收录，已剔除旗袍与泳装外的重复项）。tags 已剥离角色外貌词与构图收尾词，只保留服装本体，避免压掉角色外貌串。",
+  "_schema": {
+    "id": "唯一标识，kebab-case",
+    "category": "pose | outfit",
+    "zhName": "中文名",
+    "vibe": "调性标签，用 · 分隔",
+    "tags": "服装本体词，逗号分隔，不含权重号也不含角色外貌",
+    "defaultWeight": "默认权重 1.0–1.8"
+  },
+
+  "POSE_PRESETS": [
+    { "id": "pose-p014-front-chin",     "category": "pose", "zhName": "P014 正面托下巴",   "vibe": "思考 · 静态 · 正面",       "tags": "one hand touching chin, index finger near lips, other arm across stomach, hand resting on own arm, standing, front view, facing viewer, feet together", "defaultWeight": 1.4 },
+    { "id": "pose-p014-diag-chin",      "category": "pose", "zhName": "P014 斜角托下巴",   "vibe": "思考 · 侧身 · 三分之四",   "tags": "one hand touching chin, index finger to cheek, other arm across chest, holding own upper arm, standing, three-quarter view, head tilt", "defaultWeight": 1.4 },
+    { "id": "pose-hands-behind-back",   "category": "pose", "zhName": "双手背在身后站立", "vibe": "乖巧 · 学生 · 站姿",       "tags": "standing, hands behind back, facing viewer, feet together", "defaultWeight": 1.4 },
+    { "id": "pose-hold-skirt-curtsy",   "category": "pose", "zhName": "拎裙摆行礼",       "vibe": "礼貌 · 优雅 · 招牌",       "tags": "holding skirt hem with both hands, cute curtsy, head tilt, crossed ankles", "defaultWeight": 1.4 },
+    { "id": "pose-cheek-poke",          "category": "pose", "zhName": "指尖轻点脸颊",     "vibe": "娇俏 · 可爱",             "tags": "index finger on cheek, head tilt, one hand behind back, looking at viewer", "defaultWeight": 1.4 },
+    { "id": "pose-hand-on-cheek",       "category": "pose", "zhName": "手扶脸颊浅笑",     "vibe": "温柔 · 恬静",             "tags": "hand on cheek, gentle smile, looking at viewer, standing", "defaultWeight": 1.4 },
+    { "id": "pose-hold-cake",           "category": "pose", "zhName": "端着草莓蛋糕",     "vibe": "甜系 · 手持道具",         "tags": "holding strawberry cake on plate, one hand supporting plate, standing, looking at viewer", "defaultWeight": 1.4 },
+    { "id": "pose-seiza-hands-thighs",  "category": "pose", "zhName": "跪坐扶手",         "vibe": "安静 · 坐跪姿",           "tags": "kneeling, seiza, sitting on heels, hands on own thighs, leaning forward, head tilted up", "defaultWeight": 1.4 },
+    { "id": "pose-squat-lookback",      "category": "pose", "zhName": "蹲姿回头看",       "vibe": "俏皮 · 回眸",             "tags": "squatting, crouching, knees together, turning head back, looking back at viewer, from side", "defaultWeight": 1.5 },
+    { "id": "pose-sitting-desk-window", "category": "pose", "zhName": "靠窗坐课桌",       "vibe": "日常 · 校园 · 坐姿",       "tags": "sitting at desk, sitting by window, wooden school desk, wooden chair, upper body visible, thighs visible", "defaultWeight": 1.4 },
+    { "id": "pose-jump-happy",          "category": "pose", "zhName": "欢快跳跃挥手",     "vibe": "元气 · 动态 · 运动感",     "tags": "jumping, skipping, dynamic pose, one arm raised, waving hand, hair in motion", "defaultWeight": 1.5 },
+    { "id": "pose-peace-jump",          "category": "pose", "zhName": "双剪刀手小跳",     "vibe": "活泼 · 派对",             "tags": "double peace sign, mid-air small hop, fluttery skirt, lively dynamic pose", "defaultWeight": 1.4 },
+    { "id": "pose-hold-parfait-lean",   "category": "pose", "zhName": "双手端芭菲前倾",   "vibe": "甜系 · 前倾 · 抬腿",       "tags": "holding strawberry parfait with both hands, leaning forward, one leg lifted, dynamic pose", "defaultWeight": 1.4 },
+    { "id": "pose-hug-plush",           "category": "pose", "zhName": "抱兔子玩偶",       "vibe": "软糯 · 居家",             "tags": "hugging simple white bunny plushie, wingless stuffed toy, head tilt, cozy standing pose", "defaultWeight": 1.4 },
+    { "id": "pose-umbrella-wave",       "category": "pose", "zhName": "撑透明伞挥手",     "vibe": "清新 · 灵动 · 雨天",       "tags": "holding transparent bubble umbrella, waving one hand, playful step forward", "defaultWeight": 1.4 },
+    { "id": "pose-balloons-hop",        "category": "pose", "zhName": "手捧气球轻跃",     "vibe": "欢快 · 派对",             "tags": "holding pastel balloons, joyful little jump, raised arm, fluttering hair", "defaultWeight": 1.4 }
+  ],
+
+  "OUTFIT_PRESETS": [
+    { "id": "outfit-school-gray-cardigan",   "category": "outfit", "zhName": "校服 · 深灰开衫",       "vibe": "学生 · 秋冬 · 针织",       "tags": "dark gray cardigan, white collared shirt, black necktie, black pleated skirt, black thigh high socks, black loafers", "defaultWeight": 1.5 },
+    { "id": "outfit-school-beige-cardigan",  "category": "outfit", "zhName": "校服 · 米色开衫",       "vibe": "学生 · 温柔 · 针织",       "tags": "beige cardigan, cream cardigan, red neck ribbon, navy blue pleated skirt, white thigh high socks, brown loafers", "defaultWeight": 1.5 },
+    { "id": "outfit-school-blue-sweater",    "category": "outfit", "zhName": "校服 · 浅蓝麻花毛衣",   "vibe": "学生 · 软萌 · 小熊贴布",   "tags": "light blue sweater, cable knit sweater, round neck sweater, small bear patch, beige pleated skirt, white thigh high socks, brown loafers", "defaultWeight": 1.5 },
+    { "id": "outfit-school-gray-pinafore",   "category": "outfit", "zhName": "校服 · 灰背带裙",       "vibe": "学生 · 经典 · 定稿款",     "tags": "white collared shirt, red ribbon, bow tie, dark gray pinafore dress, jumper skirt, button front dress, frilled skirt hem, white socks, brown loafers", "defaultWeight": 1.5 },
+    { "id": "outfit-jk-sailor-short",        "category": "outfit", "zhName": "短袖 JK 水手服",         "vibe": "学生 · 夏日 · 水手领",     "tags": "japanese school uniform, sailor uniform, navy blue sailor collar, white short sleeve shirt, red neck ribbon, navy blue pleated skirt", "defaultWeight": 1.5 },
+    { "id": "outfit-jk-gray-cardigan",       "category": "outfit", "zhName": "浅灰开衫 JK",           "vibe": "学生 · 长袖 · 盖手",       "tags": "gray cardigan, dark gray cardigan, button front cardigan, ribbed cuffs, long sleeves, sleeves past wrists, hands hidden in sleeves, white collared shirt, burgundy ribbon bow", "defaultWeight": 1.5 },
+    { "id": "outfit-strawberry-lolita",      "category": "outfit", "zhName": "草莓奶油洛丽塔",         "vibe": "甜美 · 荷叶边 · 印花",     "tags": "pink and white lolita dress, strawberry print, frilled white apron, puff sleeves, pink ribbons, white frilled socks, red mary janes", "defaultWeight": 1.5 },
+    { "id": "outfit-maid-classic",           "category": "outfit", "zhName": "经典女仆装",             "vibe": "制服 · 荷叶边 · 黑白",     "tags": "maid outfit, black and white maid dress, white sailor collar, large red bow on chest, white apron, black layered frilled skirt, white frilled headdress, puff short sleeves, white frilled cuffs, black sleeves, white thighhighs, black mary janes", "defaultWeight": 1.5 },
+    { "id": "outfit-off-shoulder-black-sweater", "category": "outfit", "zhName": "露肩黑毛衣 + 黑百褶裙", "vibe": "秋日 · 露肩 · 黑白配",   "tags": "off shoulder black sweater, ribbed knit sweater, black pleated skirt, white thigh high socks", "defaultWeight": 1.5 },
+    { "id": "outfit-off-shoulder-pink-sweater",  "category": "outfit", "zhName": "露肩粉毛衣 + 黑百褶裙", "vibe": "秋日 · 露肩 · 粉黑配",   "tags": "off shoulder pink sweater, ribbed knit sweater, black pleated skirt, pink and white striped thigh high socks", "defaultWeight": 1.5 },
+    { "id": "outfit-white-shirt-black-cardigan", "category": "outfit", "zhName": "白衬衫 + 黑开衫",       "vibe": "简约 · 日常 · 学院",     "tags": "white collared shirt, black cardigan, long sleeves, black pleated skirt, white thigh high socks", "defaultWeight": 1.5 },
+    { "id": "outfit-gray-tshirt-camisole",   "category": "outfit", "zhName": "灰色滑肩 T 恤 + 黑吊带", "vibe": "居家 · 滑肩 · 慵懒",     "tags": "gray oversized t-shirt, off shoulder, one sleeve slipped off shoulder, black camisole underneath, spaghetti strap, exposed shoulder, collarbone, black pantyhose, black loafers", "defaultWeight": 1.5 },
+    { "id": "outfit-black-sweatshirt",       "category": "outfit", "zhName": "深色卫衣全身",           "vibe": "慵懒 · 居家 · 宽大",     "tags": "oversized black sweatshirt, long sleeves, black pantyhose, black loafers", "defaultWeight": 1.5 },
+    { "id": "outfit-autumn-trench-red-scarf", "category": "outfit", "zhName": "秋日风衣 + 红围巾",     "vibe": "秋日 · 保暖 · 英伦",     "tags": "brown trench coat, double breasted coat, red scarf, black plaid skirt, black tights, brown boots, fur trimmed boots", "defaultWeight": 1.5 },
+    { "id": "outfit-black-hoodie-street",    "category": "outfit", "zhName": "黑连帽衫 + 黑荷叶裙",   "vibe": "街头 · 黑系 · 棕靴",     "tags": "black hoodie, oversized hoodie, dark gray hoodie, drawstring hoodie, high collar hoodie, black frilled skirt, white lace trim, black pantyhose, black tights, brown ankle boots, lace-up boots, brown leather messenger bag, shoulder bag", "defaultWeight": 1.6 },
+    { "id": "outfit-pink-offshoulder-dress", "category": "outfit", "zhName": "伊 · 粉荷叶边露肩连衣裙", "vibe": "甜美 · 露肩 · 光脚",     "tags": "pink dress, frilled dress, off-shoulder dress, short puffy sleeves, pink frills, pleated skirt, bare shoulders, collarbone, barefoot, hair without hairbow", "defaultWeight": 1.5 },
+    { "id": "outfit-bat-pajamas",            "category": "outfit", "zhName": "小蝙蝠毛绒睡衣",         "vibe": "软糯 · 居家感",           "tags": "oversized pastel lavender fleece pajama, sleeves past wrists, ribbon cuffs, fluffy white socks", "defaultWeight": 1.4 },
+    { "id": "outfit-yellow-raincoat",        "category": "outfit", "zhName": "晴天鹅黄小雨衣",         "vibe": "清新 · 元气感 · 雨天",     "tags": "pastel yellow raincoat, translucent hood trim, white pleated skirt, yellow rain boots", "defaultWeight": 1.4 },
+    { "id": "outfit-swimsuit-blue-onepiece", "category": "outfit", "zhName": "浅蓝连体泳衣",           "vibe": "清透 · 泳池",             "tags": "light blue one-piece swimsuit, camisole, short shorts style, barefoot", "defaultWeight": 1.4 },
+    { "id": "outfit-swimsuit-pink-frill",    "category": "outfit", "zhName": "粉荷叶边泳装",           "vibe": "夏日 · 荷叶边 · 海边",     "tags": "pink swimsuit, frilled swimsuit, ruffled swimsuit top, frilled swimsuit bottom, clear shoulder bag, yellow crocs", "defaultWeight": 1.5 }
+  ],
+
+  "_统计": "姿势 16 条 / 服装 20 套。衣服参考 README 里的 12 个主条目已全部收录并拆分成 17 套（含 9/9b/9c 三个变体、11 伊的粉裙、12 黑系街头），另加 3 套常用（蝙蝠睡衣、鹅黄雨衣、粉荷叶泳装）。旗袍已按主人要求剔除。",
+
+  "_用法": {
+    "整包替换": "把 POSE_PRESETS / OUTFIT_PRESETS 两个数组整体粘进 src/data/presets.ts 对应位置。",
+    "单条新增": "从数组里取一条，追加到现有数组末尾，注意逗号。",
+    "权重协调": "tags 里不写括号权重号，由 defaultWeight 统一包装成 (整串:1.4)。单条内需要单独加权时，在 tags 里直接写 (xxx:1.6)，会被外层再包一层形成嵌套，ComfyUI 能识别。",
+    "禁词保证": "所有 tags 已剥离：发色（black hair / blonde hair）、发型（twintails / side ponytail）、瞳色（yellow eyes）、眼型（tareme / half-closed eyes）、角色配件（horns / halo / wings / tail）、构图收尾（full body / plain white background / 1girl, solo）。只留服装本体，不会覆盖角色外貌串。"
+  }
+}
