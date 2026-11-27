@@ -1327,7 +1327,7 @@ export const HAIRSTYLE_PRESETS: SimplePresetItem[] = [
     category: 'hairstyle',
     zhName: '侧马尾',
     vibe: '600 · 伊默认',
-    tags: '(side ponytail:1.6), (ponytail on side:1.4), (black hair bow:1.5), (hair bow on the side:1.3)',
+    tags: '(side ponytail:1.6), (ponytail on side:1.4), (black bow tying side ponytail:1.4), (hair bow on the side:1.3)',
     defaultWeight: 1.0,
   },
   {
@@ -1474,7 +1474,7 @@ export const HAIR_ACCESSORY_PRESETS: HairModifierPreset[] = [
   {
     id: 'acc-preset-bow',
     zhName: '跟随预设黑丝带',
-    note: '保留当前所选发型自带的黑色蝴蝶结',
+    note: '侧马尾默认仅保留绑在侧马尾上的黑色蝴蝶结，不生成头顶蝴蝶结',
     tags: '',
   },
   {
@@ -1612,7 +1612,7 @@ export const DEFAULT_NEGATIVE_GROUPS: NegativeGroup[] = [
 ];
 
 export const DEFAULT_STUDIO_CONFIG: StudioConfig = {
-  appearanceCleanedVersion: 1,
+  appearanceCleanedVersion: 2,
   bodyTypeInitializedVersion: 1,
   comfyUrl: 'http://127.0.0.1:8188',
   comfyUnetName: 'anima-base-v1.0.safetensors',

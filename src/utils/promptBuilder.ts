@@ -363,6 +363,23 @@ const ANTI_SITTING_GUARD_TAGS = [
   'sitting on floor',
 ];
 
+const ANTI_TOP_HEAD_BOW_GUARD_TAGS = [
+  '(bow on top of head:1.7)',
+  '(hair bow on top of head:1.7)',
+  '(top hair bow:1.65)',
+  '(center hair bow:1.6)',
+  '(front hair bow:1.6)',
+  '(bow on crown of head:1.6)',
+  '(headband bow:1.55)',
+];
+
+const ANTI_NO_HAIR_BOW_GUARD_TAGS = [
+  '(hair bow:1.7)',
+  '(black hair bow:1.7)',
+  '(black bow:1.7)',
+  '(hair bow on the side:1.6)',
+];
+
 export function isExplicitStandingPoseText(poseText: string): boolean {
   const trimmed = poseText.trim();
   if (!trimmed) return false;
@@ -417,6 +434,9 @@ const YI_HAIR_ACCESSORY_TOKENS = new Set<string>([
   'black bow',
   'hair bow on the side',
   'black hair bow',
+  'black bow tying side ponytail',
+  'ponytail tied with black bow',
+  'black ribbon tying side ponytail',
   'two hair bows',
   ...HAIR_ACCESSORY_PRESETS.flatMap((acc) =>
     splitPromptTags(acc.tags).map((t) =>
@@ -774,7 +794,7 @@ function resolveAndBuildCharacterSegments(
     GAZE_AWAY_OR_DOWN_RE.test(poseRaw) || GAZE_AWAY_OR_DOWN_RE.test(exprRaw);
 
   const appearanceHasHairOrnament =
-    /\b(?:hair bow|black bow|red bow|white bow|two hair bows|hair bow on the side|hair ribbon|hairclip|pearl hair ornament)\b/i.test(
+    /\b(?:hair bow|black bow|red bow|white bow|two hair bows|hair bow on the side|black bow tying side ponytail|hair ribbon|hairclip|pearl hair ornament)\b/i.test(
       appRaw
     );
 
@@ -1249,6 +1269,36 @@ export function buildNegativePromptWithMeta(
     ANTI_SITTING_GUARD_TAGS.forEach(pushUnique);
   }
 
+  const yiChar = includeAppearance
+    ? charList.find((c) => c.id === 'char-yi')
+    : undefined;
+  const yiHairOptions = yiChar ? getCharacterHairstyleOptions(yiChar) : null;
+  const yiEffectiveAppText = yiChar
+    ? resolveEffectiveAppearanceSlot(yiChar).text
+    : '';
+  const shouldSuppressTopHeadBow = Boolean(
+    yiChar &&
+      yiHairOptions &&
+      (yiHairOptions.activePreset.id === 'hair-side-ponytail' ||
+        yiHairOptions.activeAccessory.id === 'acc-none' ||
+        yiHairOptions.activeAccessory.id === 'acc-pearl-clips') &&
+      !/\bblack hair bow\b/i.test(yiEffectiveAppText)
+  );
+  const isYiNoAccessory = Boolean(
+    shouldSuppressTopHeadBow && yiHairOptions?.activeAccessory.id === 'acc-none'
+  );
+
+  if (shouldSuppressTopHeadBow) {
+    ANTI_TOP_HEAD_BOW_GUARD_TAGS.forEach(pushUnique);
+    if (!/\btwo hair bows\b/i.test(combinedPositive)) {
+      pushUnique('(two hair bows:1.65)');
+      pushUnique('(multiple hair bows:1.6)');
+    }
+    if (isYiNoAccessory && !charList.some((c) => c.id === 'char-lan')) {
+      ANTI_NO_HAIR_BOW_GUARD_TAGS.forEach(pushUnique);
+    }
+  }
+
   const rules: NegativeGuardRuleBadge[] = [];
   const triggeredRuleIds: NegativeGuardRuleId[] = [];
 
@@ -1311,6 +1361,18 @@ export function buildNegativePromptWithMeta(
       id: 'anti-sitting',
       label: '站姿优先 · 防坐姿偏差',
       detail: '已提升站姿槽位在提示词拼接中的顺位与权重，并在负向抑制坐姿/靠椅坐姿偏差',
+      tone: 'guard',
+    });
+  }
+
+  if (shouldSuppressTopHeadBow) {
+    triggeredRuleIds.push('anti-top-head-bow');
+    rules.push({
+      id: 'anti-top-head-bow',
+      label: isYiNoAccessory ? '无发饰 · 禁蝴蝶结' : '仅绑侧马尾 · 禁头顶蝴蝶结',
+      detail: isYiNoAccessory
+        ? '已选择无发饰，自动在负向压制头顶及侧边蝴蝶结'
+        : '默认仅保留绑在侧马尾上的黑色蝴蝶结，自动在负向压制头顶蝴蝶结与双蝴蝶结',
       tone: 'guard',
     });
   }
