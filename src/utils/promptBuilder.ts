@@ -125,29 +125,39 @@ export interface BuildEffectiveNegativeOptions {
 }
 
 const NO_PLUSH_GUARD_TAGS = [
-  'plush',
-  'plushie',
-  'plush toy',
-  'stuffed toy',
-  'stuffed animal',
-  'doll',
-  'holding doll',
-  'holding plush',
-  'mascot',
-  'chibi',
-  'miniature',
-  'mini character',
-  'look-alike',
-  'duplicate',
+  '(plush:1.8)',
+  '(plushie:1.8)',
+  '(plush toy:1.8)',
+  '(stuffed toy:1.8)',
+  '(stuffed animal:1.8)',
+  '(doll:1.9)',
+  '(holding doll:1.9)',
+  '(holding plush:1.9)',
+  '(mascot:1.8)',
+  'small creature in arms',
+  'creature held in arms',
+  'holding a small being',
+  '(chibi:1.6)',
+  '(miniature:1.65)',
+  '(mini character:1.6)',
+  '(look-alike:1.6)',
+  '(duplicate:1.75)',
+  '(clone:1.75)',
+  'second character',
+  'another character',
+  'two characters in frame',
 ];
 
 const ANTI_DUPLICATE_ONLY_TAGS = [
-  'chibi',
-  'miniature',
-  'mini character',
-  'look-alike',
-  'duplicate',
-  'clone',
+  '(chibi:1.6)',
+  '(miniature:1.65)',
+  '(mini character:1.6)',
+  '(look-alike:1.6)',
+  '(duplicate:1.75)',
+  '(clone:1.75)',
+  'second character',
+  'another character',
+  'two characters in frame',
 ];
 
 const PAJAMA_BED_GUARD_TAGS = [
@@ -361,10 +371,10 @@ function resolveAndBuildCharacterSegments(
     { key: 'styleAnchor', label: '画风', layer: 'shared', slot: shared.styleAnchor },
     { key: 'background', label: '场景', layer: 'shared', slot: shared.background },
     { key: 'composition', label: '构图', layer: 'shared', slot: shared.composition },
-    { key: 'appearance', label: '外貌', layer: 'character', slot: character.appearance },
     ...(shared.bodyType && shared.bodyType.text.trim()
       ? [{ key: 'bodyType', label: '体型', layer: 'shared' as const, slot: shared.bodyType }]
       : []),
+    { key: 'appearance', label: '外貌', layer: 'character', slot: character.appearance },
     { key: 'outfit', label: '服装', layer: 'character', slot: character.outfit },
     { key: 'pose', label: '动作', layer: 'character', slot: character.pose },
     { key: 'expression', label: '表情', layer: 'character', slot: character.expression },
@@ -404,9 +414,11 @@ function resolveAndBuildCharacterSegments(
     });
   }
 
+  const baseText = segments.map((s) => s.formatted).join(', ');
+  const soloAnchor = /\bsolo\b/i.test(baseText) ? '' : 'solo, 1girl, ';
   return {
     segments,
-    fullText: segments.map((s) => s.formatted).join(', '),
+    fullText: soloAnchor + baseText,
     resolvedAdjustments: Array.from(new Set(resolvedAdjustments)),
     hasBackgroundLock,
     hasHandSleeveConflict,
@@ -555,7 +567,9 @@ export function buildNegativePromptWithMeta(
   const pushUnique = (tag: string) => {
     const normalized = tag.trim().toLowerCase().replace(/\s+/g, ' ');
     if (!normalized) return;
-    if (existingCleanSet.has(normalized) || seenAdded.has(normalized)) return;
+    const hasWeight = /\([^)]*:\s*[\d.]+\)/.test(tag);
+    if (seenAdded.has(normalized)) return;
+    if (!hasWeight && existingCleanSet.has(normalized)) return;
     seenAdded.add(normalized);
     appendedTags.push(tag.trim());
   };
@@ -1338,12 +1352,42 @@ export async function postProfileToComfyUI(params: {
     });
 
   const clientId = `chibiprompt-${Math.random().toString(36).slice(2, 10)}`;
+
+  // 把本次生成的完整参数嵌进 PNG（ComfyUI SaveImage 会把 extra_pnginfo 写成 PNG 文本块），
+  // 这样重启项目/清缓存后，参数仍随图片存在，随时可查。
+  const loraRecords = Object.values(workflow)
+    .filter((n) => n.class_type === 'LoraLoader')
+    .map((n) => {
+      const inp = n.inputs as Record<string, unknown>;
+      return { name: inp.lora_name, model: inp.strength_model, clip: inp.strength_clip };
+    });
+  const samplerInputs = (workflow['13']?.inputs ?? {}) as Record<string, unknown>;
+
   const response = await fetch(`${baseUrl}/prompt`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       client_id: clientId,
       prompt: workflow,
+      extra_data: {
+        extra_pnginfo: {
+          chibiprompt: {
+            character: params.characterName,
+            createdAt: new Date().toISOString(),
+            model: usedModelSummary,
+            loras: loraRecords,
+            seed: samplerInputs.seed,
+            steps: samplerInputs.steps,
+            cfg: samplerInputs.cfg,
+            sampler: samplerInputs.sampler_name,
+            scheduler: samplerInputs.scheduler,
+            width: (workflow['12']?.inputs as Record<string, unknown>)?.width,
+            height: (workflow['12']?.inputs as Record<string, unknown>)?.height,
+            positive: params.positivePrompt,
+            negative: params.negativePrompt,
+          },
+        },
+      },
     }),
   });
 

@@ -1002,9 +1002,9 @@ export const EXPRESSION_PRESETS: SimplePresetItem[] = [
   {
     id: 'expr-closed-joy',
     category: 'expression',
-    zhName: '眯眼开心大笑 >_<',
+    zhName: '眯眼开心大笑',
     vibe: '治愈 · 感染力',
-    tags: '>_<, closed eyes, big cheerful smile, rosy cheeks',
+    tags: 'eyes closed in a happy smile, cheerful open mouth smile, rosy cheeks, uplifted eyebrows',
     defaultWeight: 1.4,
   },
   {
