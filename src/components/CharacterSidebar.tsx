@@ -16,7 +16,7 @@ import {
   SharedConfig,
   SimplePresetItem,
 } from '../types/studio';
-import { buildCharacterPrompt } from '../utils/promptBuilder';
+import { buildCharacterPrompt, getCharacterHairstyleOptions } from '../utils/promptBuilder';
 
 interface CharacterSidebarProps {
   shared: SharedConfig;
@@ -38,7 +38,9 @@ function getCharacterSubtitle(char: CharacterConfig): string {
     return '黑发低双马尾';
   }
   if (char.id === 'char-yi' || (app.includes('blonde hair') && app.includes('side ponytail'))) {
-    return '金发侧马尾六件套';
+    const activeHair =
+      char.id === 'char-yi' ? getCharacterHairstyleOptions(char).activePreset.zhName : '侧马尾';
+    return `金发${activeHair}六件套`;
   }
   if (char.id === 'char-mari' || (app.includes('orange hair') && app.includes('cat ears'))) {
     return '橘发低双马尾';

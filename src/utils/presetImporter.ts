@@ -9,8 +9,11 @@ function makeId(prefix: string, idx: number): string {
 }
 
 function normalizeCategory(raw: unknown, fallback: PresetCategory): PresetCategory {
-  if (raw === 'outfit' || raw === 'pose' || raw === 'expression') return raw;
+  if (raw === 'outfit' || raw === 'pose' || raw === 'expression' || raw === 'hairstyle') {
+    return raw;
+  }
   const s = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (s.includes('hair') || s.includes('发')) return 'hairstyle';
   if (s.includes('outfit') || s.includes('服') || s.includes('衣')) return 'outfit';
   if (s.includes('pose') || s.includes('动')) return 'pose';
   if (s.includes('expr') || s.includes('表')) return 'expression';
@@ -255,6 +258,9 @@ export function parseCutePresetsImport(
           { key: 'expression', cat: 'expression' },
           { key: 'expressions', cat: 'expression' },
           { key: 'EXPRESSION_PRESETS', cat: 'expression' },
+          { key: 'hairstyle', cat: 'hairstyle' },
+          { key: 'hairstyles', cat: 'hairstyle' },
+          { key: 'HAIRSTYLE_PRESETS', cat: 'hairstyle' },
         ];
         let matchedGrouped = false;
         for (const g of groupedKeys) {

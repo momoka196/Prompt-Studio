@@ -36,9 +36,11 @@ import {
   exportComfyProfilePayload,
   fetchComfyNodeOptions,
   getActiveLoaderKeys,
+  inferYiHairstyleFromAppearance,
   LOADER_NODE_META,
   parseComfyProfileImport,
   sanitizeFilenamePrefix,
+  stripLegacyExpressionTokensFromAppearance,
 } from './utils/promptBuilder';
 import { CharacterSidebar } from './components/CharacterSidebar';
 import { CharacterEditorPanel } from './components/CharacterEditorPanel';
@@ -234,7 +236,10 @@ function normalizeStudioConfig(raw: Partial<StudioConfig>): StudioConfig {
       ? { ...defaults.shared.background }
       : rawShared.background ?? defaults.shared.background;
 
+  const needsAppearanceClean = (raw.appearanceCleanedVersion ?? 0) < 1;
+
   return {
+    appearanceCleanedVersion: 1,
     comfyUrl: raw.comfyUrl || defaults.comfyUrl,
     comfyUnetName: raw.comfyUnetName || defaults.comfyUnetName,
     comfyClipName: raw.comfyClipName || defaults.comfyClipName,
@@ -251,11 +256,38 @@ function normalizeStudioConfig(raw: Partial<StudioConfig>): StudioConfig {
     },
     characters:
       Array.isArray(raw.characters) && raw.characters.length > 0
-        ? raw.characters.map((c) => ({
-            ...c,
-            enableFourthLora: Boolean(c.enableFourthLora),
-            forbiddenTags: c.forbiddenTags ?? '',
-          }))
+        ? raw.characters.map((c) => {
+            const defaultChar = defaults.characters.find((dc) => dc.id === c.id);
+            const rawAppearanceText = c.appearance?.text ?? '';
+            const cleanedAppearanceText = needsAppearanceClean
+              ? stripLegacyExpressionTokensFromAppearance(c.id, rawAppearanceText)
+              : rawAppearanceText;
+            const inferredHairId =
+              c.id === 'char-yi'
+                ? inferYiHairstyleFromAppearance(cleanedAppearanceText)?.id ??
+                  defaultChar?.hairstyleId ??
+                  'hair-side-ponytail'
+                : defaultChar?.hairstyleId ?? null;
+            return {
+              ...c,
+              appearance: {
+                text: cleanedAppearanceText,
+                weight: c.appearance?.weight ?? 1.0,
+              },
+              hairstyleId:
+                c.hairstyleId !== undefined ? c.hairstyleId : inferredHairId,
+              hairBangsId:
+                c.hairBangsId !== undefined
+                  ? c.hairBangsId
+                  : defaultChar?.hairBangsId ?? null,
+              hairAccessoryId:
+                c.hairAccessoryId !== undefined
+                  ? c.hairAccessoryId
+                  : defaultChar?.hairAccessoryId ?? null,
+              enableFourthLora: Boolean(c.enableFourthLora),
+              forbiddenTags: c.forbiddenTags ?? '',
+            };
+          })
         : defaults.characters,
     customBackgrounds: Array.isArray(raw.customBackgrounds)
       ? raw.customBackgrounds
@@ -526,6 +558,9 @@ export default function App() {
     const newChar: CharacterConfig = {
       id: `char-${Date.now()}`,
       name: `角色 ${nextIndex}`,
+      hairstyleId: null,
+      hairBangsId: null,
+      hairAccessoryId: null,
       appearance: { text: '', weight: 1.0 },
       outfit: { text: '', weight: 1.4 },
       pose: { text: '', weight: 1.4 },

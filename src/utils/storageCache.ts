@@ -1,19 +1,21 @@
-import { PresetCategory, StudioConfig } from '../types/studio';
+import { QuickFillCategory, StudioConfig } from '../types/studio';
 
 export const STUDIO_CONFIG_KEY = 'chibiprompt_studio_config_v3';
 export const STUDIO_HISTORY_KEY = 'chibiprompt_studio_history_v3';
 export const STUDIO_UI_CACHE_KEY = 'chibiprompt_studio_ui_cache_v1';
 
 export type EditorSlotKey = 'appearance' | 'outfit' | 'pose' | 'expression';
+export type RolePresetTab = 'slots' | 'hairstyle';
 export type PresetStyleFilter = 'all' | 'sweet' | 'cozy' | 'school' | 'dynamic';
 
 export interface UiCacheState {
   selectedCharId: string;
   includeAppearance: boolean;
+  rolePresetTab: RolePresetTab;
   presetsExpanded: boolean;
-  presetTab: PresetCategory;
+  presetTab: QuickFillCategory;
   presetFilter: PresetStyleFilter;
-  selectedPresetByChar: Record<string, Partial<Record<PresetCategory, string>>>;
+  selectedPresetByChar: Record<string, Partial<Record<QuickFillCategory, string>>>;
   editorOpenSlot: EditorSlotKey | null;
   showForbidden: boolean;
   sharedBarExpanded: boolean;
@@ -28,6 +30,7 @@ export interface UiCacheState {
 export const DEFAULT_UI_CACHE: UiCacheState = {
   selectedCharId: 'char-lan',
   includeAppearance: false,
+  rolePresetTab: 'slots',
   presetsExpanded: true,
   presetTab: 'outfit',
   presetFilter: 'all',
@@ -48,7 +51,11 @@ export function loadUiCache(): UiCacheState {
     const raw = localStorage.getItem(STUDIO_UI_CACHE_KEY);
     if (!raw) return { ...DEFAULT_UI_CACHE };
     const parsed = JSON.parse(raw) as Partial<UiCacheState>;
-    const validTab: PresetCategory =
+    const validRolePresetTab: RolePresetTab =
+      parsed.rolePresetTab === 'slots' || parsed.rolePresetTab === 'hairstyle'
+        ? parsed.rolePresetTab
+        : DEFAULT_UI_CACHE.rolePresetTab;
+    const validTab: QuickFillCategory =
       parsed.presetTab === 'outfit' ||
       parsed.presetTab === 'pose' ||
       parsed.presetTab === 'expression'
@@ -85,6 +92,7 @@ export function loadUiCache(): UiCacheState {
         typeof parsed.includeAppearance === 'boolean'
           ? parsed.includeAppearance
           : DEFAULT_UI_CACHE.includeAppearance,
+      rolePresetTab: validRolePresetTab,
       presetsExpanded:
         typeof parsed.presetsExpanded === 'boolean'
           ? parsed.presetsExpanded

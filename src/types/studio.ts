@@ -1,4 +1,5 @@
-export type PresetCategory = 'outfit' | 'pose' | 'expression';
+export type QuickFillCategory = 'outfit' | 'pose' | 'expression';
+export type PresetCategory = QuickFillCategory | 'hairstyle';
 
 export interface SimplePresetItem {
   id: string;
@@ -26,6 +27,9 @@ export interface WeightedSlot {
 export interface CharacterConfig {
   id: string;
   name: string;
+  hairstyleId?: string | null;
+  hairBangsId?: string | null;
+  hairAccessoryId?: string | null;
   appearance: WeightedSlot;
   outfit: WeightedSlot;
   pose: WeightedSlot;
@@ -133,6 +137,7 @@ export type ComfyValidationMap = Record<ComfyLoaderKey, LoaderValidationEntry> &
 };
 
 export interface StudioConfig {
+  appearanceCleanedVersion?: number;
   shared: SharedConfig;
   characters: CharacterConfig[];
   comfyUrl: string;

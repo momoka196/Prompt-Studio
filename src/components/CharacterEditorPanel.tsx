@@ -1,16 +1,29 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Check, ChevronRight, Download, Plus, ShieldAlert, Upload, X } from 'lucide-react';
+import { Check, ChevronRight, Download, Lock, Plus, RotateCcw, ShieldAlert, Upload, X } from 'lucide-react';
 import {
   EXPRESSION_PRESETS,
+  HAIR_ACCESSORY_PRESETS,
+  HAIR_BANGS_PRESETS,
+  HairModifierPreset,
+  HAIRSTYLE_PRESETS,
   OUTFIT_PRESETS,
   POSE_PRESETS,
-  PresetCategory,
   SimplePresetItem,
 } from '../data/presets';
-import { CharacterConfig, WeightedSlot } from '../types/studio';
 import {
+  CharacterConfig,
+  PresetCategory,
+  QuickFillCategory,
+  WeightedSlot,
+} from '../types/studio';
+import {
+  applyHairstyleToAppearanceText,
+  canCustomizeCharacterHairstyle,
   clampWeight,
+  composeHairstyleTagsWithAccessory,
+  getCharacterHairstyleOptions,
   getPromptStats,
+  inferYiHairstyleFromAppearance,
   normalizeSlotTagsText,
   splitPromptTags,
 } from '../utils/promptBuilder';
@@ -20,6 +33,7 @@ import {
   loadUiCache,
   patchUiCache,
   PresetStyleFilter,
+  RolePresetTab,
 } from '../utils/storageCache';
 import { CompactSlotRow } from './CompactSlotRow';
 import { getCharacterAvatarColor } from './CharacterSidebar';
@@ -152,6 +166,19 @@ function isPresetMatchedInSlot(slotText: string, preset: SimplePresetItem): bool
   return matchedCount >= Math.ceil(presetTags.length * 0.65);
 }
 
+function getBuiltinPresetsByCategory(category: PresetCategory): SimplePresetItem[] {
+  switch (category) {
+    case 'outfit':
+      return OUTFIT_PRESETS;
+    case 'pose':
+      return POSE_PRESETS;
+    case 'expression':
+      return EXPRESSION_PRESETS;
+    case 'hairstyle':
+      return HAIRSTYLE_PRESETS;
+  }
+}
+
 function resolveActivePreset(
   category: PresetCategory,
   slotText: string,
@@ -161,12 +188,7 @@ function resolveActivePreset(
   const trimmed = slotText.trim();
   if (!trimmed) return null;
 
-  const builtin =
-    category === 'outfit'
-      ? OUTFIT_PRESETS
-      : category === 'pose'
-      ? POSE_PRESETS
-      : EXPRESSION_PRESETS;
+  const builtin = getBuiltinPresetsByCategory(category);
   const pool = [...customPresets.filter((p) => p.category === category), ...builtin];
 
   const cleanJoined = extractCleanTags(trimmed).join(', ');
@@ -206,6 +228,12 @@ export const CharacterEditorPanel: React.FC<CharacterEditorPanelProps> = ({
   customPresets,
   onUpdateCustomPresets,
 }) => {
+  const [rolePresetTab, setRolePresetTabState] = useState<RolePresetTab>(
+    () => loadUiCache().rolePresetTab
+  );
+  const [hairFilter, setHairFilter] = useState<
+    'all' | 'braids' | 'short' | 'long' | 'updo'
+  >('all');
   const [openSlot, setOpenSlotState] = useState<EditorSlotKey | null>(
     () => loadUiCache().editorOpenSlot
   );
@@ -215,14 +243,14 @@ export const CharacterEditorPanel: React.FC<CharacterEditorPanelProps> = ({
   const [presetsExpanded, setPresetsExpandedState] = useState<boolean>(
     () => loadUiCache().presetsExpanded
   );
-  const [presetTab, setPresetTabState] = useState<PresetCategory>(
+  const [presetTab, setPresetTabState] = useState<QuickFillCategory>(
     () => loadUiCache().presetTab
   );
   const [styleFilter, setStyleFilterState] = useState<PresetStyleFilter>(
     () => loadUiCache().presetFilter
   );
   const [selectedPresetByChar, setSelectedPresetByChar] = useState<
-    Record<string, Partial<Record<PresetCategory, string>>>
+    Record<string, Partial<Record<QuickFillCategory, string>>>
   >(() => loadUiCache().selectedPresetByChar);
 
   const presetGridRef = useRef<HTMLDivElement | null>(null);
@@ -267,7 +295,12 @@ export const CharacterEditorPanel: React.FC<CharacterEditorPanelProps> = ({
     });
   };
 
-  const setPresetTab = (tab: PresetCategory) => {
+  const setRolePresetTab = (tab: RolePresetTab) => {
+    setRolePresetTabState(tab);
+    patchUiCache({ rolePresetTab: tab });
+  };
+
+  const setPresetTab = (tab: QuickFillCategory) => {
     setPresetTabState(tab);
     patchUiCache({ presetTab: tab });
   };
@@ -279,7 +312,7 @@ export const CharacterEditorPanel: React.FC<CharacterEditorPanelProps> = ({
 
   const recordPresetSelection = (
     charId: string,
-    category: PresetCategory,
+    category: QuickFillCategory,
     presetId: string | null
   ) => {
     setSelectedPresetByChar((prev) => {
@@ -304,6 +337,10 @@ export const CharacterEditorPanel: React.FC<CharacterEditorPanelProps> = ({
   const presetFileRef = useRef<HTMLInputElement | null>(null);
 
   const avatar = getCharacterAvatarColor(character);
+  const hairstyleState = useMemo(
+    () => getCharacterHairstyleOptions(character),
+    [character]
+  );
 
   const updateSlot = (key: SlotKey, patch: Partial<WeightedSlot>) => {
     if (
@@ -314,8 +351,21 @@ export const CharacterEditorPanel: React.FC<CharacterEditorPanelProps> = ({
       recordPresetSelection(character.id, key, matched?.id ?? null);
     }
 
+    let nextHairstyleId = character.hairstyleId;
+    if (
+      key === 'appearance' &&
+      patch.text !== undefined &&
+      canCustomizeCharacterHairstyle(character)
+    ) {
+      const inferred = inferYiHairstyleFromAppearance(patch.text);
+      if (inferred) {
+        nextHairstyleId = inferred.id;
+      }
+    }
+
     onUpdateCharacter({
       ...character,
+      hairstyleId: nextHairstyleId,
       [key]: {
         ...character[key],
         ...patch,
@@ -323,8 +373,75 @@ export const CharacterEditorPanel: React.FC<CharacterEditorPanelProps> = ({
     });
   };
 
+  const applyHairPairing = (next: {
+    preset: SimplePresetItem;
+    bangs: HairModifierPreset;
+    accessory: HairModifierPreset;
+  }) => {
+    const updatedAppearanceText = applyHairstyleToAppearanceText(
+      character.appearance.text,
+      next.preset.tags,
+      {
+        bangsTags: next.bangs.tags,
+        accessoryId: next.accessory.id,
+        accessoryTags: next.accessory.tags,
+      }
+    );
+    onUpdateCharacter({
+      ...character,
+      hairstyleId: next.preset.id,
+      hairBangsId: next.bangs.id,
+      hairAccessoryId: next.accessory.id,
+      appearance: {
+        ...character.appearance,
+        text: updatedAppearanceText,
+      },
+    });
+  };
+
+  const handleSelectHairstyle = (preset: SimplePresetItem) => {
+    if (hairstyleState.isLockedToDefault) return;
+    applyHairPairing({
+      preset,
+      bangs: hairstyleState.activeBangs,
+      accessory: hairstyleState.activeAccessory,
+    });
+  };
+
+  const handleSelectBangs = (bangs: HairModifierPreset) => {
+    if (hairstyleState.isLockedToDefault) return;
+    applyHairPairing({
+      preset: hairstyleState.activePreset,
+      bangs,
+      accessory: hairstyleState.activeAccessory,
+    });
+  };
+
+  const handleSelectAccessory = (accessory: HairModifierPreset) => {
+    if (hairstyleState.isLockedToDefault) return;
+    applyHairPairing({
+      preset: hairstyleState.activePreset,
+      bangs: hairstyleState.activeBangs,
+      accessory,
+    });
+  };
+
+  const handleResetHairPairing = () => {
+    if (hairstyleState.isLockedToDefault) return;
+    applyHairPairing({
+      preset: HAIRSTYLE_PRESETS[0],
+      bangs: HAIR_BANGS_PRESETS[0],
+      accessory: HAIR_ACCESSORY_PRESETS[0],
+    });
+  };
+
   const handleApplyPreset = (preset: SimplePresetItem) => {
-    const currentWeight = character[preset.category].weight;
+    if (preset.category === 'hairstyle') {
+      handleSelectHairstyle(preset);
+      return;
+    }
+    const category: QuickFillCategory = preset.category;
+    const currentWeight = character[category].weight;
     const nextWeight =
       preset.defaultWeight === 1.0
         ? 1.0
@@ -333,17 +450,17 @@ export const CharacterEditorPanel: React.FC<CharacterEditorPanelProps> = ({
         : currentWeight;
 
     const cleanTags = normalizeSlotTagsText(preset.tags) || preset.tags.trim();
-    recordPresetSelection(character.id, preset.category, preset.id);
+    recordPresetSelection(character.id, category, preset.id);
     onUpdateCharacter({
       ...character,
-      [preset.category]: {
+      [category]: {
         text: cleanTags,
         weight: nextWeight,
       },
     });
   };
 
-  const handleClearCategorySlot = (category: PresetCategory) => {
+  const handleClearCategorySlot = (category: QuickFillCategory) => {
     recordPresetSelection(character.id, category, null);
     onUpdateCharacter({
       ...character,
@@ -356,10 +473,10 @@ export const CharacterEditorPanel: React.FC<CharacterEditorPanelProps> = ({
 
   // 确保外部重置/导入/回滚/手改槽位后，选中预设缓存与当前槽位内容严格一致
   useEffect(() => {
-    const categories: PresetCategory[] = ['outfit', 'pose', 'expression'];
+    const categories: QuickFillCategory[] = ['outfit', 'pose', 'expression'];
     setSelectedPresetByChar((prev) => {
       const currentCharMap = prev[character.id] ?? {};
-      const nextCharMap: Partial<Record<PresetCategory, string>> = {};
+      const nextCharMap: Partial<Record<QuickFillCategory, string>> = {};
       let changed = false;
 
       for (const cat of categories) {
@@ -388,12 +505,7 @@ export const CharacterEditorPanel: React.FC<CharacterEditorPanelProps> = ({
     customPresets,
   ]);
 
-  const builtinPresets =
-    presetTab === 'outfit'
-      ? OUTFIT_PRESETS
-      : presetTab === 'pose'
-      ? POSE_PRESETS
-      : EXPRESSION_PRESETS;
+  const builtinPresets = getBuiltinPresetsByCategory(presetTab);
 
   const customTabPresets = customPresets.filter((p) => p.category === presetTab);
   const allTabPresets = useMemo(
@@ -477,14 +589,23 @@ export const CharacterEditorPanel: React.FC<CharacterEditorPanelProps> = ({
       setPresetImportError(error || '未解析到有效预设');
       return;
     }
-    onUpdateCustomPresets([...items, ...customPresets]);
+    const quickFillItems = items.filter((item) => item.category !== 'hairstyle');
+    if (quickFillItems.length === 0) {
+      setPresetImportError('发型预设属于角色预设维度，不导入到可爱预设快填');
+      return;
+    }
+    onUpdateCustomPresets([...quickFillItems, ...customPresets]);
     setPresetImportText('');
-    const firstCat = items[0]?.category;
-    if (firstCat && items.every((i) => i.category === firstCat)) {
+    const firstCat = quickFillItems[0]?.category;
+    if (
+      firstCat &&
+      firstCat !== 'hairstyle' &&
+      quickFillItems.every((i) => i.category === firstCat)
+    ) {
       setPresetTab(firstCat);
     }
     setStyleFilter('all');
-    setPresetImportNotice(`成功导入 ${items.length} 条预设`);
+    setPresetImportNotice(`成功导入 ${quickFillItems.length} 条预设`);
   };
 
   const handleExportCustomPresets = () => {
@@ -576,24 +697,312 @@ export const CharacterEditorPanel: React.FC<CharacterEditorPanelProps> = ({
           </div>
         )}
 
-        <div className="py-1 divide-y divide-[#EAEAEF]/80">
-          {SLOT_DEFS.map((def) => (
-            <CompactSlotRow
-              key={def.key}
-              label={def.label}
-              text={character[def.key].text}
-              weight={character[def.key].weight}
-              expanded={openSlot === def.key}
-              onToggleExpand={() =>
-                setOpenSlot((prev) => (prev === def.key ? null : def.key))
-              }
-              onTextChange={(text) => updateSlot(def.key, { text })}
-              onWeightChange={(weight) => updateSlot(def.key, { weight })}
-              placeholder={def.placeholder}
-              emptyHint={def.emptyHint}
-            />
-          ))}
+        {/* 角色预设维度 Tab 栏（外貌/服装/动作/表情 与 发型 并列，与下方可爱预设快填隔离） */}
+        <div className="px-5 py-2 border-b border-[#EAEAEF] bg-[#FAFAFC]/80 flex flex-wrap items-center justify-between gap-2">
+          <div className="inline-flex items-center gap-1 rounded-full bg-[#EFEFF4] p-0.5">
+            <button
+              type="button"
+              onClick={() => setRolePresetTab('slots')}
+              className={`px-3 py-1 text-[11.5px] font-medium rounded-full transition-all cursor-pointer whitespace-nowrap ${
+                rolePresetTab === 'slots'
+                  ? 'bg-white text-[#1E2028] shadow-[0_1px_2px_rgba(18,22,33,0.08)]'
+                  : 'text-[#686E7E] hover:text-[#1E2028]'
+              }`}
+            >
+              角色槽位（外貌 / 服装 / 动作 / 表情）
+            </button>
+            <button
+              type="button"
+              onClick={() => setRolePresetTab('hairstyle')}
+              className={`px-3 py-1 text-[11.5px] font-medium rounded-full transition-all cursor-pointer whitespace-nowrap inline-flex items-center gap-1.5 ${
+                rolePresetTab === 'hairstyle'
+                  ? 'bg-white text-[#6B48F5] shadow-[0_1px_2px_rgba(18,22,33,0.08)]'
+                  : 'text-[#686E7E] hover:text-[#1E2028]'
+              }`}
+            >
+              <span>发型</span>
+              <span
+                className={`px-1.5 py-0.2 rounded-full text-[10px] leading-tight ${
+                  rolePresetTab === 'hairstyle'
+                    ? 'bg-[#F3F0FF] text-[#6B48F5]'
+                    : 'bg-white/80 text-[#5A6072]'
+                }`}
+              >
+                {hairstyleState.activePreset.zhName.replace(/（.*?）/g, '')}
+              </span>
+            </button>
+          </div>
+
+          <span className="text-[11px] text-[#8E94A4] whitespace-nowrap">
+            {hairstyleState.isLockedToDefault
+              ? '当前角色仅保留默认发型'
+              : `可选 ${hairstyleState.options.length} 款预设发型`}
+          </span>
         </div>
+
+        {rolePresetTab === 'slots' ? (
+          <div className="py-1 divide-y divide-[#EAEAEF]/80">
+            {SLOT_DEFS.map((def) => (
+              <CompactSlotRow
+                key={def.key}
+                label={def.label}
+                text={character[def.key].text}
+                weight={character[def.key].weight}
+                expanded={openSlot === def.key}
+                onToggleExpand={() =>
+                  setOpenSlot((prev) => (prev === def.key ? null : def.key))
+                }
+                onTextChange={(text) => updateSlot(def.key, { text })}
+                onWeightChange={(weight) => updateSlot(def.key, { weight })}
+                placeholder={def.placeholder}
+                emptyHint={def.emptyHint}
+              />
+            ))}
+          </div>
+        ) : (
+          <div className="px-5 py-3.5 space-y-3">
+            <div className="rounded-[10px] border border-[#E2E0F2] bg-[#FAF9FF] px-3 py-2 space-y-1.5">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-[11.5px]">
+                <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+                  <span className="font-medium text-[#5A6072] shrink-0">
+                    当前已选发型：
+                  </span>
+                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-[#7C5CFC] text-white">
+                    <Check className="w-3 h-3 shrink-0" />
+                    <span>{hairstyleState.activePreset.zhName}</span>
+                  </span>
+                  {!hairstyleState.isLockedToDefault && (
+                    <>
+                      <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10.5px] font-medium bg-white border border-[#DCD8F6] text-[#5B3DF5]">
+                        {hairstyleState.activeBangs.zhName.replace(/（默认）/, '')}
+                      </span>
+                      <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10.5px] font-medium bg-white border border-[#DCD8F6] text-[#5B3DF5]">
+                        {hairstyleState.activeAccessory.zhName}
+                      </span>
+                    </>
+                  )}
+                </div>
+
+                {!hairstyleState.isLockedToDefault &&
+                  (hairstyleState.activePreset.id !== 'hair-side-ponytail' ||
+                    hairstyleState.activeBangs.id !== 'bangs-default' ||
+                    hairstyleState.activeAccessory.id !== 'acc-preset-bow') && (
+                    <button
+                      type="button"
+                      onClick={handleResetHairPairing}
+                      className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-[8px] border border-[#E2E3EA] bg-white text-[11px] font-medium text-[#5A6072] hover:border-[#7C5CFC]/40 hover:text-[#6B48F5] cursor-pointer shrink-0 transition-colors"
+                    >
+                      <RotateCcw className="w-3 h-3" />
+                      <span>恢复默认侧马尾搭配</span>
+                    </button>
+                  )}
+              </div>
+              <div
+                title={
+                  hairstyleState.isLockedToDefault
+                    ? hairstyleState.activePreset.tags
+                    : [
+                        ...composeHairstyleTagsWithAccessory(
+                          hairstyleState.activePreset.tags,
+                          hairstyleState.activeAccessory.id,
+                          hairstyleState.activeAccessory.tags
+                        ),
+                        hairstyleState.activeBangs.tags,
+                      ]
+                        .filter(Boolean)
+                        .join(', ')
+                }
+                className="text-[11px] font-mono text-[#686E7E] truncate"
+              >
+                {hairstyleState.isLockedToDefault
+                  ? hairstyleState.activePreset.tags
+                  : [
+                      ...composeHairstyleTagsWithAccessory(
+                        hairstyleState.activePreset.tags,
+                        hairstyleState.activeAccessory.id,
+                        hairstyleState.activeAccessory.tags
+                      ),
+                      hairstyleState.activeBangs.tags,
+                    ]
+                      .filter(Boolean)
+                      .join(', ')}
+              </div>
+              <p className="text-[11px] text-[#686E7E]">
+                {hairstyleState.isLockedToDefault
+                  ? '本版仅保留该角色原有的默认发型（直接读取外貌槽位词条），不开放切换其他发型，也不套用 black hair bow。'
+                  : '切换发型会自动替换「伊」外貌中的旧发型/刘海/发饰词条，完整保留金发、尖耳、角、光环、蝙蝠翼、心形尾、黄瞳等特征；与下方可爱预设快填互相独立。'}
+              </p>
+            </div>
+
+            {!hairstyleState.isLockedToDefault && (
+              <div className="space-y-2 rounded-[10px] border border-[#EAEAEF] bg-[#FAFAFC] px-3 py-2.5">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[11px] font-medium text-[#5A6072] w-[58px] shrink-0">
+                    刘海微调
+                  </span>
+                  {hairstyleState.bangsOptions.map((b) => {
+                    const active = hairstyleState.activeBangs.id === b.id;
+                    return (
+                      <button
+                        key={b.id}
+                        type="button"
+                        onClick={() => handleSelectBangs(b)}
+                        title={b.note}
+                        className={`px-2.5 py-0.5 rounded-full text-[11px] border transition-colors cursor-pointer whitespace-nowrap ${
+                          active
+                            ? 'border-[#7C5CFC] bg-[#7C5CFC] text-white font-medium'
+                            : 'border-[#E0E0E8] bg-white text-[#555B6E] hover:border-[#7C5CFC]/40 hover:text-[#5B3DF5]'
+                        }`}
+                      >
+                        {b.zhName}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[11px] font-medium text-[#5A6072] w-[58px] shrink-0">
+                    发饰搭配
+                  </span>
+                  {hairstyleState.accessoryOptions.map((acc) => {
+                    const active = hairstyleState.activeAccessory.id === acc.id;
+                    return (
+                      <button
+                        key={acc.id}
+                        type="button"
+                        onClick={() => handleSelectAccessory(acc)}
+                        title={acc.note}
+                        className={`px-2.5 py-0.5 rounded-full text-[11px] border transition-colors cursor-pointer whitespace-nowrap ${
+                          active
+                            ? 'border-[#7C5CFC] bg-[#7C5CFC] text-white font-medium'
+                            : 'border-[#E0E0E8] bg-white text-[#555B6E] hover:border-[#7C5CFC]/40 hover:text-[#5B3DF5]'
+                        }`}
+                      >
+                        {acc.zhName}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {!hairstyleState.isLockedToDefault && (
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {(
+                    [
+                      { id: 'all', label: `全部 (${hairstyleState.options.length})` },
+                      { id: 'braids', label: '双马尾 · 麻花辫' },
+                      { id: 'short', label: '短发 · 波波头' },
+                      { id: 'long', label: '长发 · 半扎披肩' },
+                      { id: 'updo', label: '盘发 · 丸子 · 马尾' },
+                    ] as const
+                  ).map((f) => {
+                    const active = hairFilter === f.id;
+                    return (
+                      <button
+                        key={f.id}
+                        type="button"
+                        onClick={() => setHairFilter(f.id)}
+                        className={`px-2.5 py-0.5 text-[11px] rounded-full border transition-colors cursor-pointer whitespace-nowrap ${
+                          active
+                            ? 'border-[#7C5CFC]/40 bg-[#F3F0FF] text-[#6B48F5] font-medium'
+                            : 'border-transparent bg-[#F4F4F7] text-[#686E7E] hover:text-[#1E2028] hover:bg-[#ECECF2]'
+                        }`}
+                      >
+                        {f.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-[10px]">
+              {hairstyleState.options
+                .filter((item) => {
+                  if (hairstyleState.isLockedToDefault || hairFilter === 'all') {
+                    return true;
+                  }
+                  const t = item.tags.toLowerCase();
+                  if (hairFilter === 'braids') {
+                    return /twintails|braid/.test(t);
+                  }
+                  if (hairFilter === 'short') {
+                    return /short hair|bob cut/.test(t);
+                  }
+                  if (hairFilter === 'long') {
+                    return /long straight hair|long hair|half updo|hime cut|wavy hair/.test(t);
+                  }
+                  if (hairFilter === 'updo') {
+                    return /ponytail|updo|bun/.test(t);
+                  }
+                  return true;
+                })
+                .map((item) => {
+                const isActive = hairstyleState.activePreset.id === item.id;
+                const coreKeywords = getCoreEnglishKeywords(item.tags, 3);
+
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    disabled={hairstyleState.isLockedToDefault}
+                    onClick={() => handleSelectHairstyle(item)}
+                    title={item.tags}
+                    className={`group/hair w-full text-left rounded-[12px] px-3.5 py-2.5 transition-all duration-150 ${
+                      isActive
+                        ? 'border-2 border-[#7C5CFC] bg-[#F3F0FF] shadow-[0_3px_12px_rgba(124,92,252,0.16)]'
+                        : 'border border-[#EAEAEF] bg-[#FAFAFC]/80 hover:bg-white hover:border-[#D4D6E4] hover:shadow-xs'
+                    } ${hairstyleState.isLockedToDefault ? 'cursor-default' : 'cursor-pointer'}`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span
+                        className={`text-[12.5px] font-semibold truncate ${
+                          isActive ? 'text-[#5B3DF5]' : 'text-[#1E2028]'
+                        }`}
+                      >
+                        {item.zhName}
+                      </span>
+
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {isActive ? (
+                          <span className="inline-flex items-center gap-0.5 px-2 py-0.5 rounded-full text-[10px] font-semibold whitespace-nowrap bg-[#7C5CFC] text-white">
+                            {hairstyleState.isLockedToDefault ? (
+                              <Lock className="w-2.5 h-2.5" />
+                            ) : (
+                              <Check className="w-2.5 h-2.5" />
+                            )}
+                            <span>{hairstyleState.isLockedToDefault ? '默认保留' : '已选'}</span>
+                          </span>
+                        ) : (
+                          <span className="text-[10.5px] text-[#949AA8] whitespace-nowrap">
+                            {item.vibe}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                      {coreKeywords.map((kw, idx) => (
+                        <span
+                          key={`${item.id}-kw-${idx}`}
+                          className={`inline-flex items-center px-2 py-0.5 rounded-[6px] text-[10.5px] leading-tight whitespace-nowrap ${
+                            isActive
+                              ? 'bg-[#7C5CFC]/15 text-[#5B3DF5] font-medium'
+                              : 'bg-[#EFEFF4] text-[#555B6E]'
+                          }`}
+                        >
+                          {kw}
+                        </span>
+                      ))}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* 可爱预设快填：上方已选摘要条 + 分类切换 + 风格筛选 + 充足可视高度的卡片流 */}
@@ -717,7 +1126,7 @@ export const CharacterEditorPanel: React.FC<CharacterEditorPanelProps> = ({
                     { key: 'outfit', label: '服装' },
                     { key: 'pose', label: '动作' },
                     { key: 'expression', label: '表情' },
-                  ] as { key: PresetCategory; label: string }[]
+                  ] as { key: QuickFillCategory; label: string }[]
                 ).map((slotMeta) => {
                   const matched = activeByCategory[slotMeta.key];
                   const slotHasText = Boolean(character[slotMeta.key].text.trim());
@@ -775,7 +1184,7 @@ export const CharacterEditorPanel: React.FC<CharacterEditorPanelProps> = ({
                     { id: 'outfit', label: '可爱服装' },
                     { id: 'pose', label: '动作姿态' },
                     { id: 'expression', label: '萌系表情' },
-                  ] as { id: PresetCategory; label: string }[]
+                  ] as { id: QuickFillCategory; label: string }[]
                 ).map((t) => {
                   const active = presetTab === t.id;
                   const hasMatched = Boolean(activeByCategory[t.id]);
@@ -1056,7 +1465,10 @@ export const CharacterEditorPanel: React.FC<CharacterEditorPanelProps> = ({
                             onUpdateCustomPresets(
                               customPresets.filter((p) => p.id !== item.id)
                             );
-                            if (activeCurrentPreset?.id === item.id) {
+                            if (
+                              activeCurrentPreset?.id === item.id &&
+                              item.category !== 'hairstyle'
+                            ) {
                               recordPresetSelection(character.id, item.category, null);
                             }
                           }}

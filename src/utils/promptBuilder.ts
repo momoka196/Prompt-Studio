@@ -3,6 +3,10 @@ import {
   CHARACTER_FORBIDDEN_FEATURES,
   COMFY_ARCH_DEFAULTS,
   EXPRESSION_PRESETS,
+  HAIR_ACCESSORY_PRESETS,
+  HAIR_BANGS_PRESETS,
+  HairModifierPreset,
+  HAIRSTYLE_PRESETS,
   MINIMAL_BACKGROUNDS,
   OUTFIT_PRESETS,
   POSE_PRESETS,
@@ -198,10 +202,345 @@ const CLASSROOM_BG_RE = /\b(?:classroom|school|desk|chalkboard)\b/i;
 const EXPR_CLOSED_OR_WIDE_EYES_RE =
   /\b(?:closed eyes|eyes closed|closed-eye|half-closed eyes|sleepy|wide eyes|wide bright eyes|wide watery eyes|star-shaped pupils|heart-shaped pupils)\b|>_</i;
 
+const EXPR_CLOSED_OR_HALF_EYES_RE =
+  /\b(?:closed eyes|eyes closed|closed-eye|half-closed eyes|sleepy|one eye closed|wink|winking|blank stare|peeking through fingers|peeking eyes)\b|>_</i;
+
 const EXPR_BLUSH_RE = /\b(?:blush|blushing|rosy cheeks)\b/i;
 
 const GAZE_AWAY_OR_DOWN_RE =
-  /\b(?:looking down at pages|averted gaze|turning head back|looking back at viewer)\b/i;
+  /\b(?:looking down at pages|averted gaze|turning head back|looking back at viewer|looking away|looking aside|upturned pleading gaze|dreamy gaze|curious gaze|shy|closed eyes|eyes closed|closed-eye|blank stare)\b/i;
+
+const LEGACY_INITIAL_APPEARANCE_EXPR_TOKENS = new Set<string>([
+  'gentle smile',
+  'looking at viewer',
+  'big eyes',
+  'blush',
+]);
+
+const BUILTIN_CHAR_IDS_FOR_APPEARANCE_CLEAN = new Set<string>([
+  'char-lan',
+  'char-yi',
+  'char-mari',
+  'char-hoshino',
+]);
+
+export function stripLegacyExpressionTokensFromAppearance(
+  charId: string,
+  appearanceText: string
+): string {
+  if (!BUILTIN_CHAR_IDS_FOR_APPEARANCE_CLEAN.has(charId)) {
+    return appearanceText;
+  }
+  const tokens = splitPromptTags(appearanceText);
+  if (tokens.length === 0) return appearanceText;
+  return tokens
+    .filter((token) => {
+      const clean = stripWeightSyntax(token).replace(/\s+/g, ' ').trim();
+      return !LEGACY_INITIAL_APPEARANCE_EXPR_TOKENS.has(clean);
+    })
+    .join(', ');
+}
+
+const YI_HAIR_ACCESSORY_TOKENS = new Set<string>([
+  'black bow',
+  'hair bow on the side',
+  'black hair bow',
+  'two hair bows',
+  ...HAIR_ACCESSORY_PRESETS.flatMap((acc) =>
+    splitPromptTags(acc.tags).map((t) =>
+      stripWeightSyntax(t).replace(/\s+/g, ' ').trim()
+    )
+  ).filter(Boolean),
+]);
+
+const YI_HAIR_BANGS_TOKENS = new Set<string>(
+  HAIR_BANGS_PRESETS.flatMap((b) =>
+    splitPromptTags(b.tags).map((t) =>
+      stripWeightSyntax(t).replace(/\s+/g, ' ').trim()
+    )
+  ).filter(Boolean)
+);
+
+const YI_HAIRSTYLE_REMOVABLE_TOKENS = new Set<string>([
+  'side ponytail',
+  'ponytail on side',
+  ...YI_HAIR_ACCESSORY_TOKENS,
+  ...HAIRSTYLE_PRESETS.flatMap((preset) =>
+    splitPromptTags(preset.tags).map((t) =>
+      stripWeightSyntax(t).replace(/\s+/g, ' ').trim()
+    )
+  ).filter(Boolean),
+]);
+
+export function canCustomizeCharacterHairstyle(character: CharacterConfig): boolean {
+  return character.id === 'char-yi';
+}
+
+function extractDefaultHairstyleTag(appearanceText: string, preferredPatterns: RegExp[], fallback: string): string {
+  const tokens = splitPromptTags(appearanceText);
+  for (const re of preferredPatterns) {
+    const found = tokens.find((t) => re.test(stripWeightSyntax(t)));
+    if (found) return found.trim();
+  }
+  return fallback;
+}
+
+export function getCharacterDefaultHairstyleOption(character: CharacterConfig): SimplePresetItem {
+  const appText = character.appearance.text;
+  if (character.id === 'char-lan') {
+    const tag = extractDefaultHairstyleTag(
+      appText,
+      [/^low twintails$/i, /\btwintails\b/i, /\b(?:long|short) hair\b/i],
+      'low twintails'
+    );
+    return {
+      id: 'default-lan',
+      category: 'hairstyle',
+      zhName: '低双马尾（蓝默认）',
+      vibe: '原生默认 · 仅读取保留',
+      tags: tag,
+      defaultWeight: 1.0,
+    };
+  }
+  if (character.id === 'char-mari') {
+    const tag = extractDefaultHairstyleTag(
+      appText,
+      [/\bvery long low twintails\b/i, /\blow twintails\b/i, /\btwintails\b/i],
+      'very long low twintails'
+    );
+    return {
+      id: 'default-mari',
+      category: 'hairstyle',
+      zhName: '超长低双马尾（Mari 默认）',
+      vibe: '原生默认 · 仅读取保留',
+      tags: tag,
+      defaultWeight: 1.0,
+    };
+  }
+  if (character.id === 'char-hoshino') {
+    const tag = extractDefaultHairstyleTag(
+      appText,
+      [/^long hair$/i, /\b(?:long|short|medium) hair\b/i],
+      'long hair'
+    );
+    return {
+      id: 'default-hoshino',
+      category: 'hairstyle',
+      zhName: '长发（Hoshino 默认）',
+      vibe: '原生默认 · 仅读取保留',
+      tags: tag,
+      defaultWeight: 1.0,
+    };
+  }
+  const customTag = extractDefaultHairstyleTag(
+    appText,
+    [/\b(?:twintails|ponytail|long hair|short hair|updo|bun|bob cut|braids?)\b/i],
+    ''
+  );
+  return {
+    id: `default-${character.id}`,
+    category: 'hairstyle',
+    zhName: '外貌默认发型',
+    vibe: '跟随外貌槽位',
+    tags: customTag || '由外貌槽位控制',
+    defaultWeight: 1.0,
+  };
+}
+
+export function inferYiHairstyleFromAppearance(appearanceText: string): SimplePresetItem | null {
+  const tokenSet = new Set(
+    splitPromptTags(appearanceText)
+      .map((t) => stripWeightSyntax(t).replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+  );
+  if (tokenSet.size === 0) return null;
+
+  let bestMatch: { preset: SimplePresetItem; matchedCore: number; ratio: number } | null = null;
+  for (const preset of HAIRSTYLE_PRESETS) {
+    const coreTokens = splitPromptTags(preset.tags)
+      .map((t) => stripWeightSyntax(t).replace(/\s+/g, ' ').trim())
+      .filter((t) => t && !YI_HAIR_ACCESSORY_TOKENS.has(t));
+    if (coreTokens.length === 0) continue;
+
+    const matchedCore = coreTokens.filter((ct) => tokenSet.has(ct)).length;
+    if (matchedCore === 0) continue;
+    const ratio = matchedCore / coreTokens.length;
+    if (ratio < 0.6) continue;
+
+    if (
+      !bestMatch ||
+      matchedCore > bestMatch.matchedCore ||
+      (matchedCore === bestMatch.matchedCore && ratio > bestMatch.ratio)
+    ) {
+      bestMatch = { preset, matchedCore, ratio };
+    }
+  }
+  return bestMatch?.preset ?? null;
+}
+
+export function getCharacterHairstyleOptions(character: CharacterConfig): {
+  options: SimplePresetItem[];
+  isLockedToDefault: boolean;
+  activePreset: SimplePresetItem;
+  bangsOptions: HairModifierPreset[];
+  activeBangs: HairModifierPreset;
+  accessoryOptions: HairModifierPreset[];
+  activeAccessory: HairModifierPreset;
+} {
+  if (canCustomizeCharacterHairstyle(character)) {
+    const byId = character.hairstyleId
+      ? HAIRSTYLE_PRESETS.find((p) => p.id === character.hairstyleId)
+      : undefined;
+    const activePreset =
+      byId ?? inferYiHairstyleFromAppearance(character.appearance.text) ?? HAIRSTYLE_PRESETS[0];
+    const activeBangs =
+      (character.hairBangsId
+        ? HAIR_BANGS_PRESETS.find((b) => b.id === character.hairBangsId)
+        : undefined) ?? HAIR_BANGS_PRESETS[0];
+    const activeAccessory =
+      (character.hairAccessoryId
+        ? HAIR_ACCESSORY_PRESETS.find((a) => a.id === character.hairAccessoryId)
+        : undefined) ?? HAIR_ACCESSORY_PRESETS[0];
+    return {
+      options: HAIRSTYLE_PRESETS,
+      isLockedToDefault: false,
+      activePreset,
+      bangsOptions: HAIR_BANGS_PRESETS,
+      activeBangs,
+      accessoryOptions: HAIR_ACCESSORY_PRESETS,
+      activeAccessory,
+    };
+  }
+  const def = getCharacterDefaultHairstyleOption(character);
+  return {
+    options: [def],
+    isLockedToDefault: true,
+    activePreset: def,
+    bangsOptions: [],
+    activeBangs: HAIR_BANGS_PRESETS[0],
+    accessoryOptions: [],
+    activeAccessory: HAIR_ACCESSORY_PRESETS[0],
+  };
+}
+
+export interface HairstylePairingApplyOptions {
+  bangsTags?: string;
+  accessoryId?: string | null;
+  accessoryTags?: string;
+}
+
+export function composeHairstyleTagsWithAccessory(
+  presetTags: string,
+  accessoryId?: string | null,
+  accessoryTags?: string
+): string[] {
+  const baseTokens = splitPromptTags(presetTags);
+  if (!accessoryId || accessoryId === 'acc-preset-bow') {
+    return baseTokens;
+  }
+  const nonAccessoryTokens = baseTokens.filter((token) => {
+    const clean = stripWeightSyntax(token).replace(/\s+/g, ' ').trim();
+    return !YI_HAIR_ACCESSORY_TOKENS.has(clean);
+  });
+  if (accessoryId === 'acc-none') {
+    return nonAccessoryTokens;
+  }
+  const customAccTokens = splitPromptTags(accessoryTags ?? '');
+  return [...nonAccessoryTokens, ...customAccTokens];
+}
+
+export function applyHairstyleToAppearanceText(
+  appearanceText: string,
+  presetTags: string,
+  pairing?: HairstylePairingApplyOptions
+): string {
+  const tokens = splitPromptTags(appearanceText);
+  const replacementTokens = composeHairstyleTagsWithAccessory(
+    presetTags,
+    pairing?.accessoryId,
+    pairing?.accessoryTags
+  );
+  const replaceBangs = pairing?.bangsTags !== undefined;
+  const replacementBangsTokens = replaceBangs
+    ? splitPromptTags(pairing.bangsTags ?? '')
+    : [];
+
+  if (tokens.length === 0) {
+    return [...replacementTokens, ...replacementBangsTokens].join(', ');
+  }
+
+  let insertHairIdx = -1;
+  let insertBangsIdx = -1;
+  let blondeIndex = -1;
+
+  tokens.forEach((token, idx) => {
+    const clean = stripWeightSyntax(token).replace(/\s+/g, ' ').trim();
+    if (insertHairIdx === -1 && YI_HAIRSTYLE_REMOVABLE_TOKENS.has(clean)) {
+      insertHairIdx = idx;
+    }
+    if (insertBangsIdx === -1 && YI_HAIR_BANGS_TOKENS.has(clean)) {
+      insertBangsIdx = idx;
+    }
+    if (blondeIndex === -1 && clean === 'blonde hair') {
+      blondeIndex = idx;
+    }
+  });
+
+  if (insertHairIdx === -1) {
+    insertHairIdx = blondeIndex >= 0 ? blondeIndex + 1 : 0;
+  }
+
+  const out: string[] = [];
+  let hairInserted = false;
+  let bangsInserted = !replaceBangs;
+
+  tokens.forEach((token, idx) => {
+    if (!hairInserted && idx === insertHairIdx) {
+      out.push(...replacementTokens);
+      hairInserted = true;
+    }
+    if (!bangsInserted && insertBangsIdx >= 0 && idx === insertBangsIdx) {
+      out.push(...replacementBangsTokens);
+      bangsInserted = true;
+    }
+    const clean = stripWeightSyntax(token).replace(/\s+/g, ' ').trim();
+    if (YI_HAIRSTYLE_REMOVABLE_TOKENS.has(clean)) return;
+    if (replaceBangs && YI_HAIR_BANGS_TOKENS.has(clean)) return;
+    out.push(token);
+  });
+
+  if (!hairInserted) {
+    out.push(...replacementTokens);
+  }
+  if (!bangsInserted) {
+    // If appearance had no prior bangs tokens, place bangs right after hairstyle replacement
+    const lastHairToken = replacementTokens[replacementTokens.length - 1];
+    const anchorIdx = lastHairToken ? out.indexOf(lastHairToken) : -1;
+    if (anchorIdx >= 0) {
+      out.splice(anchorIdx + 1, 0, ...replacementBangsTokens);
+    } else {
+      out.push(...replacementBangsTokens);
+    }
+  }
+
+  return out.join(', ');
+}
+
+export function resolveEffectiveAppearanceSlot(character: CharacterConfig): WeightedSlot {
+  if (!canCustomizeCharacterHairstyle(character)) {
+    return character.appearance;
+  }
+  const { activePreset, activeBangs, activeAccessory } =
+    getCharacterHairstyleOptions(character);
+  return {
+    ...character.appearance,
+    text: applyHairstyleToAppearanceText(character.appearance.text, activePreset.tags, {
+      bangsTags: activeBangs.tags,
+      accessoryId: activeAccessory.id,
+      accessoryTags: activeAccessory.tags,
+    }),
+  };
+}
 
 interface ResolvedCharacterPromptData {
   segments: PromptSegment[];
@@ -221,7 +560,8 @@ function resolveAndBuildCharacterSegments(
   const bgRaw = shared.background.text.trim();
   const hasBackgroundLock = bgRaw.length > 0;
   const compRaw = shared.composition.text.trim();
-  const appRaw = includeAppearance ? character.appearance.text.trim() : '';
+  const effectiveAppearanceSlot = resolveEffectiveAppearanceSlot(character);
+  const appRaw = includeAppearance ? effectiveAppearanceSlot.text.trim() : '';
   const outfitRaw = character.outfit.text.trim();
   const poseRaw = character.pose.text.trim();
   const exprRaw = character.expression.text.trim();
@@ -254,6 +594,7 @@ function resolveAndBuildCharacterSegments(
 
   const exprHasText = exprRaw.length > 0;
   const exprClosedOrWideEyes = EXPR_CLOSED_OR_WIDE_EYES_RE.test(exprRaw);
+  const exprClosedOrHalfEyes = EXPR_CLOSED_OR_HALF_EYES_RE.test(exprRaw);
   const exprHasBlush = EXPR_BLUSH_RE.test(exprRaw);
   const poseOrExprRedirectsGaze =
     GAZE_AWAY_OR_DOWN_RE.test(poseRaw) || GAZE_AWAY_OR_DOWN_RE.test(exprRaw);
@@ -277,16 +618,25 @@ function resolveAndBuildCharacterSegments(
         continue;
       }
 
-      // 外貌 vs 表情 / 动作：已有显式表情时，去掉外貌默认微笑与重复基础脸红
+      // 外貌 vs 表情 / 动作：已有显式表情时，清理外貌中残留的微笑/脸红/视线/眼型冲突词，避免覆盖可爱预设表情
       if (key === 'appearance') {
-        if (exprHasText && /^(?:gentle smile|soft smile|smile|neutral expression|expressionless)$/.test(clean)) {
+        if (
+          exprHasText &&
+          /^(?:gentle smile|soft smile|smile|happy|neutral expression|expressionless|blush|blushing|rosy cheeks)$/.test(
+            clean
+          )
+        ) {
           hasPoseExprGuard = true;
           continue;
         }
         if (exprHasBlush && clean === 'blush') {
           continue;
         }
-        if (poseOrExprRedirectsGaze && clean === 'looking at viewer') {
+        if (exprClosedOrHalfEyes && /^(?:big eyes|tareme)$/.test(clean)) {
+          hasPoseExprGuard = true;
+          continue;
+        }
+        if ((poseOrExprRedirectsGaze || exprClosedOrHalfEyes) && clean === 'looking at viewer') {
           hasPoseExprGuard = true;
           continue;
         }
@@ -374,7 +724,7 @@ function resolveAndBuildCharacterSegments(
     ...(shared.bodyType && shared.bodyType.text.trim()
       ? [{ key: 'bodyType', label: '体型', layer: 'shared' as const, slot: shared.bodyType }]
       : []),
-    { key: 'appearance', label: '外貌', layer: 'character', slot: character.appearance },
+    { key: 'appearance', label: '外貌', layer: 'character', slot: effectiveAppearanceSlot },
     { key: 'outfit', label: '服装', layer: 'character', slot: character.outfit },
     { key: 'pose', label: '动作', layer: 'character', slot: character.pose },
     { key: 'expression', label: '表情', layer: 'character', slot: character.expression },
@@ -491,6 +841,7 @@ function collectMatchedPresetText(
     ...OUTFIT_PRESETS,
     ...POSE_PRESETS,
     ...EXPRESSION_PRESETS,
+    ...HAIRSTYLE_PRESETS,
   ];
   for (const char of characters) {
     const slotTexts = [char.outfit.text, char.pose.text, char.expression.text]
@@ -506,6 +857,10 @@ function collectMatchedPresetText(
       if (matched) {
         extraTexts.push(matched.zhName, matched.vibe);
       }
+    }
+    if (canCustomizeCharacterHairstyle(char)) {
+      const activeHair = getCharacterHairstyleOptions(char).activePreset;
+      extraTexts.push(activeHair.zhName, activeHair.vibe);
     }
   }
 
@@ -541,7 +896,7 @@ export function buildNegativePromptWithMeta(
     shared.composition.text,
     shared.bodyType?.text ?? '',
     ...charList.flatMap((c) => [
-      includeAppearance ? c.appearance.text : '',
+      includeAppearance ? resolveEffectiveAppearanceSlot(c).text : '',
       c.outfit.text,
       c.pose.text,
       c.expression.text,
@@ -762,8 +1117,9 @@ export function detectConflicts(
     }
 
     characters.forEach((char) => {
+      const resolvedApp = resolveEffectiveAppearanceSlot(char).text;
       const charPosText = [
-        char.appearance.text,
+        resolvedApp,
         char.outfit.text,
         char.pose.text,
         char.expression.text,
@@ -788,7 +1144,7 @@ export function detectConflicts(
     ...characters.map((c) => ({
       source: c.name,
       characterId: c.id,
-      text: `${c.appearance.text}, ${c.outfit.text}, ${c.pose.text}, ${c.expression.text}`,
+      text: `${resolveEffectiveAppearanceSlot(c).text}, ${c.outfit.text}, ${c.pose.text}, ${c.expression.text}`,
     })),
   ];
 
@@ -861,12 +1217,18 @@ export function detectConflicts(
     }
   }
 
-  // 5. 角色专属禁用词（防串特征）检测
+  // 5. 角色专属禁用词（防串特征）检测（自动豁免「伊」当前显式选定的角色预设发型/刘海/发饰词条）
   for (const char of characters) {
     if (!char.forbiddenTags || !char.forbiddenTags.trim()) continue;
     const forbiddenList = splitCleanTerms(char.forbiddenTags);
+    const appearanceForForbiddenCheck = canCustomizeCharacterHairstyle(char)
+      ? applyHairstyleToAppearanceText(char.appearance.text, '', {
+          bangsTags: '',
+          accessoryId: 'acc-none',
+        })
+      : char.appearance.text;
     const charTerms = splitCleanTerms(
-      `${char.appearance.text}, ${char.outfit.text}, ${char.pose.text}, ${char.expression.text}`
+      `${appearanceForForbiddenCheck}, ${char.outfit.text}, ${char.pose.text}, ${char.expression.text}`
     );
     for (const fTag of forbiddenList) {
       const matched = charTerms.find(

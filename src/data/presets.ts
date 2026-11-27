@@ -1162,6 +1162,190 @@ export const EXPRESSION_PRESETS: SimplePresetItem[] = [
   },
 ];
 
+// 角色预设维度 · 发型选型（600–606）
+// 仅「伊 (char-yi)」开放全部 7 项切换；蓝 / Mari / Hoshino 仅保留各自默认发型，不套用 black hair bow
+export const HAIRSTYLE_PRESETS: SimplePresetItem[] = [
+  {
+    id: 'hair-side-ponytail',
+    category: 'hairstyle',
+    zhName: '侧马尾',
+    vibe: '600 · 伊默认',
+    tags: '(side ponytail:1.6), (ponytail on side:1.4), (black hair bow:1.5), (hair bow on the side:1.3)',
+    defaultWeight: 1.0,
+  },
+  {
+    id: 'hair-low-twintails',
+    category: 'hairstyle',
+    zhName: '低双马尾',
+    vibe: '601 · 双马尾',
+    tags: '(low twintails:1.6), (twintails:1.4), (black hair bow:1.4), (two hair bows:1.3)',
+    defaultWeight: 1.0,
+  },
+  {
+    id: 'hair-straight',
+    category: 'hairstyle',
+    zhName: '长直发',
+    vibe: '602 · 披肩直发',
+    tags: '(long straight hair:1.6), (hair down:1.4), (black hair bow:1.3)',
+    defaultWeight: 1.0,
+  },
+  {
+    id: 'hair-high-ponytail',
+    category: 'hairstyle',
+    zhName: '高马尾',
+    vibe: '603 · 活力马尾',
+    tags: '(high ponytail:1.6), (black hair bow:1.4)',
+    defaultWeight: 1.0,
+  },
+  {
+    id: 'hair-updo',
+    category: 'hairstyle',
+    zhName: '盘发',
+    vibe: '604 · 优雅盘发',
+    tags: '(updo:1.5), (hair bun:1.5), nape of neck visible, (black hair bow:1.3)',
+    defaultWeight: 1.0,
+  },
+  {
+    id: 'hair-bun',
+    category: 'hairstyle',
+    zhName: '丸子头',
+    vibe: '605 · 可爱双丸子',
+    tags: '(double bun:1.5), (hair bun:1.4), (black hair bow:1.3)',
+    defaultWeight: 1.0,
+  },
+  {
+    id: 'hair-short',
+    category: 'hairstyle',
+    zhName: '短波波头',
+    vibe: '606 · 清爽波波头',
+    tags: '(short hair:1.6), (bob cut:1.5), (black hair bow:1.2)',
+    defaultWeight: 1.0,
+  },
+  {
+    id: 'hair-short-twin-braids',
+    category: 'hairstyle',
+    zhName: '双麻花辫配短波波头',
+    vibe: '607 · 短发双麻花',
+    tags: '(bob cut:1.5), (short hair:1.5), (twin braids:1.5), (short braids:1.4), (black hair bow:1.2), (two hair bows:1.2)',
+    defaultWeight: 1.0,
+  },
+  {
+    id: 'hair-long-twin-braids',
+    category: 'hairstyle',
+    zhName: '长发双麻花辫',
+    vibe: '608 · 垂肩麻花',
+    tags: '(long hair:1.5), (twin braids:1.6), (braided hair:1.4), (black hair bow:1.3), (two hair bows:1.3)',
+    defaultWeight: 1.0,
+  },
+  {
+    id: 'hair-half-up',
+    category: 'hairstyle',
+    zhName: '公主半扎发',
+    vibe: '609 · 温柔半扎',
+    tags: '(half updo:1.6), (long hair:1.4), (hair down:1.3), (black hair bow:1.4)',
+    defaultWeight: 1.0,
+  },
+  {
+    id: 'hair-hime-cut',
+    category: 'hairstyle',
+    zhName: '姬发式长直',
+    vibe: '610 · 切齐姬发',
+    tags: '(hime cut:1.6), (long straight hair:1.5), (black hair bow:1.3)',
+    defaultWeight: 1.0,
+  },
+  {
+    id: 'hair-fluffy-wavy',
+    category: 'hairstyle',
+    zhName: '蓬松微卷披发',
+    vibe: '611 · 软萌波浪',
+    tags: '(wavy hair:1.5), (fluffy hair:1.4), (long hair:1.4), (hair down:1.3), (black hair bow:1.3)',
+    defaultWeight: 1.0,
+  },
+  {
+    id: 'hair-low-bun-down',
+    category: 'hairstyle',
+    zhName: '双丸子半披发',
+    vibe: '612 · 甜美半丸子',
+    tags: '(half updo:1.5), (double bun:1.5), (hair down:1.3), (black hair bow:1.3)',
+    defaultWeight: 1.0,
+  },
+  {
+    id: 'hair-side-braid',
+    category: 'hairstyle',
+    zhName: '单侧麻花辫',
+    vibe: '613 · 俏皮侧辫',
+    tags: '(side braid:1.6), (braid:1.4), (black hair bow:1.4), (hair bow on the side:1.3)',
+    defaultWeight: 1.0,
+  },
+];
+
+export interface HairModifierPreset {
+  id: string;
+  zhName: string;
+  note: string;
+  tags: string;
+}
+
+export const HAIR_BANGS_PRESETS: HairModifierPreset[] = [
+  {
+    id: 'bangs-default',
+    zhName: '斜刘海碎发（默认）',
+    note: '伊原生斜分刘海与修饰碎发',
+    tags: '(swept bangs:1.3), loose hair strands framing face',
+  },
+  {
+    id: 'bangs-blunt',
+    zhName: '齐刘海乖巧感',
+    note: '齐整平刘海，适合波波头/姬发/双麻花',
+    tags: '(blunt bangs:1.3), hair between eyes, sidelocks',
+  },
+  {
+    id: 'bangs-parted',
+    zhName: '空气八字刘海',
+    note: '轻盈中分微透刘海与双侧鬓角',
+    tags: '(parted bangs:1.3), wispy bangs, sidelocks',
+  },
+  {
+    id: 'bangs-short',
+    zhName: '眉上短萌刘海',
+    note: '露出眉眼与小额头，元气减龄',
+    tags: '(short bangs:1.3), hair between eyes, loose hair strands framing face',
+  },
+];
+
+export const HAIR_ACCESSORY_PRESETS: HairModifierPreset[] = [
+  {
+    id: 'acc-preset-bow',
+    zhName: '跟随预设黑丝带',
+    note: '保留当前所选发型自带的黑色蝴蝶结',
+    tags: '',
+  },
+  {
+    id: 'acc-none',
+    zhName: '无发饰 · 纯净',
+    note: '移除蝴蝶结发饰，纯展示发型轮廓',
+    tags: '',
+  },
+  {
+    id: 'acc-red-ribbon',
+    zhName: '甜美红蝴蝶结',
+    note: '将黑丝带替换为红色蝴蝶结，搭校服/洛丽塔更出彩',
+    tags: '(red hair bow:1.4), (red ribbon:1.3)',
+  },
+  {
+    id: 'acc-white-lace',
+    zhName: '纯白蕾丝蝴蝶结',
+    note: '将黑丝带替换为白蕾丝蝴蝶结，适合浅色裙装',
+    tags: '(white hair bow:1.4), (lace-trimmed bow:1.2)',
+  },
+  {
+    id: 'acc-pearl-clips',
+    zhName: '珍珠侧发卡',
+    note: '将蝴蝶结替换为精致珍珠小发卡',
+    tags: '(hairclip:1.4), (pearl hair ornament:1.3)',
+  },
+];
+
 export const DEFAULT_NEGATIVE_GROUPS: NegativeGroup[] = [
   {
     id: 'anti-split',
@@ -1271,6 +1455,7 @@ export const DEFAULT_NEGATIVE_GROUPS: NegativeGroup[] = [
 ];
 
 export const DEFAULT_STUDIO_CONFIG: StudioConfig = {
+  appearanceCleanedVersion: 1,
   comfyUrl: 'http://127.0.0.1:8188',
   comfyUnetName: 'anima-base-v1.0.safetensors',
   comfyClipName: 'qwen_3_06b_base.safetensors',
@@ -1316,8 +1501,9 @@ export const DEFAULT_STUDIO_CONFIG: StudioConfig = {
     {
       id: 'char-lan',
       name: '蓝 (Lan)',
+      hairstyleId: 'default-lan',
       appearance: {
-        text: 'black hair, very long hair, low twintails, black hair ribbon, blunt bangs, hair between eyes, yellow eyes, tareme, gentle smile, pale skin, looking at viewer',
+        text: 'black hair, very long hair, low twintails, black hair ribbon, blunt bangs, hair between eyes, yellow eyes, tareme, pale skin',
         weight: 1.0,
       },
       outfit: {
@@ -1338,8 +1524,11 @@ export const DEFAULT_STUDIO_CONFIG: StudioConfig = {
     {
       id: 'char-yi',
       name: '伊 (Yi · Ibuki)',
+      hairstyleId: 'hair-side-ponytail',
+      hairBangsId: 'bangs-default',
+      hairAccessoryId: 'acc-preset-bow',
       appearance: {
-        text: '(pointed ears:1.3), (small demon horns:1.3), (golden spiked halo:1.4), (black bat wings:1.3), (heart shaped demon tail:1.3), (blonde hair:1.3), (side ponytail:1.7), (ponytail on side:1.5), (swept bangs:1.3), loose hair strands framing face, (black bow:1.5), (hair bow on the side:1.3), yellow eyes, long eyelashes, big eyes, (fair skin:1.1), (blush:1.1)',
+        text: '(pointed ears:1.3), (small demon horns:1.3), (golden spiked halo:1.4), (black bat wings:1.3), (heart shaped demon tail:1.3), (blonde hair:1.3), (side ponytail:1.7), (ponytail on side:1.5), (swept bangs:1.3), loose hair strands framing face, (black bow:1.5), (hair bow on the side:1.3), yellow eyes, long eyelashes, (fair skin:1.1)',
         weight: 1.0,
       },
       outfit: {
@@ -1360,8 +1549,9 @@ export const DEFAULT_STUDIO_CONFIG: StudioConfig = {
     {
       id: 'char-mari',
       name: 'Mari (Blue Archive)',
+      hairstyleId: 'default-mari',
       appearance: {
-        text: '(mari (blue archive):1.8), (orange hair:1.5), (very long low twintails:1.5), tied low at the nape, one thick ponytail draped over shoulder reaching waist, the other flowing behind, thick side-swept bangs, soft face-framing sidelocks, loose wavy ends, blue eyes, fluffy cat ears, golden halo, looking at viewer',
+        text: '(mari (blue archive):1.8), (orange hair:1.5), (very long low twintails:1.5), tied low at the nape, one thick ponytail draped over shoulder reaching waist, the other flowing behind, thick side-swept bangs, soft face-framing sidelocks, loose wavy ends, blue eyes, fluffy cat ears, golden halo',
         weight: 1.0,
       },
       outfit: {
@@ -1382,8 +1572,9 @@ export const DEFAULT_STUDIO_CONFIG: StudioConfig = {
     {
       id: 'char-hoshino',
       name: 'Hoshino (Blue Archive)',
+      hairstyleId: 'default-hoshino',
       appearance: {
-        text: '(hoshino (blue archive):1.8), (pink hair:1.6), (long hair:1.3), (bangs:1.2), (heterochromia:1.5), (blue eyes:1.2), (yellow eyes:1.2), (golden halo:1.5), (halo:1.4), looking at viewer',
+        text: '(hoshino (blue archive):1.8), (pink hair:1.6), (long hair:1.3), (bangs:1.2), (heterochromia:1.5), (blue eyes:1.2), (yellow eyes:1.2), (golden halo:1.5), (halo:1.4)',
         weight: 1.0,
       },
       outfit: {
