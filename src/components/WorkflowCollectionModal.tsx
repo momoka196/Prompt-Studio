@@ -23,6 +23,7 @@ import {
   Minus,
   Play,
   Plus,
+  RefreshCw,
   RotateCcw,
   Save,
   Search,
@@ -46,20 +47,28 @@ import {
 import { sanitizeFilenamePrefix } from '../utils/promptBuilder';
 import {
   buildCardExportPayloadAsync,
+  buildCardFolderPathSegments,
   buildWorkflowCardFromPngFile,
+  computeBlobContentHash,
+  computeCardContentFingerprint,
+  dedupeAndMergeIncomingCards,
   ensureDirectoryWritePermission,
   extractComfyMetadataFromPngFile,
+  findDuplicateCardForSingleDraft,
+  FolderSyncIndexEntry,
+  IncomingCardWithBlob,
   isFileSystemAccessSupported,
   isInRestrictedIframe,
+  loadFolderSyncIndexSnapshot,
   parseComfyWorkflowSource,
   parsePromptToTagItems,
   pickLocalWorkflowDirectory,
   readImageDimensions,
   resolveCardImageBlob,
+  scanLocalDirectoryAndMerge,
   sendWorkflowCardToComfyUI,
   serializeTagItemsToPrompt,
-  writeCardsBatchToLocalDirectory,
-  writeCardToLocalDirectory,
+  syncCardsIncrementalToLocalDirectory,
 } from '../utils/workflowLibrary';
 import {
   clearCardImageCache,
@@ -73,13 +82,10 @@ import {
   encodeBlobToDataUrl,
   isIndexedDbSupported,
   loadBoundDirectoryHandle,
-  mergeImportedWorkflowCards,
   migrateCardInlineImagesToIdb,
   normalizeWorkflowCards,
   saveBoundDirectoryHandle,
   saveCardImageBlob,
-  saveCardImageBlobsBatch,
-  StoredCardImageRecord,
 } from '../utils/storageCache';
 
 interface WorkflowCollectionModalProps {
@@ -103,6 +109,7 @@ interface DraftImportState {
   originalImageWidth?: number;
   originalImageHeight?: number;
   imageByteSize?: number;
+  imageContentHash?: string;
   imageFile?: File | null;
   previewObjectUrl?: string;
   imageName: string;
@@ -139,6 +146,7 @@ const EMPTY_DRAFT: DraftImportState = {
   originalImageWidth: undefined,
   originalImageHeight: undefined,
   imageByteSize: undefined,
+  imageContentHash: undefined,
   imageFile: null,
   previewObjectUrl: undefined,
   imageName: '',
@@ -355,6 +363,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   const inRestrictedIframe = useMemo(() => isInRestrictedIframe(), []);
   const [boundDirHandle, setBoundDirHandle] = useState<FileSystemDirectoryHandle | null>(null);
   const [dirPermState, setDirPermState] = useState<'none' | 'granted' | 'prompt' | 'denied'>('none');
+  const [folderIndexMap, setFolderIndexMap] = useState<Record<string, FolderSyncIndexEntry> | null>(null);
   const [folderNotice, setFolderNotice] = useState<{
     type: 'ok' | 'warn' | 'err';
     text: string;
@@ -364,6 +373,12 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     done: number;
     total: number;
     currentTitle: string;
+    actionLabel?: string;
+  } | null>(null);
+  const [isScanningFolder, setIsScanningFolder] = useState(false);
+  const [scanProgress, setScanProgress] = useState<{
+    scanned: number;
+    currentPath: string;
   } | null>(null);
   const [isExportingJson, setIsExportingJson] = useState(false);
 
@@ -429,6 +444,12 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       if (cancelled) return;
       setBoundDirHandle(savedHandle);
       setDirPermState(perm);
+      if (perm === 'granted') {
+        const snapshot = await loadFolderSyncIndexSnapshot(savedHandle);
+        if (!cancelled) {
+          setFolderIndexMap(snapshot);
+        }
+      }
     })();
     return () => {
       cancelled = true;
@@ -441,6 +462,20 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     () => (privateView ? privateCards : publicCards),
     [privateView, privateCards, publicCards]
   );
+
+  const pendingSyncCount = useMemo(() => {
+    if (!boundDirHandle || !folderIndexMap) return scopedCards.length;
+    let count = 0;
+    for (const card of scopedCards) {
+      const entry = folderIndexMap[card.id];
+      const targetPath = buildCardFolderPathSegments(card).join('/');
+      const fp = card.contentFingerprint || computeCardContentFingerprint(card);
+      if (!entry || entry.relativePath !== targetPath || entry.contentFingerprint !== fp) {
+        count += 1;
+      }
+    }
+    return count;
+  }, [boundDirHandle, folderIndexMap, scopedCards]);
 
   const untaggedCount = useMemo(
     () => scopedCards.filter((c) => c.tags.length === 0).length,
@@ -596,6 +631,60 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     [onChangeCards]
   );
 
+  const handleScanLocalFolder = useCallback(
+    async (
+      dirHandle: FileSystemDirectoryHandle,
+      options?: { silentIfEmpty?: boolean }
+    ) => {
+      setIsScanningFolder(true);
+      setScanProgress({ scanned: 0, currentPath: dirHandle.name });
+      try {
+        const res = await scanLocalDirectoryAndMerge(dirHandle, cardsRef.current, {
+          onProgress: (scanned, currentPath) => {
+            setScanProgress({ scanned, currentPath });
+          },
+        });
+        setFolderIndexMap(res.indexEntries);
+        if (res.addedCards.length > 0 || res.updatedCards.length > 0 || res.restoredImageBlobsCount > 0) {
+          commitCards(res.mergedCards);
+        }
+
+        if (res.discoveredCardsCount === 0) {
+          if (!options?.silentIfEmpty) {
+            setFolderNotice({
+              type: 'ok',
+              text: `已绑定本地文件夹「${dirHandle.name}」：目录中暂未发现已有卡片（.card.json），可点击右侧「增量同步」将当前工作台卡片写入本地`,
+            });
+          }
+          return res;
+        }
+
+        const extraRestoreNote =
+          res.restoredImageBlobsCount > 0
+            ? `（含补齐原图 ${res.restoredImageBlobsCount} 张）`
+            : '';
+        setFolderNotice({
+          type: 'ok',
+          text: `已从「${dirHandle.name}」扫描 ${res.discoveredCardsCount} 张卡片：新增 ${res.addedCards.length} 张、更新 ${res.updatedCards.length} 张${extraRestoreNote}、跳过重复/未变更 ${res.skippedDuplicates.length} 张`,
+        });
+        return res;
+      } catch (err) {
+        setFolderNotice({
+          type: 'warn',
+          text:
+            err instanceof Error
+              ? `扫描本地文件夹失败：${err.message}`
+              : '扫描本地文件夹失败，请检查目录读写权限',
+        });
+        return null;
+      } finally {
+        setIsScanningFolder(false);
+        setScanProgress(null);
+      }
+    },
+    [commitCards]
+  );
+
   const handleSelectLocalFolder = async () => {
     const result = await pickLocalWorkflowDirectory();
     if (!result.ok) {
@@ -613,14 +702,11 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     await saveBoundDirectoryHandle(result.handle);
 
     if (perm === 'granted') {
-      setFolderNotice({
-        type: 'ok',
-        text: `已绑定本地文件夹「${result.handle.name}」：后续建卡、微调保存与批量导入将自动把未压缩原图与工作流 JSON 落盘写入对应子文件夹`,
-      });
+      await handleScanLocalFolder(result.handle);
     } else {
       setFolderNotice({
         type: 'warn',
-        text: `已选择文件夹「${result.handle.name}」，但暂未获得写入权限；请点击「授权写入」或降级使用导出下载`,
+        text: `已选择文件夹「${result.handle.name}」，但暂未获得读写权限；请点击「授权写入」或降级使用导出下载`,
       });
     }
   };
@@ -628,6 +714,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   const handleUnbindLocalFolder = async () => {
     setBoundDirHandle(null);
     setDirPermState('none');
+    setFolderIndexMap(null);
     await saveBoundDirectoryHandle(null);
     setFolderNotice({
       type: 'ok',
@@ -640,10 +727,13 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     const perm = await ensureDirectoryWritePermission(boundDirHandle, true);
     setDirPermState(perm);
     if (perm === 'granted') {
-      setFolderNotice({
-        type: 'ok',
-        text: `已重新授权本地文件夹「${boundDirHandle.name}」写入权限`,
-      });
+      const scanRes = await handleScanLocalFolder(boundDirHandle, { silentIfEmpty: true });
+      if (!scanRes || scanRes.discoveredCardsCount === 0) {
+        setFolderNotice({
+          type: 'ok',
+          text: `已重新授权本地文件夹「${boundDirHandle.name}」读写权限`,
+        });
+      }
     } else {
       setFolderNotice({
         type: 'warn',
@@ -656,15 +746,41 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     async (
       card: WorkflowCollectionCard,
       overrideBlob?: Blob | null
-    ): Promise<{ written: boolean; path?: string; error?: string }> => {
+    ): Promise<{
+      written: boolean;
+      skippedUnchanged?: boolean;
+      path?: string;
+      updatedCard?: WorkflowCollectionCard;
+      error?: string;
+    }> => {
       if (!boundDirHandle || dirPermState !== 'granted') {
         return { written: false };
       }
-      const res = await writeCardToLocalDirectory(boundDirHandle, card, overrideBlob);
-      if (res.ok) {
-        return { written: true, path: res.relativePath };
+      const blobsByCardId = new Map<string, Blob>();
+      if (overrideBlob) {
+        blobsByCardId.set(card.id, overrideBlob);
       }
-      return { written: false, error: res.error };
+      const res = await syncCardsIncrementalToLocalDirectory(boundDirHandle, [card], {
+        blobsByCardId: blobsByCardId.size > 0 ? blobsByCardId : undefined,
+      });
+      setFolderIndexMap(res.indexEntries);
+      if (res.failed.length > 0) {
+        return { written: false, error: res.failed[0].error };
+      }
+      const syncedCard = res.updatedCardsById.get(card.id);
+      if (res.skippedCount > 0 && res.addedCount === 0 && res.updatedCount === 0) {
+        return {
+          written: false,
+          skippedUnchanged: true,
+          path: buildCardFolderPathSegments(card).join('/'),
+          updatedCard: syncedCard,
+        };
+      }
+      return {
+        written: true,
+        path: buildCardFolderPathSegments(card).join('/'),
+        updatedCard: syncedCard,
+      };
     },
     [boundDirHandle, dirPermState]
   );
@@ -693,35 +809,41 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     }
 
     setIsSyncingFolder(true);
-    setSyncProgress({ done: 0, total: targetCards.length, currentTitle: targetCards[0]?.title ?? '' });
+    setSyncProgress({
+      done: 0,
+      total: targetCards.length,
+      currentTitle: targetCards[0]?.title ?? '',
+      actionLabel: '比对差异',
+    });
     try {
-      const { succeededIds, failed } = await writeCardsBatchToLocalDirectory(
-        boundDirHandle,
-        targetCards,
-        {
-          onProgress: (done, total, currentTitle) => {
-            setSyncProgress({ done, total, currentTitle });
-          },
-        }
-      );
-      if (succeededIds.length > 0) {
-        const now = Date.now();
-        const okSet = new Set(succeededIds);
+      const res = await syncCardsIncrementalToLocalDirectory(boundDirHandle, targetCards, {
+        onProgress: (done, total, currentTitle, actionLabel) => {
+          setSyncProgress({ done, total, currentTitle, actionLabel });
+        },
+      });
+      setFolderIndexMap(res.indexEntries);
+      if (res.updatedCardsById.size > 0) {
         commitCards(
-          cardsRef.current.map((c) =>
-            okSet.has(c.id) ? { ...c, lastFolderSyncAt: now } : c
-          )
+          cardsRef.current.map((c) => res.updatedCardsById.get(c.id) ?? c)
         );
       }
-      if (failed.length === 0) {
-        setFolderNotice({
-          type: 'ok',
-          text: `已将 ${succeededIds.length} 张卡片（含未压缩原图 + workflow.json + card.json）同步写入本地文件夹「${boundDirHandle.name}」`,
-        });
+
+      if (res.failed.length === 0) {
+        if (res.addedCount === 0 && res.updatedCount === 0) {
+          setFolderNotice({
+            type: 'ok',
+            text: `「${boundDirHandle.name}」已是最新，无需重写（跳过未变更 ${res.skippedCount} 张）`,
+          });
+        } else {
+          setFolderNotice({
+            type: 'ok',
+            text: `增量同步完成（${boundDirHandle.name}）：新增 ${res.addedCount} 张、更新 ${res.updatedCount} 张、跳过未变更 ${res.skippedCount} 张`,
+          });
+        }
       } else {
         setFolderNotice({
           type: 'warn',
-          text: `已同步 ${succeededIds.length} 张，${failed.length} 张写入失败（${failed[0]?.title}: ${failed[0]?.error}）`,
+          text: `增量同步部分完成：新增 ${res.addedCount} 张、更新 ${res.updatedCount} 张、跳过 ${res.skippedCount} 张，${res.failed.length} 张写入失败（${res.failed[0]?.title}: ${res.failed[0]?.error}）`,
         });
       }
     } finally {
@@ -744,21 +866,30 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       });
       return;
     }
-    const res = await writeCardToLocalDirectory(boundDirHandle, card);
-    if (res.ok) {
+    const res = await syncCardsIncrementalToLocalDirectory(boundDirHandle, [card]);
+    setFolderIndexMap(res.indexEntries);
+    if (res.failed.length > 0) {
+      setFolderNotice({
+        type: 'err',
+        text: `写入「${card.title}」失败：${res.failed[0].error}`,
+      });
+      return;
+    }
+    const updatedCard = res.updatedCardsById.get(card.id);
+    if (updatedCard) {
       commitCards(
-        cardsRef.current.map((c) =>
-          c.id === card.id ? { ...c, lastFolderSyncAt: Date.now() } : c
-        )
+        cardsRef.current.map((c) => (c.id === card.id ? updatedCard : c))
       );
+    }
+    if (res.skippedCount > 0 && res.addedCount === 0 && res.updatedCount === 0) {
       setFolderNotice({
         type: 'ok',
-        text: `已将「${card.title}」原图与工作流写入「${boundDirHandle.name}/${res.relativePath}」`,
+        text: `「${card.title}」与本地文件夹内容一致，已是最新无需重写`,
       });
     } else {
       setFolderNotice({
-        type: 'err',
-        text: `写入「${card.title}」失败：${res.error}`,
+        type: 'ok',
+        text: `已将「${card.title}」增量写入「${boundDirHandle.name}/${buildCardFolderPathSegments(card).join('/')}」`,
       });
     }
   };
@@ -795,6 +926,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     }
 
     let imageDims: { width?: number; height?: number } = {};
+    let imageContentHash: string | undefined;
     let previewObjectUrl: string | undefined;
     let inlineDataUrlFallback: string | undefined;
     let pngMeta: Awaited<ReturnType<typeof extractComfyMetadataFromPngFile>> | null = null;
@@ -802,6 +934,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     if (nextImageFile) {
       try {
         imageDims = await readImageDimensions(nextImageFile);
+        imageContentHash = await computeBlobContentHash(nextImageFile);
         previewObjectUrl = URL.createObjectURL(nextImageFile);
         if (!isIndexedDbSupported()) {
           inlineDataUrlFallback = await encodeBlobToDataUrl(nextImageFile);
@@ -846,6 +979,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         updated.originalImageWidth = imageDims.width;
         updated.originalImageHeight = imageDims.height;
         updated.imageByteSize = nextImageFile.size;
+        updated.imageContentHash = imageContentHash;
         updated.imageName = nextImageFile.name;
         if (!updated.title.trim()) {
           const stem = stripFileExtension(nextImageFile.name);
@@ -922,14 +1056,36 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       });
       return;
     }
+
+    const dupExisting = await findDuplicateCardForSingleDraft(cardsRef.current, {
+      imageFile: draft.imageFile ?? null,
+      imageContentHash: draft.imageContentHash,
+      rawWorkflowJson: draft.rawWorkflowJson || '{}',
+      apiPromptJson: draft.apiPromptJson,
+      extractedPositive: draft.extractedPositive,
+      extractedNegative: draft.extractedNegative,
+    });
+    if (dupExisting) {
+      setImportNotice({
+        type: 'warn',
+        text: `跳过重复建卡：工作台已存在相同参考图与工作流的卡片「${dupExisting.title}」`,
+      });
+      return;
+    }
+
     const now = Date.now();
     const title =
       draft.title.trim() ||
       stripFileExtension(draft.imageName) ||
       stripFileExtension(draft.workflowFileName) ||
-      `工作流收藏 #${cards.length + 1}`;
+      `工作流收藏 #${cardsRef.current.length + 1}`;
     const tags = parseTagsInput(draft.tagsInput);
     const cardId = `wf-card-${now}-${Math.random().toString(36).slice(2, 6)}`;
+
+    let imageContentHash = draft.imageContentHash;
+    if (!imageContentHash && draft.imageFile) {
+      imageContentHash = await computeBlobContentHash(draft.imageFile);
+    }
 
     let storedInIdb = false;
     if (draft.imageFile && isIndexedDbSupported()) {
@@ -963,6 +1119,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       originalImageHeight: draft.originalImageHeight,
       hasOriginalImageBlob: Boolean(draft.imageFile || fallbackInlineDataUrl),
       imageByteSize: draft.imageByteSize ?? draft.imageFile?.size,
+      imageContentHash,
       autoImportedSource: 'manual',
       imageName: draft.imageName,
       workflowFileName: draft.workflowFileName || 'workflow.json',
@@ -982,10 +1139,11 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       createdAt: now,
       updatedAt: now,
     };
+    newCard.contentFingerprint = computeCardContentFingerprint(newCard);
 
     const folderRes = await tryAutoWriteCardToFolder(newCard, draft.imageFile ?? null);
-    if (folderRes.written) {
-      newCard = { ...newCard, lastFolderSyncAt: Date.now() };
+    if (folderRes.updatedCard) {
+      newCard = folderRes.updatedCard;
     } else if (folderRes.error) {
       setFolderNotice({
         type: 'warn',
@@ -1014,13 +1172,20 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   };
 
   const handleToggleCardPrivate = (cardId: string) => {
-    const target = cards.find((c) => c.id === cardId);
+    const target = cardsRef.current.find((c) => c.id === cardId);
     if (!target) return;
     const nextPrivate = !target.isPrivate;
     const res = commitCards(
-      cards.map((c) =>
-        c.id === cardId ? { ...c, isPrivate: nextPrivate, updatedAt: Date.now() } : c
-      )
+      cardsRef.current.map((c) => {
+        if (c.id !== cardId) return c;
+        const updated: WorkflowCollectionCard = {
+          ...c,
+          isPrivate: nextPrivate,
+          updatedAt: Date.now(),
+        };
+        updated.contentFingerprint = computeCardContentFingerprint(updated);
+        return updated;
+      })
     );
     if (res.ok) {
       if (editingCardId === cardId) {
@@ -1050,16 +1215,23 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     });
     invalidateCardImageCache([cardId]);
     void deleteCardImageBlobsBatch([cardId]);
-    commitCards(cards.filter((c) => c.id !== cardId));
+    commitCards(cardsRef.current.filter((c) => c.id !== cardId));
   };
 
   const handleBulkTogglePrivate = (makePrivate: boolean) => {
     if (selectedCardIds.size === 0) return;
     const now = Date.now();
     const res = commitCards(
-      cards.map((c) =>
-        selectedCardIds.has(c.id) ? { ...c, isPrivate: makePrivate, updatedAt: now } : c
-      )
+      cardsRef.current.map((c) => {
+        if (!selectedCardIds.has(c.id)) return c;
+        const updated: WorkflowCollectionCard = {
+          ...c,
+          isPrivate: makePrivate,
+          updatedAt: now,
+        };
+        updated.contentFingerprint = computeCardContentFingerprint(updated);
+        return updated;
+      })
     );
     if (res.ok) {
       setImportNotice({
@@ -1077,10 +1249,16 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     if (selectedCardIds.size === 0 || tagsToAdd.length === 0) return;
     const now = Date.now();
     const res = commitCards(
-      cards.map((c) => {
+      cardsRef.current.map((c) => {
         if (!selectedCardIds.has(c.id)) return c;
         const mergedTags = Array.from(new Set([...c.tags, ...tagsToAdd]));
-        return { ...c, tags: mergedTags, updatedAt: now };
+        const updated: WorkflowCollectionCard = {
+          ...c,
+          tags: mergedTags,
+          updatedAt: now,
+        };
+        updated.contentFingerprint = computeCardContentFingerprint(updated);
+        return updated;
       })
     );
     if (res.ok) {
@@ -1312,7 +1490,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
   const buildUpdatedEditingCard = (): WorkflowCollectionCard | null => {
     if (!editingCard) return null;
-    return {
+    const nextCard: WorkflowCollectionCard = {
       ...editingCard,
       title: editTitle.trim() || editingCard.title,
       tags: parseTagsInput(editTagsInput),
@@ -1326,22 +1504,24 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       fixedSeed: editSeedMode === 'fixed' ? editFixedSeed : editingCard.fixedSeed,
       updatedAt: Date.now(),
     };
+    nextCard.contentFingerprint = computeCardContentFingerprint(nextCard);
+    return nextCard;
   };
 
   const handleSaveToCurrentCard = async () => {
     const updated = buildUpdatedEditingCard();
     if (!updated) return;
     const folderRes = await tryAutoWriteCardToFolder(updated);
-    const finalCard = folderRes.written
-      ? { ...updated, lastFolderSyncAt: Date.now() }
-      : updated;
+    const finalCard = folderRes.updatedCard ?? updated;
     const res = commitCards(
       cardsRef.current.map((c) => (c.id === finalCard.id ? finalCard : c))
     );
     if (res.ok) {
       setSaveFeedback(
         folderRes.written
-          ? '已保存到当前卡片并同步写入本地文件夹'
+          ? '已保存到当前卡片并增量写入本地文件夹'
+          : folderRes.skippedUnchanged
+          ? '已保存到当前卡片（文件夹内容未变更，已跳过重写）'
           : '已保存到当前卡片'
       );
       window.setTimeout(() => setSaveFeedback(null), 2200);
@@ -1368,15 +1548,20 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       id: newId,
       title: newTitle,
       hasOriginalImageBlob: clonedHasBlob,
+      folderSyncedPath: undefined,
+      folderSyncedFingerprint: undefined,
+      folderSyncedImageHash: undefined,
       lastRunAt: undefined,
       lastPromptId: undefined,
       lastFolderSyncAt: undefined,
       createdAt: now,
       updatedAt: now,
     };
+    cloned.contentFingerprint = computeCardContentFingerprint(cloned);
+
     const folderRes = await tryAutoWriteCardToFolder(cloned);
-    if (folderRes.written) {
-      cloned = { ...cloned, lastFolderSyncAt: Date.now() };
+    if (folderRes.updatedCard) {
+      cloned = folderRes.updatedCard;
     }
     const res = commitCards([cloned, ...cardsRef.current]);
     if (res.ok) {
@@ -1464,11 +1649,9 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       currentFile: files[0]?.name ?? '',
     });
 
-    const importedJsonCards: WorkflowCollectionCard[] = [];
-    const importedPngCards: WorkflowCollectionCard[] = [];
-    const blobEntriesToSave: { cardId: string; record: StoredCardImageRecord }[] = [];
+    const incomingItems: IncomingCardWithBlob[] = [];
     const blobsByCardId = new Map<string, Blob>();
-    const skipped: { fileName: string; reason: string }[] = [];
+    const invalidSkipped: { fileName: string; reason: string }[] = [];
 
     try {
       for (let i = 0; i < files.length; i++) {
@@ -1477,8 +1660,8 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         setBatchProgress({
           processed: i,
           total: files.length,
-          succeeded: importedPngCards.length + importedJsonCards.length,
-          skipped: skipped.length,
+          succeeded: incomingItems.length,
+          skipped: invalidSkipped.length,
           currentFile: file.name,
         });
 
@@ -1499,7 +1682,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
               : null;
 
             if (!rawArr) {
-              skipped.push({
+              invalidSkipped.push({
                 fileName: file.name,
                 reason: '未找到有效的收藏卡片列表（需包含 cards 数组）',
               });
@@ -1508,16 +1691,20 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
             const normalized = normalizeWorkflowCards(rawArr);
             if (normalized.length === 0) {
-              skipped.push({
+              invalidSkipped.push({
                 fileName: file.name,
                 reason: '卡片数据结构无效或为空',
               });
               continue;
             }
-            const { cards: lightCards } = await migrateCardInlineImagesToIdb(normalized);
-            importedJsonCards.push(...lightCards);
+            for (const c of normalized) {
+              incomingItems.push({
+                card: c,
+                sourceLabel: `${file.name} · ${c.title}`,
+              });
+            }
           } catch {
-            skipped.push({
+            invalidSkipped.push({
               fileName: file.name,
               reason: '无法解析收藏集 JSON 文件',
             });
@@ -1529,27 +1716,21 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
             indexSeed: i,
           });
           if (pngResult.ok) {
-            importedPngCards.push(pngResult.card);
             blobsByCardId.set(pngResult.card.id, pngResult.imageBlob);
-            blobEntriesToSave.push({
-              cardId: pngResult.card.id,
-              record: {
-                blob: pngResult.imageBlob,
-                mimeType: pngResult.mimeType,
-                width: pngResult.card.originalImageWidth,
-                height: pngResult.card.originalImageHeight,
-                byteSize: pngResult.imageBlob.size,
-                updatedAt: pngResult.card.updatedAt,
-              },
+            incomingItems.push({
+              card: pngResult.card,
+              imageBlob: pngResult.imageBlob,
+              mimeType: pngResult.mimeType,
+              sourceLabel: file.name,
             });
           } else {
-            skipped.push({
+            invalidSkipped.push({
               fileName: pngResult.fileName,
               reason: pngResult.reason,
             });
           }
         } else {
-          skipped.push({
+          invalidSkipped.push({
             fileName: file.name,
             reason: '仅支持收藏集 .json 或内嵌 ComfyUI 参数的 .png 图片',
           });
@@ -1560,93 +1741,85 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         }
       }
 
-      if (blobEntriesToSave.length > 0 && isIndexedDbSupported()) {
-        await saveCardImageBlobsBatch(blobEntriesToSave);
-      }
+      const mergeRes = await dedupeAndMergeIncomingCards(
+        cardsRef.current,
+        incomingItems,
+        { preferIncomingOnSameIdUpdate: true }
+      );
 
-      const allImported = [...importedPngCards, ...importedJsonCards];
-      setSkippedDetails(skipped);
+      const allSkippedDetails = [
+        ...mergeRes.skippedDuplicates.map((d) => ({
+          fileName: d.fileName,
+          reason: d.reason,
+        })),
+        ...invalidSkipped,
+      ];
+      setSkippedDetails(allSkippedDetails);
 
-      if (allImported.length > 0) {
-        const merged = mergeImportedWorkflowCards(cardsRef.current, allImported);
-        const importedCount = allImported.length;
-        const newlyAddedCards = merged.slice(0, importedCount);
+      const changedCards = [...mergeRes.addedCards, ...mergeRes.updatedCards];
+      let finalCards = mergeRes.mergedCards;
+      let folderSyncSummary = '';
 
-        let cardsAfterSync = merged;
-        let folderSyncedCount = 0;
+      if (changedCards.length > 0) {
         if (boundDirHandle && dirPermState === 'granted') {
-          const { succeededIds } = await writeCardsBatchToLocalDirectory(
+          const syncRes = await syncCardsIncrementalToLocalDirectory(
             boundDirHandle,
-            newlyAddedCards,
+            changedCards,
             {
               blobsByCardId,
-              onProgress: (done, total, currentTitle) => {
-                setSyncProgress({ done, total, currentTitle });
+              onProgress: (done, total, currentTitle, actionLabel) => {
+                setSyncProgress({ done, total, currentTitle, actionLabel });
               },
             }
           );
           setSyncProgress(null);
-          if (succeededIds.length > 0) {
-            folderSyncedCount = succeededIds.length;
-            const okSet = new Set(succeededIds);
-            const syncTime = Date.now();
-            cardsAfterSync = merged.map((c) =>
-              okSet.has(c.id) ? { ...c, lastFolderSyncAt: syncTime } : c
-            );
+          setFolderIndexMap(syncRes.indexEntries);
+          if (syncRes.updatedCardsById.size > 0) {
+            finalCards = finalCards.map((c) => syncRes.updatedCardsById.get(c.id) ?? c);
+          }
+          if (syncRes.addedCount > 0 || syncRes.updatedCount > 0) {
+            folderSyncSummary = `，已增量写入「${boundDirHandle.name}」（新增 ${syncRes.addedCount} / 更新 ${syncRes.updatedCount}）`;
           }
         }
 
-        const res = commitCards(cardsAfterSync);
+        const res = commitCards(finalCards);
         if (res.ok) {
-          const parts: string[] = [];
-          if (importedPngCards.length > 0 && importedJsonCards.length > 0) {
-            parts.push(
-              `已导入 ${allImported.length} 张卡片（PNG ${importedPngCards.length} 张 + JSON ${importedJsonCards.length} 张）`
-            );
-          } else if (importedPngCards.length > 0) {
-            parts.push(
-              `已从 ${importedPngCards.length} 张 PNG 自动提取工作流并生成收藏卡片（保留原图不压缩，已自动生成默认标题与基础标签）`
-            );
-          } else {
-            parts.push(`已导入 ${importedJsonCards.length} 张工作流收藏卡片`);
-          }
-
-          if (folderSyncedCount > 0 && boundDirHandle) {
-            parts.push(`，已同步写入「${boundDirHandle.name}」`);
-          }
-
-          const importedPrivateCount = allImported.filter((c) =>
+          const dupSkippedCount = mergeRes.skippedDuplicates.length;
+          const invalidCount = invalidSkipped.length;
+          const statsText = `导入完成：新增 ${mergeRes.addedCards.length} 张、更新 ${mergeRes.updatedCards.length} 张、跳过重复 ${dupSkippedCount} 张${
+            invalidCount > 0 ? `（另有 ${invalidCount} 个无效/无参数文件被跳过）` : ''
+          }`;
+          const importedPrivateCount = changedCards.filter((c) =>
             Boolean(c.isPrivate)
           ).length;
-          if (importedPrivateCount > 0 && !privateView) {
-            parts.push(
-              `（其中 ${importedPrivateCount} 张为私密卡片，已自动归入「私密」区）`
-            );
-          }
-
-          if (skipped.length > 0) {
-            const previewSkip = skipped
-              .slice(0, 3)
-              .map((s) => `${s.fileName}（${s.reason}）`)
-              .join('、');
-            const moreSuffix = skipped.length > 3 ? ` 等共 ${skipped.length} 个文件` : '';
-            setImportNotice({
-              type: 'warn',
-              text: `${parts.join('')}；已跳过 ${skipped.length} 个文件：${previewSkip}${moreSuffix}`,
-            });
-          } else {
-            setImportNotice({
-              type: 'ok',
-              text: parts.join(''),
-            });
-          }
+          const privateSuffix =
+            importedPrivateCount > 0 && !privateView
+              ? `；其中 ${importedPrivateCount} 张为私密卡片已归入「私密」区`
+              : '';
+          setImportNotice({
+            type: allSkippedDetails.length > 0 ? 'warn' : 'ok',
+            text: `${statsText}${folderSyncSummary}${privateSuffix}`,
+          });
         }
+      } else if (mergeRes.skippedDuplicates.length > 0) {
+        // 即使没有新增/更新，若后台补齐了旧卡片 hash 也可安全同步索引
+        if (mergeRes.mergedCards !== cardsRef.current) {
+          commitCards(mergeRes.mergedCards);
+        }
+        const invalidCount = invalidSkipped.length;
+        setImportNotice({
+          type: 'warn',
+          text: `未产生重复入库：新增 0 张、更新 0 张、跳过重复/已存在 ${mergeRes.skippedDuplicates.length} 张${
+            invalidCount > 0 ? `（另有 ${invalidCount} 个文件无可用参数被跳过）` : ''
+          }`,
+        });
       } else {
-        const previewSkip = skipped
+        const previewSkip = invalidSkipped
           .slice(0, 3)
           .map((s) => `${s.fileName}（${s.reason}）`)
           .join('、');
-        const moreSuffix = skipped.length > 3 ? ` 等共 ${skipped.length} 个文件` : '';
+        const moreSuffix =
+          invalidSkipped.length > 3 ? ` 等共 ${invalidSkipped.length} 个文件` : '';
         setImportNotice({
           type: 'err',
           text: previewSkip
@@ -1896,16 +2069,18 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                     <span>
                       已绑定本地文件夹 <strong className="font-semibold">「{boundDirHandle.name}」</strong>
                       {dirPermState === 'granted'
-                        ? '（读写已授权 · 建卡/微调/批量导入自动写入未压缩原图 + .workflow.json + .card.json）'
-                        : '（页面刷新后需点击右侧「授权写入」恢复磁盘写入权限）'}
+                        ? pendingSyncCount > 0
+                          ? `（读写已授权 · 待增量同步 ${pendingSyncCount} 张）`
+                          : '（读写已授权 · 当前视图已是最新）'
+                        : '（页面刷新后需点击右侧「授权写入」恢复读写与扫描权限）'}
                     </span>
                   ) : inRestrictedIframe ? (
                     <span>
-                      当前处于受限预览 iframe 沙箱：若浏览器拦截本地文件夹授权，将自动降级为 IndexedDB 原图缓存 +「导出集 / 单卡下载」（拉取到本地 <code className="font-mono text-[11px] bg-[#F2F3F7] px-1 rounded">npm run dev</code> 独立窗口打开即可直写本地文件夹）。
+                      当前处于受限预览 iframe 沙箱：若浏览器拦截本地文件夹授权，将自动降级为 IndexedDB 原图缓存 +「导出集 / 单卡下载」（拉取到本地 <code className="font-mono text-[11px] bg-[#F2F3F7] px-1 rounded">npm run dev</code> 独立窗口打开即可直写与读取本地文件夹）。
                     </span>
                   ) : (
                     <span>
-                      当前浏览器环境暂不支持直接写入本地磁盘文件夹，已自动使用 IndexedDB 浏览器存储保留原图并支持「导出集 / 单卡下载」。
+                      当前浏览器环境暂不支持直接读写本地磁盘文件夹，已自动使用 IndexedDB 浏览器存储保留原图并支持「导出集 / 单卡下载」。
                     </span>
                   )}
                 </div>
@@ -1924,8 +2099,40 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                 {boundDirHandle && (
                   <button
                     type="button"
-                    disabled={isSyncingFolder || scopedCards.length === 0}
+                    disabled={isScanningFolder || isSyncingFolder}
+                    onClick={async () => {
+                      const perm = await ensureDirectoryWritePermission(boundDirHandle, true);
+                      setDirPermState(perm);
+                      if (perm === 'granted') {
+                        await handleScanLocalFolder(boundDirHandle);
+                      } else {
+                        setFolderNotice({
+                          type: 'warn',
+                          text: `未获得「${boundDirHandle.name}」读取权限，请先授权`,
+                        });
+                      }
+                    }}
+                    title="递归扫描本地文件夹（含 _私密区）恢复缺失卡片与无损原图，自动跳过已存在卡片"
+                    className="h-7 px-2.5 inline-flex items-center gap-1 rounded-[8px] border border-[#DDD8FA] bg-white text-[11.5px] font-medium text-[#6B48F5] hover:bg-[#F4F2FF] disabled:opacity-45 cursor-pointer whitespace-nowrap"
+                  >
+                    {isScanningFolder ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <RefreshCw className="w-3.5 h-3.5" />
+                    )}
+                    <span>
+                      {isScanningFolder && scanProgress
+                        ? `扫描 ${scanProgress.scanned}`
+                        : '从文件夹读取'}
+                    </span>
+                  </button>
+                )}
+                {boundDirHandle && (
+                  <button
+                    type="button"
+                    disabled={isSyncingFolder || isScanningFolder || scopedCards.length === 0}
                     onClick={() => void handleSyncScopedCardsToFolder()}
+                    title="仅写入新增或修改过的卡片，未变更卡片及未改动原图自动跳过"
                     className="h-7 px-2.5 inline-flex items-center gap-1 rounded-[8px] border border-emerald-300 bg-white text-[11.5px] font-medium text-emerald-800 hover:bg-emerald-50 disabled:opacity-45 cursor-pointer whitespace-nowrap"
                   >
                     {isSyncingFolder ? (
@@ -1935,8 +2142,10 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                     )}
                     <span>
                       {isSyncingFolder && syncProgress
-                        ? `写入中 ${syncProgress.done}/${syncProgress.total}`
-                        : `同步${privateView ? '私密' : '公开'}卡片 (${scopedCards.length})`}
+                        ? `${syncProgress.actionLabel || '同步中'} ${syncProgress.done}/${syncProgress.total}`
+                        : pendingSyncCount > 0
+                        ? `增量同步 (${pendingSyncCount}/${scopedCards.length})`
+                        : `增量同步 (已最新)`}
                     </span>
                   </button>
                 )}
@@ -1960,6 +2169,42 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                   </button>
                 )}
               </div>
+            </div>
+          )}
+
+          {/* 文件夹扫描/增量同步进度条 */}
+          {(scanProgress || syncProgress) && (
+            <div className="rounded-[12px] border border-emerald-200 bg-emerald-50/80 px-4 py-2 text-[12px] text-emerald-900 space-y-1.5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <Loader2 className="w-4 h-4 animate-spin shrink-0 text-emerald-600" />
+                  <span className="font-medium truncate">
+                    {scanProgress
+                      ? `正在扫描本地目录并去重恢复：${scanProgress.currentPath}`
+                      : `正在增量同步（${syncProgress!.actionLabel || '检查'}）：${
+                          syncProgress!.currentTitle || '更新目录索引'
+                        }`}
+                  </span>
+                </div>
+                <span className="font-mono text-[11px] tabular-nums shrink-0">
+                  {scanProgress
+                    ? `已扫描 ${scanProgress.scanned} 项`
+                    : `${syncProgress!.done} / ${syncProgress!.total}`}
+                </span>
+              </div>
+              {syncProgress && syncProgress.total > 0 && (
+                <div className="h-1.5 rounded-full bg-white overflow-hidden">
+                  <div
+                    className="h-full bg-emerald-500 transition-all duration-150"
+                    style={{
+                      width: `${Math.min(
+                        100,
+                        Math.round((syncProgress.done / Math.max(1, syncProgress.total)) * 100)
+                      )}%`,
+                    }}
+                  />
+                </div>
+              )}
             </div>
           )}
 

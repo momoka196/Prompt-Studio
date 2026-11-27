@@ -272,6 +272,11 @@ export interface WorkflowCollectionCard {
   isPrivate?: boolean;
   seedMode?: 'workflow' | 'fixed' | 'random';
   fixedSeed?: number;
+  imageContentHash?: string;
+  contentFingerprint?: string;
+  folderSyncedPath?: string;
+  folderSyncedFingerprint?: string;
+  folderSyncedImageHash?: string;
   lastRunAt?: number;
   lastPromptId?: string;
   lastFolderSyncAt?: number;

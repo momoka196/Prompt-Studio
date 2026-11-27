@@ -281,6 +281,26 @@ export function normalizeWorkflowCards(raw: unknown): WorkflowCollectionCard[] {
         typeof rec.fixedSeed === 'number' && Number.isFinite(rec.fixedSeed) && rec.fixedSeed >= 0
           ? Math.floor(rec.fixedSeed)
           : undefined,
+      imageContentHash:
+        typeof rec.imageContentHash === 'string' && rec.imageContentHash
+          ? rec.imageContentHash
+          : undefined,
+      contentFingerprint:
+        typeof rec.contentFingerprint === 'string' && rec.contentFingerprint
+          ? rec.contentFingerprint
+          : undefined,
+      folderSyncedPath:
+        typeof rec.folderSyncedPath === 'string' && rec.folderSyncedPath
+          ? rec.folderSyncedPath
+          : undefined,
+      folderSyncedFingerprint:
+        typeof rec.folderSyncedFingerprint === 'string' && rec.folderSyncedFingerprint
+          ? rec.folderSyncedFingerprint
+          : undefined,
+      folderSyncedImageHash:
+        typeof rec.folderSyncedImageHash === 'string' && rec.folderSyncedImageHash
+          ? rec.folderSyncedImageHash
+          : undefined,
       lastRunAt: typeof rec.lastRunAt === 'number' ? rec.lastRunAt : undefined,
       lastPromptId:
         typeof rec.lastPromptId === 'string' ? rec.lastPromptId : undefined,
@@ -459,6 +479,27 @@ export async function loadCardImageBlob(
       req.onerror = () => resolve(null);
     } catch {
       resolve(null);
+    }
+  });
+}
+
+export async function listStoredCardImageIds(): Promise<Set<string>> {
+  const db = await openStudioDb();
+  if (!db) return new Set();
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(STUDIO_IDB_IMAGES_STORE, 'readonly');
+      const store = tx.objectStore(STUDIO_IDB_IMAGES_STORE);
+      const req = store.getAllKeys();
+      req.onsuccess = () => {
+        const keys = Array.isArray(req.result)
+          ? req.result.filter((k): k is string => typeof k === 'string')
+          : [];
+        resolve(new Set(keys));
+      };
+      req.onerror = () => resolve(new Set());
+    } catch {
+      resolve(new Set());
     }
   });
 }
