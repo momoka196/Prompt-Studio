@@ -467,6 +467,12 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   const [applySwitchAndClose, setApplySwitchAndClose] = useState<boolean>(true);
   const [applyPersistToChar, setApplyPersistToChar] = useState<boolean>(false);
   const [applyErrorMsg, setApplyErrorMsg] = useState<string | null>(null);
+  const [isApplyingAndRunning, setIsApplyingAndRunning] = useState<boolean>(false);
+  const [applyRunToast, setApplyRunToast] = useState<{
+    tone: 'sending' | 'success' | 'error';
+    text: string;
+    detail?: string;
+  } | null>(null);
 
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const jsonInputRef = useRef<HTMLInputElement | null>(null);
@@ -495,7 +501,32 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   const pendingDeleteCardsRef = useRef<Map<string, WorkflowCollectionCard>>(new Map());
   const deleteFlushScheduledRef = useRef(false);
   const deleteToastTimerRef = useRef<number | null>(null);
+  const applyRunToastTimerRef = useRef<number | null>(null);
   const burstDeletedTotalRef = useRef(0);
+
+  const showApplyRunToast = useCallback(
+    (
+      toast: {
+        tone: 'sending' | 'success' | 'error';
+        text: string;
+        detail?: string;
+      } | null,
+      autoHideMs?: number
+    ) => {
+      if (applyRunToastTimerRef.current !== null) {
+        window.clearTimeout(applyRunToastTimerRef.current);
+        applyRunToastTimerRef.current = null;
+      }
+      setApplyRunToast(toast);
+      if (toast && autoHideMs && autoHideMs > 0) {
+        applyRunToastTimerRef.current = window.setTimeout(() => {
+          setApplyRunToast(null);
+          applyRunToastTimerRef.current = null;
+        }, autoHideMs);
+      }
+    },
+    []
+  );
 
   const handleOpenLightbox = useCallback((id: string) => {
     setLightboxCardId(id);
@@ -521,6 +552,9 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       }
       if (deleteToastTimerRef.current !== null) {
         window.clearTimeout(deleteToastTimerRef.current);
+      }
+      if (applyRunToastTimerRef.current !== null) {
+        window.clearTimeout(applyRunToastTimerRef.current);
       }
       clearCardImageCache();
     };
@@ -900,9 +934,11 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       setApplySamplingParams(hasAnyParams);
       setApplySwitchAndClose(true);
       setApplyErrorMsg(null);
+      setIsApplyingAndRunning(false);
+      showApplyRunToast(null);
       setApplyingCardId(card.id);
     },
-    [characters, populateApplyPreparedFields, selectedCharId]
+    [characters, populateApplyPreparedFields, selectedCharId, showApplyRunToast]
   );
 
   const handleConfirmApplyToCharacter = useCallback(
@@ -2217,7 +2253,13 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   const handleRunCard = async (
     card: WorkflowCollectionCard,
     forceStudioProfile = false
-  ) => {
+  ): Promise<{
+    ok: boolean;
+    promptId?: string;
+    usedSeed?: number;
+    summary?: string;
+    error?: string;
+  }> => {
     setRunStatus({
       state: 'sending',
       cardId: card.id,
@@ -2265,19 +2307,27 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         timestamp: nowTime,
         message: `已进入本地 ComfyUI 队列 (${res.summary})`,
       });
+      return {
+        ok: true,
+        promptId: res.promptId,
+        usedSeed: res.usedSeed,
+        summary: res.summary,
+      };
     } catch (err) {
       const msg = err instanceof Error ? err.message : '推送失败';
       const isNetworkErr =
         /failed to fetch|networkerror|err_connection/i.test(msg);
+      const finalMsg = isNetworkErr
+        ? `${msg}（请确认已启动 ComfyUI 并开启 --enable-cors-header）`
+        : msg;
       setRunStatus({
         state: 'error',
         cardId: card.id,
         cardTitle: card.title,
         canRetryWithProfile: !forceStudioProfile && !preferStudioProfile && Boolean(card.fineTunedPositive.trim()),
-        message: isNetworkErr
-          ? `${msg}（请确认已启动 ComfyUI 并开启 --enable-cors-header）`
-          : msg,
+        message: finalMsg,
       });
+      return { ok: false, error: finalMsg };
     }
   };
 
@@ -2287,7 +2337,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         e.preventDefault();
         e.stopPropagation();
       }
-      if (!applyingCard || !onApplyCardToCharacter) return;
+      if (!applyingCard || !onApplyCardToCharacter || isApplyingAndRunning) return;
       if (!applyTargetCharId) {
         setApplyErrorMsg('请先选择要套用的目标角色');
         return;
@@ -2332,7 +2382,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         negativeMode: applyNegativeMode,
         applySamplingParams: hasSampling,
         samplingParams: hasSampling ? applyExtractedParams : undefined,
-        switchAndClose: true,
+        switchAndClose: false,
         persistToCharacter: applyPersistToChar,
         runDirectly: true,
       });
@@ -2342,7 +2392,13 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         return;
       }
 
-      setApplyingCardId(null);
+      setApplyErrorMsg(null);
+      setIsApplyingAndRunning(true);
+      showApplyRunToast({
+        tone: 'sending',
+        text: '正在发起请求...',
+        detail: `正在向 ComfyUI 发送「${applyingCard.title}」生图任务`,
+      });
 
       const targetChar = characters.find((c) => c.id === applyTargetCharId);
       const charAppearance = targetChar?.appearance.text.trim() ?? '';
@@ -2360,7 +2416,34 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         applyFineTuneOnSend: true,
       };
 
-      await handleRunCard(runCard);
+      try {
+        const runRes = await handleRunCard(runCard);
+        if (runRes.ok) {
+          showApplyRunToast(
+            {
+              tone: 'success',
+              text: '已经发起请求',
+              detail: runRes.promptId
+                ? `已加入 ComfyUI 队列 · ID: ${runRes.promptId.slice(0, 10)}`
+                : '已加入 ComfyUI 生图队列',
+            },
+            4500
+          );
+        } else {
+          const errText = runRes.error ?? '推送到 ComfyUI 失败';
+          setApplyErrorMsg(errText);
+          showApplyRunToast(
+            {
+              tone: 'error',
+              text: '发起请求失败',
+              detail: errText,
+            },
+            6000
+          );
+        }
+      } finally {
+        setIsApplyingAndRunning(false);
+      }
     },
     [
       applyBackground,
@@ -2385,7 +2468,9 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       applyingCard,
       characters,
       handleRunCard,
+      isApplyingAndRunning,
       onApplyCardToCharacter,
+      showApplyRunToast,
     ]
   );
 
@@ -5684,20 +5769,74 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                     </button>
                     <button
                       type="button"
+                      disabled={isApplyingAndRunning}
                       onClick={(e) => handleConfirmApplyAndRun(e)}
-                      className="h-9 px-4 inline-flex items-center gap-1.5 rounded-[10px] bg-gradient-to-b from-[#7C5CFC] to-[#6342E8] text-white text-[12px] font-semibold shadow-[0_2px_8px_rgba(124,92,252,0.32)] hover:brightness-105 cursor-pointer whitespace-nowrap"
+                      className="h-9 px-4 inline-flex items-center gap-1.5 rounded-[10px] bg-gradient-to-b from-[#7C5CFC] to-[#6342E8] text-white text-[12px] font-semibold shadow-[0_2px_8px_rgba(124,92,252,0.32)] hover:brightness-105 disabled:opacity-65 disabled:cursor-not-allowed cursor-pointer whitespace-nowrap"
                     >
-                      <Play className="w-4 h-4 fill-current" />
+                      {isApplyingAndRunning ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <Play className="w-4 h-4 fill-current" />
+                      )}
                       <span>
-                        复刻并直接发往 ComfyUI 生图（
-                        {characters.find((c) => c.id === applyTargetCharId)?.name ??
-                          '角色'}
-                        ）
+                        {isApplyingAndRunning
+                          ? '正在发起请求...'
+                          : `复刻并直接发往 ComfyUI 生图（${
+                              characters.find((c) => c.id === applyTargetCharId)?.name ??
+                              '角色'
+                            }）`}
                       </span>
                     </button>
                   </div>
                 </div>
               </div>
+            </div>
+          </div>
+        )}
+
+        {/* 复刻直发 ComfyUI 顶部浮动 Toast 提示 */}
+        {applyRunToast && (
+          <div className="pointer-events-none fixed top-5 left-1/2 -translate-x-1/2 z-[80] px-4 w-full max-w-[480px] flex justify-center">
+            <div
+              role="status"
+              aria-live="polite"
+              className={`pointer-events-auto w-auto max-w-full rounded-[12px] border px-4 py-2.5 shadow-[0_12px_32px_rgba(18,22,33,0.18)] backdrop-blur-md flex items-center gap-2.5 text-[12.5px] ${
+                applyRunToast.tone === 'success'
+                  ? 'border-emerald-300 bg-emerald-50/95 text-emerald-900'
+                  : applyRunToast.tone === 'error'
+                  ? 'border-[#F5B8C4] bg-[#FFF1F3]/95 text-[#B42343]'
+                  : 'border-[#DDD6FE] bg-white/95 text-[#4C35C6]'
+              }`}
+            >
+              {applyRunToast.tone === 'sending' && (
+                <Loader2 className="w-4 h-4 animate-spin shrink-0 text-[#7C5CFC]" />
+              )}
+              {applyRunToast.tone === 'success' && (
+                <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-600" />
+              )}
+              {applyRunToast.tone === 'error' && (
+                <AlertCircle className="w-4 h-4 shrink-0 text-[#E85D75]" />
+              )}
+              <div className="min-w-0 flex items-center gap-2">
+                <span className="font-semibold whitespace-nowrap">{applyRunToast.text}</span>
+                {applyRunToast.detail && (
+                  <span className="text-[11.5px] opacity-85 truncate max-w-[260px]">
+                    {applyRunToast.detail}
+                  </span>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  showApplyRunToast(null);
+                }}
+                aria-label="关闭请求提示"
+                className="p-0.5 opacity-65 hover:opacity-100 cursor-pointer shrink-0"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
             </div>
           </div>
         )}

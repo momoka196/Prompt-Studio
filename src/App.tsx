@@ -825,7 +825,7 @@ export default function App() {
         });
       }
 
-      if (payload.switchAndClose) {
+      if (payload.switchAndClose && !payload.runDirectly) {
         setWorkbenchOpen(false);
       }
 
