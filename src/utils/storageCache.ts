@@ -190,6 +190,7 @@ export function normalizeWorkflowCards(raw: unknown): WorkflowCollectionCard[] {
       typeof rec.originalImageDataUrl === 'string' && rec.originalImageDataUrl
         ? rec.originalImageDataUrl
         : undefined;
+    const hasBlob = Boolean(rec.hasOriginalImageBlob);
     cards.push({
       id: rec.id,
       title:
@@ -201,8 +202,8 @@ export function normalizeWorkflowCards(raw: unknown): WorkflowCollectionCard[] {
             .filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
             .map((t) => t.trim())
         : [],
-      thumbnailDataUrl: rawThumb || rawOriginal || '',
-      originalImageDataUrl: rawOriginal,
+      thumbnailDataUrl: hasBlob ? '' : rawThumb || rawOriginal || '',
+      originalImageDataUrl: hasBlob ? undefined : rawOriginal,
       originalImageMime:
         typeof rec.originalImageMime === 'string' ? rec.originalImageMime : undefined,
       originalImageWidth:
@@ -216,6 +217,19 @@ export function normalizeWorkflowCards(raw: unknown): WorkflowCollectionCard[] {
         Number.isFinite(rec.originalImageHeight) &&
         rec.originalImageHeight > 0
           ? Math.round(rec.originalImageHeight)
+          : undefined,
+      hasOriginalImageBlob: hasBlob || Boolean(rawOriginal),
+      imageByteSize:
+        typeof rec.imageByteSize === 'number' &&
+        Number.isFinite(rec.imageByteSize) &&
+        rec.imageByteSize > 0
+          ? Math.round(rec.imageByteSize)
+          : undefined,
+      autoImportedSource:
+        rec.autoImportedSource === 'png' ||
+        rec.autoImportedSource === 'json' ||
+        rec.autoImportedSource === 'manual'
+          ? rec.autoImportedSource
           : undefined,
       imageName: typeof rec.imageName === 'string' ? rec.imageName : '',
       workflowFileName:
@@ -307,12 +321,23 @@ export function mergeImportedWorkflowCards(
 }
 
 const STUDIO_IDB_NAME = 'chibiprompt_studio_db_v1';
+const STUDIO_IDB_VERSION = 2;
 const STUDIO_IDB_CARDS_STORE = 'workflow_cards';
+const STUDIO_IDB_IMAGES_STORE = 'card_images';
 const STUDIO_IDB_FS_STORE = 'fs_handles';
 const STUDIO_IDB_CARDS_KEY = 'cards_v1';
 const STUDIO_IDB_DIR_KEY = 'bound_workflow_dir';
 
-function isIndexedDbSupported(): boolean {
+export interface StoredCardImageRecord {
+  blob: Blob;
+  mimeType: string;
+  width?: number;
+  height?: number;
+  byteSize: number;
+  updatedAt: number;
+}
+
+export function isIndexedDbSupported(): boolean {
   return typeof window !== 'undefined' && typeof window.indexedDB !== 'undefined';
 }
 
@@ -320,11 +345,14 @@ function openStudioDb(): Promise<IDBDatabase | null> {
   if (!isIndexedDbSupported()) return Promise.resolve(null);
   return new Promise((resolve) => {
     try {
-      const req = window.indexedDB.open(STUDIO_IDB_NAME, 1);
+      const req = window.indexedDB.open(STUDIO_IDB_NAME, STUDIO_IDB_VERSION);
       req.onupgradeneeded = () => {
         const db = req.result;
         if (!db.objectStoreNames.contains(STUDIO_IDB_CARDS_STORE)) {
           db.createObjectStore(STUDIO_IDB_CARDS_STORE);
+        }
+        if (!db.objectStoreNames.contains(STUDIO_IDB_IMAGES_STORE)) {
+          db.createObjectStore(STUDIO_IDB_IMAGES_STORE);
         }
         if (!db.objectStoreNames.contains(STUDIO_IDB_FS_STORE)) {
           db.createObjectStore(STUDIO_IDB_FS_STORE);
@@ -338,10 +366,184 @@ function openStudioDb(): Promise<IDBDatabase | null> {
   });
 }
 
+export function decodeDataUrlToBlob(dataUrl: string): Blob {
+  const commaIdx = dataUrl.indexOf(',');
+  if (commaIdx < 0) {
+    throw new Error('无效的图像 DataURL');
+  }
+  const header = dataUrl.slice(0, commaIdx);
+  const body = dataUrl.slice(commaIdx + 1);
+  const mimeMatch = header.match(/data:([^;]+)/i);
+  const mimeType = mimeMatch ? mimeMatch[1] : 'application/octet-stream';
+
+  if (/;base64/i.test(header)) {
+    const binStr = atob(body);
+    const bytes = new Uint8Array(binStr.length);
+    for (let i = 0; i < binStr.length; i++) {
+      bytes[i] = binStr.charCodeAt(i);
+    }
+    return new Blob([bytes], { type: mimeType });
+  }
+  return new Blob([decodeURIComponent(body)], { type: mimeType });
+}
+
+export function encodeBlobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === 'string') {
+        resolve(reader.result);
+      } else {
+        reject(new Error('无法编码图像数据'));
+      }
+    };
+    reader.onerror = () => reject(new Error('读取图像 Blob 失败'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+export async function saveCardImageBlob(
+  cardId: string,
+  record: StoredCardImageRecord
+): Promise<boolean> {
+  return saveCardImageBlobsBatch([{ cardId, record }]);
+}
+
+export async function saveCardImageBlobsBatch(
+  entries: { cardId: string; record: StoredCardImageRecord }[]
+): Promise<boolean> {
+  if (entries.length === 0) return true;
+  const db = await openStudioDb();
+  if (!db) return false;
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(STUDIO_IDB_IMAGES_STORE, 'readwrite');
+      const store = tx.objectStore(STUDIO_IDB_IMAGES_STORE);
+      for (const entry of entries) {
+        store.put(entry.record, entry.cardId);
+      }
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => resolve(false);
+      tx.onabort = () => resolve(false);
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+export async function loadCardImageBlob(
+  cardId: string
+): Promise<StoredCardImageRecord | null> {
+  const db = await openStudioDb();
+  if (!db) return null;
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(STUDIO_IDB_IMAGES_STORE, 'readonly');
+      const store = tx.objectStore(STUDIO_IDB_IMAGES_STORE);
+      const req = store.get(cardId);
+      req.onsuccess = () => {
+        const res = req.result as Partial<StoredCardImageRecord> | undefined;
+        if (res && res.blob instanceof Blob) {
+          resolve({
+            blob: res.blob,
+            mimeType: res.mimeType || res.blob.type || 'image/png',
+            width: res.width,
+            height: res.height,
+            byteSize: res.byteSize ?? res.blob.size,
+            updatedAt: res.updatedAt ?? Date.now(),
+          });
+        } else {
+          resolve(null);
+        }
+      };
+      req.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+export async function deleteCardImageBlob(cardId: string): Promise<void> {
+  await deleteCardImageBlobsBatch([cardId]);
+}
+
+export async function deleteCardImageBlobsBatch(cardIds: string[]): Promise<void> {
+  if (cardIds.length === 0) return;
+  const db = await openStudioDb();
+  if (!db) return;
+  await new Promise<void>((resolve) => {
+    try {
+      const tx = db.transaction(STUDIO_IDB_IMAGES_STORE, 'readwrite');
+      const store = tx.objectStore(STUDIO_IDB_IMAGES_STORE);
+      for (const id of cardIds) {
+        store.delete(id);
+      }
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+      tx.onabort = () => resolve();
+    } catch {
+      resolve();
+    }
+  });
+}
+
+export async function copyCardImageBlob(
+  srcCardId: string,
+  destCardId: string
+): Promise<boolean> {
+  const rec = await loadCardImageBlob(srcCardId);
+  if (!rec) return false;
+  return saveCardImageBlob(destCardId, {
+    ...rec,
+    updatedAt: Date.now(),
+  });
+}
+
+export async function migrateCardInlineImagesToIdb(
+  cards: WorkflowCollectionCard[]
+): Promise<{ cards: WorkflowCollectionCard[]; migrated: boolean }> {
+  if (!isIndexedDbSupported()) return { cards, migrated: false };
+  const toStore: { cardId: string; record: StoredCardImageRecord }[] = [];
+  let changed = false;
+
+  const nextCards = cards.map((c) => {
+    if (!c.originalImageDataUrl) return c;
+    try {
+      const blob = decodeDataUrlToBlob(c.originalImageDataUrl);
+      toStore.push({
+        cardId: c.id,
+        record: {
+          blob,
+          mimeType: c.originalImageMime || blob.type || 'image/png',
+          width: c.originalImageWidth,
+          height: c.originalImageHeight,
+          byteSize: blob.size,
+          updatedAt: c.updatedAt || Date.now(),
+        },
+      });
+      changed = true;
+      return {
+        ...c,
+        originalImageDataUrl: undefined,
+        thumbnailDataUrl: '',
+        hasOriginalImageBlob: true,
+        imageByteSize: blob.size,
+      };
+    } catch {
+      return c;
+    }
+  });
+
+  if (!changed) return { cards, migrated: false };
+  const ok = await saveCardImageBlobsBatch(toStore);
+  if (!ok) return { cards, migrated: false };
+  return { cards: nextCards, migrated: true };
+}
+
 export async function loadWorkflowCardsFromIndexedDb(): Promise<WorkflowCollectionCard[]> {
   const db = await openStudioDb();
   if (!db) return [];
-  return new Promise((resolve) => {
+  const rawCards = await new Promise<WorkflowCollectionCard[]>((resolve) => {
     try {
       const tx = db.transaction(STUDIO_IDB_CARDS_STORE, 'readonly');
       const store = tx.objectStore(STUDIO_IDB_CARDS_STORE);
@@ -354,6 +556,13 @@ export async function loadWorkflowCardsFromIndexedDb(): Promise<WorkflowCollecti
       resolve([]);
     }
   });
+
+  if (rawCards.length === 0) return [];
+  const { cards: migratedCards, migrated } = await migrateCardInlineImagesToIdb(rawCards);
+  if (migrated) {
+    void saveWorkflowCardsToIndexedDb(migratedCards);
+  }
+  return migratedCards;
 }
 
 export async function saveWorkflowCardsToIndexedDb(
@@ -435,12 +644,25 @@ export function saveWorkflowCardsSafely(cards: WorkflowCollectionCard[]): {
     void saveWorkflowCardsToIndexedDb(cards);
   }
 
+  // 当卡片数量较大或存在大图时，优先持久化轻量索引到 localStorage，避免 JSON.stringify 数百张原图阻塞主线程
+  const hasAnyInlineOriginal = cards.some((c) => Boolean(c.originalImageDataUrl));
+  if (idbAvailable && (cards.length > 30 || hasAnyInlineOriginal)) {
+    try {
+      const lightPayload = JSON.stringify(buildLightweightCardsForLocalStorage(cards));
+      if (lightPayload.length < 2_500_000) {
+        localStorage.setItem(STUDIO_WORKFLOW_CARDS_KEY, lightPayload);
+      }
+    } catch {
+      // IndexedDB 已完成持久化，忽略 localStorage 配额限制
+    }
+    return { ok: true };
+  }
+
   try {
     const payload = JSON.stringify(cards);
     localStorage.setItem(STUDIO_WORKFLOW_CARDS_KEY, payload);
     return { ok: true };
   } catch {
-    // 原图无损体积极易超出 localStorage ~5MB 限制；自动降级为 IndexedDB 完整持久化 + localStorage 轻量索引兜底
     try {
       const lightPayload = JSON.stringify(buildLightweightCardsForLocalStorage(cards));
       localStorage.setItem(STUDIO_WORKFLOW_CARDS_KEY, lightPayload);
@@ -464,5 +686,6 @@ export function saveWorkflowCardsSafely(cards: WorkflowCollectionCard[]): {
     }
   }
 }
+
 
 

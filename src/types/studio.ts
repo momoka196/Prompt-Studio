@@ -253,6 +253,9 @@ export interface WorkflowCollectionCard {
   originalImageMime?: string;
   originalImageWidth?: number;
   originalImageHeight?: number;
+  hasOriginalImageBlob?: boolean;
+  imageByteSize?: number;
+  autoImportedSource?: 'png' | 'json' | 'manual';
   imageName: string;
   workflowFileName: string;
   workflowFormat: WorkflowJsonFormat;

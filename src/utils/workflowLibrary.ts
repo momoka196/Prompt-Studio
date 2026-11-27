@@ -13,6 +13,12 @@ import {
   sanitizeFilenamePrefix,
   splitPromptTags,
 } from './promptBuilder';
+import {
+  decodeDataUrlToBlob,
+  encodeBlobToDataUrl,
+  isIndexedDbSupported,
+  loadCardImageBlob,
+} from './storageCache';
 
 type ComfyApiNode = {
   class_type: string;
@@ -143,6 +149,17 @@ async function inflateZlibBytes(compressed: Uint8Array): Promise<string | null> 
   return null;
 }
 
+export interface A1111PngParametersMeta {
+  positive: string;
+  negative: string;
+  seed?: number;
+  steps?: number;
+  cfg?: number;
+  sampler?: string;
+  model?: string;
+  rawParameters: string;
+}
+
 export interface ExtractedPngComfyMetadata {
   isPng: boolean;
   workflowJson?: string;
@@ -152,7 +169,60 @@ export interface ExtractedPngComfyMetadata {
     positive?: string;
     negative?: string;
   };
+  a1111Meta?: A1111PngParametersMeta;
   rawChunks: Record<string, string>;
+}
+
+function parseA1111ParametersText(raw: string): A1111PngParametersMeta | undefined {
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  const lines = trimmed.split(/\r?\n/);
+  const negIdx = lines.findIndex((l) => /^Negative prompt:/i.test(l.trim()));
+  const stepsIdx = lines.findIndex((l) => /^Steps:\s*\d+/i.test(l.trim()));
+  if (negIdx < 0 && stepsIdx < 0) return undefined;
+
+  const posEnd = negIdx >= 0 ? negIdx : stepsIdx >= 0 ? stepsIdx : lines.length;
+  const positive = lines.slice(0, posEnd).join('\n').trim();
+
+  let negative = '';
+  if (negIdx >= 0) {
+    const negEnd = stepsIdx > negIdx ? stepsIdx : lines.length;
+    const negLines = lines.slice(negIdx, negEnd);
+    negLines[0] = negLines[0].replace(/^Negative prompt:\s*/i, '');
+    negative = negLines.join('\n').trim();
+  }
+
+  let seed: number | undefined;
+  let steps: number | undefined;
+  let cfg: number | undefined;
+  let sampler: string | undefined;
+  let model: string | undefined;
+
+  if (stepsIdx >= 0) {
+    const metaLine = lines.slice(stepsIdx).join(' ');
+    const stepsMatch = metaLine.match(/Steps:\s*(\d+)/i);
+    if (stepsMatch) steps = parseInt(stepsMatch[1], 10);
+    const cfgMatch = metaLine.match(/CFG scale:\s*([0-9.]+)/i);
+    if (cfgMatch) cfg = parseFloat(cfgMatch[1]);
+    const seedMatch = metaLine.match(/Seed:\s*(\d+)/i);
+    if (seedMatch) seed = parseInt(seedMatch[1], 10);
+    const samplerMatch = metaLine.match(/Sampler:\s*([^,]+)/i);
+    if (samplerMatch) sampler = samplerMatch[1].trim();
+    const modelMatch = metaLine.match(/Model:\s*([^,]+)/i);
+    if (modelMatch) model = modelMatch[1].trim();
+  }
+
+  if (!positive && !negative) return undefined;
+  return {
+    positive,
+    negative,
+    seed,
+    steps,
+    cfg,
+    sampler,
+    model,
+    rawParameters: trimmed,
+  };
 }
 
 export async function extractComfyMetadataFromPngBuffer(
@@ -243,6 +313,7 @@ export async function extractComfyMetadataFromPngBuffer(
   let workflowJson: string | undefined;
   let apiPromptJson: string | undefined;
   let chibipromptMeta: ExtractedPngComfyMetadata['chibipromptMeta'];
+  let a1111Meta: A1111PngParametersMeta | undefined;
 
   const rawWorkflowChunk = findChunkValue('workflow');
   if (rawWorkflowChunk) {
@@ -276,11 +347,19 @@ export async function extractComfyMetadataFromPngBuffer(
     }
   }
 
+  if (!workflowJson && !apiPromptJson && !chibipromptMeta) {
+    const rawParamsChunk = findChunkValue('parameters');
+    if (rawParamsChunk) {
+      a1111Meta = parseA1111ParametersText(rawParamsChunk);
+    }
+  }
+
   return {
     isPng: true,
     workflowJson,
     apiPromptJson,
     chibipromptMeta,
+    a1111Meta,
     rawChunks,
   };
 }
@@ -297,27 +376,13 @@ export interface OriginalImageReadResult {
   mimeType: string;
   width?: number;
   height?: number;
+  byteSize: number;
 }
 
-export async function readImageOriginalData(
-  file: File
-): Promise<OriginalImageReadResult> {
-  const dataUrl = await new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === 'string' && reader.result.startsWith('data:')) {
-        resolve(reader.result);
-      } else {
-        reject(new Error('无法读取参考图原始文件数据'));
-      }
-    };
-    reader.onerror = () => reject(new Error('读取参考图文件失败'));
-    reader.readAsDataURL(file);
-  });
-
+export async function readImageDimensions(
+  file: Blob
+): Promise<{ width?: number; height?: number }> {
   // 仅非破坏性探测原图尺寸，绝不经 Canvas 缩放或有损重编码
-  let width: number | undefined;
-  let height: number | undefined;
   const objectUrl = URL.createObjectURL(file);
   try {
     const dims = await new Promise<{ w: number; h: number }>((resolve, reject) => {
@@ -331,66 +396,31 @@ export async function readImageOriginalData(
       img.src = objectUrl;
     });
     if (dims.w > 0 && dims.h > 0) {
-      width = dims.w;
-      height = dims.h;
+      return { width: dims.w, height: dims.h };
     }
+    return {};
   } catch {
-    // 若浏览器无法内联解码尺寸，仍保留原始无损 dataUrl
+    return {};
   } finally {
     URL.revokeObjectURL(objectUrl);
   }
+}
+
+export async function readImageOriginalData(
+  file: File
+): Promise<OriginalImageReadResult> {
+  const [dataUrl, dims] = await Promise.all([
+    encodeBlobToDataUrl(file),
+    readImageDimensions(file),
+  ]);
 
   return {
     dataUrl,
     mimeType: file.type || 'image/png',
-    width,
-    height,
+    width: dims.width,
+    height: dims.height,
+    byteSize: file.size,
   };
-}
-
-export async function resizeImageToThumbnail(
-  file: File,
-  maxDimension = 520
-): Promise<string> {
-  const objectUrl = URL.createObjectURL(file);
-  try {
-    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
-      const el = new Image();
-      el.onload = () => resolve(el);
-      el.onerror = () => reject(new Error('无法解码图片文件'));
-      el.src = objectUrl;
-    });
-
-    const srcW = img.naturalWidth || img.width || 512;
-    const srcH = img.naturalHeight || img.height || 512;
-
-    const renderScaled = (limit: number, quality: number): string => {
-      const scale = Math.min(1, limit / Math.max(srcW, srcH));
-      const w = Math.max(1, Math.round(srcW * scale));
-      const h = Math.max(1, Math.round(srcH * scale));
-      const canvas = document.createElement('canvas');
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return '';
-      ctx.fillStyle = '#FFFFFF';
-      ctx.fillRect(0, 0, w, h);
-      ctx.drawImage(img, 0, 0, w, h);
-      const webp = canvas.toDataURL('image/webp', quality);
-      if (webp.startsWith('data:image/webp')) {
-        return webp;
-      }
-      return canvas.toDataURL('image/jpeg', quality);
-    };
-
-    let dataUrl = renderScaled(maxDimension, 0.78);
-    if (dataUrl.length > 140_000) {
-      dataUrl = renderScaled(380, 0.62);
-    }
-    return dataUrl;
-  } finally {
-    URL.revokeObjectURL(objectUrl);
-  }
 }
 
 export function isApiPromptDict(obj: unknown): obj is ComfyApiGraph {
@@ -950,8 +980,9 @@ export function parseComfyWorkflowSource(params: {
   rawJsonText?: string;
   apiPromptJsonText?: string;
   chibipromptMeta?: { positive?: string; negative?: string; character?: string };
+  a1111Meta?: A1111PngParametersMeta;
 }): ParsedWorkflowSource {
-  const { rawJsonText, apiPromptJsonText, chibipromptMeta } = params;
+  const { rawJsonText, apiPromptJsonText, chibipromptMeta, a1111Meta } = params;
 
   let parsedRaw: unknown = null;
   if (rawJsonText && rawJsonText.trim()) {
@@ -1020,6 +1051,18 @@ export function parseComfyWorkflowSource(params: {
       rawWorkflowJson: JSON.stringify({ chibiprompt: chibipromptMeta }, null, 2),
       extractedPositive: chibipromptMeta.positive || '',
       extractedNegative: chibipromptMeta.negative || '',
+      positiveNodeId: null,
+      negativeNodeId: null,
+      nodeCandidates: [],
+    };
+  }
+
+  if (a1111Meta && (a1111Meta.positive || a1111Meta.negative)) {
+    return {
+      workflowFormat: 'png-embedded',
+      rawWorkflowJson: JSON.stringify({ parameters: a1111Meta.rawParameters }, null, 2),
+      extractedPositive: a1111Meta.positive || '',
+      extractedNegative: a1111Meta.negative || '',
       positiveNodeId: null,
       negativeNodeId: null,
       nodeCandidates: [],
@@ -1427,6 +1470,62 @@ export async function sendWorkflowCardToComfyUI(params: {
   };
 }
 
+export async function resolveCardImageBlob(
+  card: WorkflowCollectionCard
+): Promise<{ blob: Blob; isLosslessOriginal: boolean; mimeType: string } | null> {
+  if (card.originalImageDataUrl) {
+    try {
+      const blob = decodeDataUrlToBlob(card.originalImageDataUrl);
+      return {
+        blob,
+        isLosslessOriginal: true,
+        mimeType: card.originalImageMime || blob.type || 'image/png',
+      };
+    } catch {
+      // fall through
+    }
+  }
+
+  if (card.hasOriginalImageBlob) {
+    const stored = await loadCardImageBlob(card.id);
+    if (stored) {
+      return {
+        blob: stored.blob,
+        isLosslessOriginal: true,
+        mimeType: stored.mimeType || stored.blob.type || 'image/png',
+      };
+    }
+  }
+
+  if (card.thumbnailDataUrl) {
+    try {
+      const blob = decodeDataUrlToBlob(card.thumbnailDataUrl);
+      return {
+        blob,
+        isLosslessOriginal: false,
+        mimeType: blob.type || 'image/webp',
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+export async function resolveCardImageDataUrl(
+  card: WorkflowCollectionCard
+): Promise<string | null> {
+  if (card.originalImageDataUrl) return card.originalImageDataUrl;
+  if (card.hasOriginalImageBlob) {
+    const stored = await loadCardImageBlob(card.id);
+    if (stored) {
+      return encodeBlobToDataUrl(stored.blob);
+    }
+  }
+  return card.thumbnailDataUrl || null;
+}
+
 export function buildCardExportPayload(
   cards: WorkflowCollectionCard[],
   options?: { includePrivate?: boolean; onlyPrivate?: boolean }
@@ -1448,13 +1547,121 @@ export function buildCardExportPayload(
   );
 }
 
+export async function buildCardExportPayloadAsync(
+  cards: WorkflowCollectionCard[],
+  options?: { includePrivate?: boolean; onlyPrivate?: boolean; maxEmbeddedImageBytes?: number }
+): Promise<{ payload: string; omittedLargeImagesCount: number; exportedCount: number }> {
+  const filteredCards = options?.onlyPrivate
+    ? cards.filter((c) => Boolean(c.isPrivate))
+    : options?.includePrivate
+    ? cards
+    : cards.filter((c) => !c.isPrivate);
+
+  const maxBytes = options?.maxEmbeddedImageBytes ?? 140 * 1024 * 1024;
+  let accumulatedBytes = 0;
+  let omittedLargeImagesCount = 0;
+
+  const hydratedCards: WorkflowCollectionCard[] = [];
+  for (let i = 0; i < filteredCards.length; i++) {
+    const card = filteredCards[i];
+    if (card.originalImageDataUrl) {
+      accumulatedBytes += card.originalImageDataUrl.length;
+      hydratedCards.push(card);
+    } else if (card.hasOriginalImageBlob) {
+      const stored = await loadCardImageBlob(card.id);
+      if (stored && accumulatedBytes + stored.byteSize * 1.35 <= maxBytes) {
+        const dataUrl = await encodeBlobToDataUrl(stored.blob);
+        accumulatedBytes += dataUrl.length;
+        hydratedCards.push({
+          ...card,
+          originalImageDataUrl: dataUrl,
+          thumbnailDataUrl: '',
+        });
+      } else {
+        omittedLargeImagesCount += 1;
+        hydratedCards.push(card);
+      }
+    } else {
+      hydratedCards.push(card);
+    }
+    if (i > 0 && i % 15 === 0) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
+  }
+
+  return {
+    payload: JSON.stringify(
+      {
+        schema: 'chibiprompt-workflow-collection-v1',
+        exportedAt: new Date().toISOString(),
+        cards: hydratedCards,
+      },
+      null,
+      2
+    ),
+    omittedLargeImagesCount,
+    exportedCount: hydratedCards.length,
+  };
+}
+
+function inferAutoTagsFromPngMetadata(params: {
+  parsed: ParsedWorkflowSource;
+  pngMeta: ExtractedPngComfyMetadata;
+  knownCharacterHints?: string[];
+}): string[] {
+  const tags: string[] = ['PNG导入'];
+  const lowerCombined = `${params.parsed.extractedPositive}\n${params.parsed.rawWorkflowJson}\n${params.parsed.apiPromptJson ?? ''}`.toLowerCase();
+
+  const charFromMeta = params.pngMeta.chibipromptMeta?.character?.trim();
+  if (charFromMeta) {
+    tags.push(charFromMeta);
+  } else if (params.knownCharacterHints && params.knownCharacterHints.length > 0) {
+    for (const hint of params.knownCharacterHints) {
+      const clean = hint.trim();
+      if (clean && lowerCombined.includes(clean.toLowerCase())) {
+        tags.push(clean);
+        break;
+      }
+    }
+  }
+
+  // 常见角色英文关键词兜底识别
+  if (tags.length === 1) {
+    if (/\bibuki\b/.test(lowerCombined)) tags.push('伊吹');
+    else if (/\bmari\b/.test(lowerCombined)) tags.push('玛丽');
+    else if (/\bsakura\b/.test(lowerCombined)) tags.push('樱');
+    else if (/\bblue archive\b/.test(lowerCombined)) tags.push('BlueArchive');
+  }
+
+  if (/anima|qwen_3_06b|qwen_image_vae/i.test(lowerCombined)) {
+    tags.push('Anima');
+  } else if (/illustrious/i.test(lowerCombined)) {
+    tags.push('Illustrious');
+  } else if (/sdxl|text_g/i.test(lowerCombined)) {
+    tags.push('SDXL');
+  } else if (/flux/i.test(lowerCombined)) {
+    tags.push('Flux');
+  }
+
+  return Array.from(new Set(tags)).slice(0, 4);
+}
+
 export type PngCardImportResult =
-  | { ok: true; card: WorkflowCollectionCard }
+  | {
+      ok: true;
+      card: WorkflowCollectionCard;
+      imageBlob: Blob;
+      mimeType: string;
+    }
   | { ok: false; fileName: string; reason: string };
 
 export async function buildWorkflowCardFromPngFile(
   file: File,
-  options?: { isPrivate?: boolean }
+  options?: {
+    isPrivate?: boolean;
+    knownCharacterHints?: string[];
+    indexSeed?: number;
+  }
 ): Promise<PngCardImportResult> {
   const isPngFile =
     file.type === 'image/png' || file.name.toLowerCase().endsWith('.png');
@@ -1485,11 +1692,16 @@ export async function buildWorkflowCardFromPngFile(
     };
   }
 
-  if (!pngMeta.workflowJson && !pngMeta.apiPromptJson && !pngMeta.chibipromptMeta) {
+  if (
+    !pngMeta.workflowJson &&
+    !pngMeta.apiPromptJson &&
+    !pngMeta.chibipromptMeta &&
+    !pngMeta.a1111Meta
+  ) {
     return {
       ok: false,
       fileName: file.name,
-      reason: '未检测到内嵌 ComfyUI prompt / workflow 元数据',
+      reason: '未检测到内嵌 ComfyUI prompt / workflow 或参数元数据',
     };
   }
 
@@ -1499,6 +1711,7 @@ export async function buildWorkflowCardFromPngFile(
       rawJsonText: pngMeta.workflowJson,
       apiPromptJsonText: pngMeta.apiPromptJson,
       chibipromptMeta: pngMeta.chibipromptMeta,
+      a1111Meta: pngMeta.a1111Meta,
     });
   } catch (err) {
     return {
@@ -1508,30 +1721,50 @@ export async function buildWorkflowCardFromPngFile(
     };
   }
 
-  let originalImage: OriginalImageReadResult | null = null;
-  try {
-    originalImage = await readImageOriginalData(file);
-  } catch {
-    originalImage = null;
+  const dims = await readImageDimensions(file);
+  const idbAvailable = isIndexedDbSupported();
+  let inlineOriginalDataUrl: string | undefined;
+  if (!idbAvailable) {
+    try {
+      inlineOriginalDataUrl = await encodeBlobToDataUrl(file);
+    } catch {
+      inlineOriginalDataUrl = undefined;
+    }
   }
 
   const now = Date.now();
+  const fileStem = file.name.replace(/\.[^/.]+$/, '').trim();
+  const charLabel = pngMeta.chibipromptMeta?.character?.trim();
   const baseTitle =
-    pngMeta.chibipromptMeta?.character?.trim() ||
-    file.name.replace(/\.[^/.]+$/, '').trim() ||
-    'PNG 工作流卡片';
+    charLabel && fileStem && !fileStem.toLowerCase().includes(charLabel.toLowerCase())
+      ? `${charLabel} · ${fileStem}`
+      : fileStem || charLabel || 'PNG 工作流卡片';
+
+  const autoTags = inferAutoTagsFromPngMetadata({
+    parsed,
+    pngMeta,
+    knownCharacterHints: options?.knownCharacterHints,
+  });
+
+  const idxToken =
+    typeof options?.indexSeed === 'number' ? `${options.indexSeed}-` : '';
 
   return {
     ok: true,
+    imageBlob: file,
+    mimeType: file.type || 'image/png',
     card: {
-      id: `wf-card-${now}-${Math.random().toString(36).slice(2, 7)}`,
+      id: `wf-card-${now}-${idxToken}${Math.random().toString(36).slice(2, 7)}`,
       title: baseTitle,
-      tags: [],
-      thumbnailDataUrl: originalImage?.dataUrl ?? '',
-      originalImageDataUrl: originalImage?.dataUrl,
-      originalImageMime: originalImage?.mimeType,
-      originalImageWidth: originalImage?.width,
-      originalImageHeight: originalImage?.height,
+      tags: autoTags,
+      thumbnailDataUrl: inlineOriginalDataUrl ?? '',
+      originalImageDataUrl: inlineOriginalDataUrl,
+      originalImageMime: file.type || 'image/png',
+      originalImageWidth: dims.width,
+      originalImageHeight: dims.height,
+      hasOriginalImageBlob: true,
+      imageByteSize: file.size,
+      autoImportedSource: 'png',
       imageName: file.name,
       workflowFileName: `${file.name} (内嵌元数据)`,
       workflowFormat: parsed.workflowFormat,
@@ -1547,6 +1780,7 @@ export async function buildWorkflowCardFromPngFile(
       applyFineTuneOnSend: true,
       isPrivate: Boolean(options?.isPrivate),
       seedMode: 'workflow',
+      fixedSeed: pngMeta.a1111Meta?.seed,
       createdAt: now,
       updatedAt: now,
     },
@@ -1573,6 +1807,15 @@ export function isFileSystemAccessSupported(): boolean {
     typeof window !== 'undefined' &&
     typeof (window as WindowWithDirectoryPicker).showDirectoryPicker === 'function'
   );
+}
+
+export function isInRestrictedIframe(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return window.self !== window.top;
+  } catch {
+    return true;
+  }
 }
 
 export type PickDirectoryResult =
@@ -1617,7 +1860,7 @@ export async function pickLocalWorkflowDirectory(): Promise<PickDirectoryResult>
         ok: false,
         iframeBlocked: true,
         message:
-          '当前页面运行在受限的 iframe 沙箱或跨域嵌套环境中，浏览器禁止直接访问本地磁盘目录。已自动降级为浏览器缓存 +「导出集 / 单卡下载」模式（在新窗口独立打开应用即可启用直写本地文件夹）。',
+          '当前页面运行在受限的 iframe 沙箱或跨域嵌套环境中，浏览器禁止直接访问本地磁盘目录。已自动降级为浏览器缓存 +「导出集 / 单卡下载」模式（在本地 npm run dev 新窗口打开即可直写本地文件夹）。',
       };
     }
     return {
@@ -1650,24 +1893,7 @@ export async function ensureDirectoryWritePermission(
 }
 
 export function dataUrlToBlob(dataUrl: string): Blob {
-  const commaIdx = dataUrl.indexOf(',');
-  if (commaIdx < 0) {
-    throw new Error('无效的图像 DataURL');
-  }
-  const header = dataUrl.slice(0, commaIdx);
-  const body = dataUrl.slice(commaIdx + 1);
-  const mimeMatch = header.match(/data:([^;]+)/i);
-  const mimeType = mimeMatch ? mimeMatch[1] : 'application/octet-stream';
-
-  if (/;base64/i.test(header)) {
-    const binStr = atob(body);
-    const bytes = new Uint8Array(binStr.length);
-    for (let i = 0; i < binStr.length; i++) {
-      bytes[i] = binStr.charCodeAt(i);
-    }
-    return new Blob([bytes], { type: mimeType });
-  }
-  return new Blob([decodeURIComponent(body)], { type: mimeType });
+  return decodeDataUrlToBlob(dataUrl);
 }
 
 function inferImageExtension(card: WorkflowCollectionCard, mimeType?: string): string {
@@ -1684,11 +1910,11 @@ export function buildCardFolderPathSegments(card: WorkflowCollectionCard): strin
   const safeTitle = sanitizeFilenamePrefix(card.title).slice(0, 48);
   const cardDir = `${safeTitle}_${shortId}`;
   const firstTag = card.tags[0]?.trim();
-  if (firstTag) {
-    const safeTag = sanitizeFilenamePrefix(firstTag).slice(0, 32);
-    return [safeTag, cardDir];
+  const tagSegments = firstTag ? [sanitizeFilenamePrefix(firstTag).slice(0, 32)] : [];
+  if (card.isPrivate) {
+    return ['_私密区', ...tagSegments, cardDir];
   }
-  return [cardDir];
+  return [...tagSegments, cardDir];
 }
 
 async function writeFileInDirectory(
@@ -1713,7 +1939,8 @@ export interface FolderWriteCardResult {
 
 export async function writeCardToLocalDirectory(
   rootHandle: FileSystemDirectoryHandle,
-  card: WorkflowCollectionCard
+  card: WorkflowCollectionCard,
+  overrideImageBlob?: Blob | null
 ): Promise<FolderWriteCardResult> {
   const segments = buildCardFolderPathSegments(card);
   const relativePath = segments.join('/');
@@ -1724,10 +1951,17 @@ export async function writeCardToLocalDirectory(
     }
 
     const baseName = sanitizeFilenamePrefix(card.title).slice(0, 48);
-    const imageDataUrl = card.originalImageDataUrl || card.thumbnailDataUrl;
-    if (imageDataUrl) {
-      const imgBlob = dataUrlToBlob(imageDataUrl);
-      const ext = inferImageExtension(card, imgBlob.type);
+    let imgBlob: Blob | null = overrideImageBlob ?? null;
+    let imgMime = card.originalImageMime;
+    if (!imgBlob) {
+      const resolved = await resolveCardImageBlob(card);
+      if (resolved) {
+        imgBlob = resolved.blob;
+        imgMime = resolved.mimeType;
+      }
+    }
+    if (imgBlob) {
+      const ext = inferImageExtension(card, imgMime || imgBlob.type);
       const imgFileName = `${baseName}.${ext}`;
       await writeFileInDirectory(targetDir, imgFileName, imgBlob);
     }
@@ -1749,6 +1983,7 @@ export async function writeCardToLocalDirectory(
         imageName: card.imageName,
         originalImageWidth: card.originalImageWidth,
         originalImageHeight: card.originalImageHeight,
+        imageByteSize: card.imageByteSize ?? imgBlob?.size,
         applyFineTuneOnSend: card.applyFineTuneOnSend,
         positiveNodeId: card.positiveNodeId,
         negativeNodeId: card.negativeNodeId,
@@ -1778,15 +2013,23 @@ export async function writeCardToLocalDirectory(
 
 export async function writeCardsBatchToLocalDirectory(
   rootHandle: FileSystemDirectoryHandle,
-  cards: WorkflowCollectionCard[]
+  cards: WorkflowCollectionCard[],
+  options?: {
+    blobsByCardId?: Map<string, Blob>;
+    onProgress?: (done: number, total: number, currentTitle: string) => void;
+  }
 ): Promise<{
   succeededIds: string[];
   failed: { cardId: string; title: string; error: string }[];
 }> {
   const succeededIds: string[] = [];
   const failed: { cardId: string; title: string; error: string }[] = [];
-  for (const card of cards) {
-    const res = await writeCardToLocalDirectory(rootHandle, card);
+  const total = cards.length;
+  for (let i = 0; i < total; i++) {
+    const card = cards[i];
+    options?.onProgress?.(i, total, card.title);
+    const overrideBlob = options?.blobsByCardId?.get(card.id) ?? null;
+    const res = await writeCardToLocalDirectory(rootHandle, card, overrideBlob);
     if (res.ok) {
       succeededIds.push(card.id);
     } else {
@@ -1796,7 +2039,11 @@ export async function writeCardsBatchToLocalDirectory(
         error: res.error || '写入失败',
       });
     }
+    if (i > 0 && i % 4 === 0) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
   }
+  options?.onProgress?.(total, total, '');
   return { succeededIds, failed };
 }
 

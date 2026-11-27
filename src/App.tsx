@@ -56,6 +56,7 @@ import {
   loadUiCache,
   loadWorkflowCards,
   loadWorkflowCardsFromIndexedDb,
+  migrateCardInlineImagesToIdb,
   normalizeWorkflowCards,
   patchUiCache,
   saveConfigSafely,
@@ -395,7 +396,13 @@ export default function App() {
       } else {
         const legacyLocal = loadWorkflowCards();
         if (legacyLocal.length > 0) {
-          void saveWorkflowCardsToIndexedDb(legacyLocal);
+          const { cards: migratedCards, migrated } =
+            await migrateCardInlineImagesToIdb(legacyLocal);
+          if (cancelled || cardsMutatedRef.current) return;
+          if (migrated) {
+            setWorkflowCards(migratedCards);
+          }
+          void saveWorkflowCardsToIndexedDb(migratedCards);
         }
       }
     })();
@@ -850,6 +857,18 @@ export default function App() {
             (c) => Boolean(c.isPrivate) && !importedIds.has(c.id)
           );
           handleChangeWorkflowCards([...importedCards, ...preservedPrivate]);
+          void migrateCardInlineImagesToIdb(importedCards).then(
+            ({ cards: lightImported, migrated }) => {
+              if (migrated) {
+                const lightById = new Map(lightImported.map((c) => [c.id, c]));
+                setWorkflowCards((prev) => {
+                  const next = prev.map((c) => lightById.get(c.id) ?? c);
+                  void saveWorkflowCardsToIndexedDb(next);
+                  return next;
+                });
+              }
+            }
+          );
         }
         patchUiCache({
           selectedPresetByChar: {},
@@ -997,9 +1016,9 @@ export default function App() {
 
   return (
     <div className="min-h-screen lg:h-screen lg:flex lg:flex-col bg-[#F4F4F7] text-[#1E2028]">
-      {/* 56px 柔和磨砂顶栏 */}
-      <header className="sticky top-0 z-20 h-[56px] shrink-0 bg-white/90 backdrop-blur-md border-b border-[#E0E0E6]">
-        <div className="max-w-[1600px] mx-auto px-5 h-full flex items-center justify-between gap-4">
+      {/* 顶栏（支持半屏/窄屏自动换行，避免右侧按钮裁切） */}
+      <header className="sticky top-0 z-20 min-h-[56px] shrink-0 bg-white/90 backdrop-blur-md border-b border-[#E0E0E6]">
+        <div className="max-w-[1600px] mx-auto px-3.5 sm:px-5 min-h-[56px] py-1.5 flex flex-wrap items-center justify-between gap-2.5 sm:gap-4">
           <div className="flex items-center gap-3 min-w-0">
             <span className="text-[15px] font-bold tracking-tight text-[#1E2028] whitespace-nowrap">
               ChibiPrompt Studio
@@ -1009,7 +1028,7 @@ export default function App() {
             </span>
           </div>
 
-          <div className="flex items-center gap-2.5 shrink-0">
+          <div className="flex flex-wrap items-center gap-1.5 sm:gap-2.5">
             <button
               type="button"
               onClick={() => setWorkbenchOpen(true)}
@@ -1354,6 +1373,7 @@ export default function App() {
         comfyUrl={config.comfyUrl}
         activeProfile={activeProfile}
         activeCharacterName={activeCharacter?.name ?? '角色'}
+        knownCharacterHints={config.characters.map((c) => c.name)}
         onOpenSettings={() => {
           setWorkbenchOpen(false);
           setSettingsOpen(true);

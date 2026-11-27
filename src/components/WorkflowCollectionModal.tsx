@@ -1,8 +1,9 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   Check,
   CheckCircle2,
+  CheckSquare,
   ChevronLeft,
   ChevronRight,
   CopyPlus,
@@ -14,6 +15,7 @@ import {
   FolderCheck,
   FolderOpen,
   FolderSync,
+  ImageDown,
   ImagePlus,
   Layers,
   Loader2,
@@ -26,6 +28,8 @@ import {
   Search,
   SlidersHorizontal,
   Sparkles,
+  Square,
+  Tag,
   Trash2,
   Upload,
   X,
@@ -41,26 +45,41 @@ import {
 } from '../types/studio';
 import { sanitizeFilenamePrefix } from '../utils/promptBuilder';
 import {
-  buildCardExportPayload,
+  buildCardExportPayloadAsync,
   buildWorkflowCardFromPngFile,
-  dataUrlToBlob,
   ensureDirectoryWritePermission,
   extractComfyMetadataFromPngFile,
   isFileSystemAccessSupported,
+  isInRestrictedIframe,
   parseComfyWorkflowSource,
   parsePromptToTagItems,
   pickLocalWorkflowDirectory,
-  readImageOriginalData,
+  readImageDimensions,
+  resolveCardImageBlob,
   sendWorkflowCardToComfyUI,
   serializeTagItemsToPrompt,
   writeCardsBatchToLocalDirectory,
   writeCardToLocalDirectory,
 } from '../utils/workflowLibrary';
 import {
+  clearCardImageCache,
+  formatBytesCompact,
+  invalidateCardImageCache,
+  useCardImageSrc,
+} from '../utils/cardImageCache';
+import {
+  copyCardImageBlob,
+  deleteCardImageBlobsBatch,
+  encodeBlobToDataUrl,
+  isIndexedDbSupported,
   loadBoundDirectoryHandle,
   mergeImportedWorkflowCards,
+  migrateCardInlineImagesToIdb,
   normalizeWorkflowCards,
   saveBoundDirectoryHandle,
+  saveCardImageBlob,
+  saveCardImageBlobsBatch,
+  StoredCardImageRecord,
 } from '../utils/storageCache';
 
 interface WorkflowCollectionModalProps {
@@ -71,6 +90,7 @@ interface WorkflowCollectionModalProps {
   comfyUrl: string;
   activeProfile: ComfyProfile;
   activeCharacterName: string;
+  knownCharacterHints?: string[];
   onOpenSettings: () => void;
 }
 
@@ -82,6 +102,9 @@ interface DraftImportState {
   originalImageMime?: string;
   originalImageWidth?: number;
   originalImageHeight?: number;
+  imageByteSize?: number;
+  imageFile?: File | null;
+  previewObjectUrl?: string;
   imageName: string;
   workflowFileName: string;
   workflowFormat: WorkflowJsonFormat;
@@ -115,6 +138,9 @@ const EMPTY_DRAFT: DraftImportState = {
   originalImageMime: undefined,
   originalImageWidth: undefined,
   originalImageHeight: undefined,
+  imageByteSize: undefined,
+  imageFile: null,
+  previewObjectUrl: undefined,
   imageName: '',
   workflowFileName: '',
   workflowFormat: 'unknown',
@@ -150,6 +176,128 @@ function formatFormatLabel(fmt: WorkflowJsonFormat): string {
   return '未知格式';
 }
 
+function cardHasImage(card: WorkflowCollectionCard): boolean {
+  return Boolean(
+    card.hasOriginalImageBlob || card.originalImageDataUrl || card.thumbnailDataUrl
+  );
+}
+
+function cardHasLosslessOriginal(card: WorkflowCollectionCard): boolean {
+  return Boolean(card.hasOriginalImageBlob || card.originalImageDataUrl);
+}
+
+const CardThumbnailPreview: React.FC<{
+  card: WorkflowCollectionCard;
+  onOpenLightbox: (cardId: string) => void;
+}> = memo(({ card, onOpenLightbox }) => {
+  const { src, loading } = useCardImageSrc(card);
+  const hasAny = cardHasImage(card);
+
+  if (!hasAny) {
+    return (
+      <div className="w-[84px] h-[104px] rounded-[9px] border border-[#E0E0E6] bg-[#FAFAFC] flex flex-col items-center justify-center text-[#949AA8] shrink-0">
+        <FileJson className="w-5 h-5 mb-1" />
+        <span className="text-[10px]">纯 JSON</span>
+      </div>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={() => onOpenLightbox(card.id)}
+      title="点击查看大图（保留原图画质）"
+      className="group relative w-[84px] h-[104px] rounded-[9px] overflow-hidden border border-[#E0E0E6] bg-[#FAFAFC] shrink-0 cursor-zoom-in focus:outline-none focus:ring-2 focus:ring-[#7C5CFC]/50"
+    >
+      {src ? (
+        <img
+          src={src}
+          alt={card.title}
+          loading="lazy"
+          decoding="async"
+          referrerPolicy="no-referrer"
+          className="w-full h-full object-cover transition-transform duration-200 group-hover:scale-105"
+        />
+      ) : (
+        <div className="w-full h-full flex items-center justify-center text-[#949AA8]">
+          {loading ? (
+            <Loader2 className="w-4 h-4 animate-spin" />
+          ) : (
+            <ImagePlus className="w-4 h-4" />
+          )}
+        </div>
+      )}
+      <span className="absolute right-1 bottom-1 w-5 h-5 rounded-md bg-black/55 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+        <ZoomIn className="w-3 h-3" />
+      </span>
+    </button>
+  );
+});
+
+const DrawerThumbnailButton: React.FC<{
+  card: WorkflowCollectionCard;
+  alt: string;
+  onOpenLightbox: (cardId: string) => void;
+}> = ({ card, alt, onOpenLightbox }) => {
+  const { src } = useCardImageSrc(card);
+  if (!cardHasImage(card)) {
+    return (
+      <div className="w-10 h-10 rounded-[8px] border border-[#E0E0E6] bg-[#FAFAFC] flex items-center justify-center text-[#949AA8] shrink-0">
+        <FileJson className="w-4 h-4" />
+      </div>
+    );
+  }
+  return (
+    <button
+      type="button"
+      onClick={() => onOpenLightbox(card.id)}
+      title="点击查看大图"
+      className="w-10 h-10 shrink-0 rounded-[8px] overflow-hidden border border-[#E0E0E6] bg-[#FAFAFC] cursor-zoom-in flex items-center justify-center"
+    >
+      {src ? (
+        <img
+          src={src}
+          alt={alt}
+          referrerPolicy="no-referrer"
+          className="w-full h-full object-cover"
+        />
+      ) : (
+        <Loader2 className="w-4 h-4 animate-spin text-[#949AA8]" />
+      )}
+    </button>
+  );
+};
+
+const LightboxImageElement: React.FC<{
+  card: WorkflowCollectionCard;
+}> = ({ card }) => {
+  const { src, loading } = useCardImageSrc(card);
+  if (loading && !src) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-2 text-white/80 py-16">
+        <Loader2 className="w-7 h-7 animate-spin" />
+        <span className="text-[12px]">正在读取无损原图...</span>
+      </div>
+    );
+  }
+  if (!src) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-2 text-white/75 py-16">
+        <FileJson className="w-9 h-9 opacity-70" />
+        <span className="text-[12.5px]">该卡片暂无参考图数据</span>
+      </div>
+    );
+  }
+  return (
+    <img
+      src={src}
+      alt={card.title}
+      referrerPolicy="no-referrer"
+      className="max-w-full max-h-[80vh] object-contain rounded-[10px] shadow-[0_24px_64px_rgba(0,0,0,0.55)] bg-black/25 select-none"
+    />
+  );
+};
+
 export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = ({
   open,
   onClose,
@@ -158,6 +306,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   comfyUrl,
   activeProfile,
   activeCharacterName,
+  knownCharacterHints,
   onOpenSettings,
 }) => {
   const [draft, setDraft] = useState<DraftImportState>(EMPTY_DRAFT);
@@ -167,6 +316,15 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   const [isDragging, setIsDragging] = useState(false);
   const [isBatchDragging, setIsBatchDragging] = useState(false);
   const [isImportingBatch, setIsImportingBatch] = useState(false);
+  const [batchProgress, setBatchProgress] = useState<{
+    processed: number;
+    total: number;
+    succeeded: number;
+    skipped: number;
+    currentFile: string;
+  } | null>(null);
+  const [skippedDetails, setSkippedDetails] = useState<{ fileName: string; reason: string }[]>([]);
+  const [showSkippedDetails, setShowSkippedDetails] = useState(false);
   const [importNotice, setImportNotice] = useState<{
     type: 'ok' | 'err' | 'warn';
     text: string;
@@ -175,7 +333,17 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
   const [privateView, setPrivateView] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
   const [activeTagFilter, setActiveTagFilter] = useState<string>('ALL');
+  const [showAllTags, setShowAllTags] = useState(false);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState<24 | 48 | 96>(24);
+
+  // Batch organization mode
+  const [batchSelectMode, setBatchSelectMode] = useState(false);
+  const [selectedCardIds, setSelectedCardIds] = useState<Set<string>>(() => new Set());
+  const [batchTagInput, setBatchTagInput] = useState('');
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
 
   const [runStatus, setRunStatus] = useState<WorkbenchRunStatus>({ state: 'idle' });
   const [preferStudioProfile, setPreferStudioProfile] = useState(false);
@@ -184,6 +352,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
   // Local folder binding state (File System Access API + graceful fallback)
   const fsApiSupported = useMemo(() => isFileSystemAccessSupported(), []);
+  const inRestrictedIframe = useMemo(() => isInRestrictedIframe(), []);
   const [boundDirHandle, setBoundDirHandle] = useState<FileSystemDirectoryHandle | null>(null);
   const [dirPermState, setDirPermState] = useState<'none' | 'granted' | 'prompt' | 'denied'>('none');
   const [folderNotice, setFolderNotice] = useState<{
@@ -191,6 +360,12 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     text: string;
   } | null>(null);
   const [isSyncingFolder, setIsSyncingFolder] = useState(false);
+  const [syncProgress, setSyncProgress] = useState<{
+    done: number;
+    total: number;
+    currentTitle: string;
+  } | null>(null);
+  const [isExportingJson, setIsExportingJson] = useState(false);
 
   // Lightbox state
   const [lightboxCardId, setLightboxCardId] = useState<string | null>(null);
@@ -216,6 +391,29 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const jsonInputRef = useRef<HTMLInputElement | null>(null);
   const collectionImportRef = useRef<HTMLInputElement | null>(null);
+  const draftPreviewUrlRef = useRef<string | undefined>(undefined);
+  const cardsRef = useRef<WorkflowCollectionCard[]>(cards);
+  cardsRef.current = cards;
+
+  useEffect(() => {
+    draftPreviewUrlRef.current = draft.previewObjectUrl;
+  }, [draft.previewObjectUrl]);
+
+  useEffect(() => {
+    return () => {
+      if (draftPreviewUrlRef.current) {
+        URL.revokeObjectURL(draftPreviewUrlRef.current);
+      }
+      clearCardImageCache();
+    };
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setDebouncedSearch(searchQuery);
+    }, 180);
+    return () => window.clearTimeout(timer);
+  }, [searchQuery]);
 
   const editingCard = useMemo(
     () => (editingCardId ? cards.find((c) => c.id === editingCardId) ?? null : null),
@@ -244,6 +442,21 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     [privateView, privateCards, publicCards]
   );
 
+  const untaggedCount = useMemo(
+    () => scopedCards.filter((c) => c.tags.length === 0).length,
+    [scopedCards]
+  );
+
+  const modifiedCount = useMemo(
+    () =>
+      scopedCards.filter(
+        (c) =>
+          c.fineTunedPositive.trim() !== c.extractedPositive.trim() ||
+          c.fineTunedNegative.trim() !== c.extractedNegative.trim()
+      ).length,
+    [scopedCards]
+  );
+
   const allCategoryTags = useMemo(() => {
     const counts = new Map<string, number>();
     for (const card of scopedCards) {
@@ -255,9 +468,16 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   }, [scopedCards]);
 
   const filteredCards = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
+    const q = debouncedSearch.trim().toLowerCase();
     return scopedCards.filter((card) => {
-      if (activeTagFilter !== 'ALL' && !card.tags.includes(activeTagFilter)) {
+      if (activeTagFilter === '__UNTAGGED__') {
+        if (card.tags.length > 0) return false;
+      } else if (activeTagFilter === '__MODIFIED__') {
+        const modified =
+          card.fineTunedPositive.trim() !== card.extractedPositive.trim() ||
+          card.fineTunedNegative.trim() !== card.extractedNegative.trim();
+        if (!modified) return false;
+      } else if (activeTagFilter !== 'ALL' && !card.tags.includes(activeTagFilter)) {
         return false;
       }
       if (!q) return true;
@@ -268,7 +488,22 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         card.fineTunedNegative.toLowerCase().includes(q)
       );
     });
-  }, [scopedCards, activeTagFilter, searchQuery]);
+  }, [scopedCards, activeTagFilter, debouncedSearch]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredCards.length / pageSize));
+  const safePage = Math.min(page, totalPages);
+  const pagedCards = useMemo(() => {
+    const start = (safePage - 1) * pageSize;
+    return filteredCards.slice(start, start + pageSize);
+  }, [filteredCards, safePage, pageSize]);
+
+  useEffect(() => {
+    setPage(1);
+  }, [debouncedSearch, activeTagFilter, privateView, pageSize]);
+
+  useEffect(() => {
+    setConfirmBulkDelete(false);
+  }, [selectedCardIds, batchSelectMode]);
 
   const lightboxIndex = useMemo(() => {
     if (!lightboxCardId) return -1;
@@ -286,6 +521,9 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       setPrivateView(false);
       setActiveTagFilter('ALL');
       setLightboxCardId(null);
+      setBatchSelectMode(false);
+      setSelectedCardIds(new Set());
+      clearCardImageCache();
       return;
     }
     const onKeyDown = (e: KeyboardEvent) => {
@@ -415,11 +653,14 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   };
 
   const tryAutoWriteCardToFolder = useCallback(
-    async (card: WorkflowCollectionCard): Promise<{ written: boolean; path?: string; error?: string }> => {
+    async (
+      card: WorkflowCollectionCard,
+      overrideBlob?: Blob | null
+    ): Promise<{ written: boolean; path?: string; error?: string }> => {
       if (!boundDirHandle || dirPermState !== 'granted') {
         return { written: false };
       }
-      const res = await writeCardToLocalDirectory(boundDirHandle, card);
+      const res = await writeCardToLocalDirectory(boundDirHandle, card, overrideBlob);
       if (res.ok) {
         return { written: true, path: res.relativePath };
       }
@@ -428,7 +669,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     [boundDirHandle, dirPermState]
   );
 
-  const handleSyncScopedCardsToFolder = async () => {
+  const handleSyncScopedCardsToFolder = async (cardsOverride?: WorkflowCollectionCard[]) => {
     if (!boundDirHandle) {
       await handleSelectLocalFolder();
       return;
@@ -442,7 +683,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       });
       return;
     }
-    const targetCards = scopedCards;
+    const targetCards = cardsOverride ?? scopedCards;
     if (targetCards.length === 0) {
       setFolderNotice({
         type: 'warn',
@@ -452,22 +693,30 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     }
 
     setIsSyncingFolder(true);
+    setSyncProgress({ done: 0, total: targetCards.length, currentTitle: targetCards[0]?.title ?? '' });
     try {
       const { succeededIds, failed } = await writeCardsBatchToLocalDirectory(
         boundDirHandle,
-        targetCards
+        targetCards,
+        {
+          onProgress: (done, total, currentTitle) => {
+            setSyncProgress({ done, total, currentTitle });
+          },
+        }
       );
       if (succeededIds.length > 0) {
         const now = Date.now();
         const okSet = new Set(succeededIds);
         commitCards(
-          cards.map((c) => (okSet.has(c.id) ? { ...c, lastFolderSyncAt: now } : c))
+          cardsRef.current.map((c) =>
+            okSet.has(c.id) ? { ...c, lastFolderSyncAt: now } : c
+          )
         );
       }
       if (failed.length === 0) {
         setFolderNotice({
           type: 'ok',
-          text: `已将 ${succeededIds.length} 张${privateView ? '私密' : '公开'}卡片（含未压缩原图 + workflow.json + card.json）同步写入本地文件夹「${boundDirHandle.name}」`,
+          text: `已将 ${succeededIds.length} 张卡片（含未压缩原图 + workflow.json + card.json）同步写入本地文件夹「${boundDirHandle.name}」`,
         });
       } else {
         setFolderNotice({
@@ -477,6 +726,40 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       }
     } finally {
       setIsSyncingFolder(false);
+      setSyncProgress(null);
+    }
+  };
+
+  const handleWriteSingleCardToFolder = async (card: WorkflowCollectionCard) => {
+    if (!boundDirHandle) {
+      await handleSelectLocalFolder();
+      return;
+    }
+    const perm = await ensureDirectoryWritePermission(boundDirHandle, true);
+    setDirPermState(perm);
+    if (perm !== 'granted') {
+      setFolderNotice({
+        type: 'warn',
+        text: `未获得「${boundDirHandle.name}」写入权限，请先授权或改用单卡下载`,
+      });
+      return;
+    }
+    const res = await writeCardToLocalDirectory(boundDirHandle, card);
+    if (res.ok) {
+      commitCards(
+        cardsRef.current.map((c) =>
+          c.id === card.id ? { ...c, lastFolderSyncAt: Date.now() } : c
+        )
+      );
+      setFolderNotice({
+        type: 'ok',
+        text: `已将「${card.title}」原图与工作流写入「${boundDirHandle.name}/${res.relativePath}」`,
+      });
+    } else {
+      setFolderNotice({
+        type: 'err',
+        text: `写入「${card.title}」失败：${res.error}`,
+      });
     }
   };
 
@@ -511,12 +794,18 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       return;
     }
 
-    let originalImage: Awaited<ReturnType<typeof readImageOriginalData>> | null = null;
+    let imageDims: { width?: number; height?: number } = {};
+    let previewObjectUrl: string | undefined;
+    let inlineDataUrlFallback: string | undefined;
     let pngMeta: Awaited<ReturnType<typeof extractComfyMetadataFromPngFile>> | null = null;
 
     if (nextImageFile) {
       try {
-        originalImage = await readImageOriginalData(nextImageFile);
+        imageDims = await readImageDimensions(nextImageFile);
+        previewObjectUrl = URL.createObjectURL(nextImageFile);
+        if (!isIndexedDbSupported()) {
+          inlineDataUrlFallback = await encodeBlobToDataUrl(nextImageFile);
+        }
         if (
           nextImageFile.type === 'image/png' ||
           nextImageFile.name.toLowerCase().endsWith('.png')
@@ -524,6 +813,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
           pngMeta = await extractComfyMetadataFromPngFile(nextImageFile);
         }
       } catch (err) {
+        if (previewObjectUrl) URL.revokeObjectURL(previewObjectUrl);
         setImportNotice({
           type: 'err',
           text: err instanceof Error ? err.message : '读取参考图失败',
@@ -543,30 +833,45 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     }
 
     setDraft((prev) => {
+      if (nextImageFile && prev.previewObjectUrl && prev.previewObjectUrl !== previewObjectUrl) {
+        URL.revokeObjectURL(prev.previewObjectUrl);
+      }
       const updated = { ...prev };
-      if (nextImageFile && originalImage) {
-        updated.thumbnailDataUrl = originalImage.dataUrl;
-        updated.originalImageDataUrl = originalImage.dataUrl;
-        updated.originalImageMime = originalImage.mimeType;
-        updated.originalImageWidth = originalImage.width;
-        updated.originalImageHeight = originalImage.height;
+      if (nextImageFile) {
+        updated.imageFile = nextImageFile;
+        updated.previewObjectUrl = previewObjectUrl;
+        updated.thumbnailDataUrl = inlineDataUrlFallback ?? previewObjectUrl ?? '';
+        updated.originalImageDataUrl = inlineDataUrlFallback;
+        updated.originalImageMime = nextImageFile.type || 'image/png';
+        updated.originalImageWidth = imageDims.width;
+        updated.originalImageHeight = imageDims.height;
+        updated.imageByteSize = nextImageFile.size;
         updated.imageName = nextImageFile.name;
         if (!updated.title.trim()) {
+          const stem = stripFileExtension(nextImageFile.name);
+          const ch = pngMeta?.chibipromptMeta?.character?.trim();
           updated.title =
-            pngMeta?.chibipromptMeta?.character ||
-            stripFileExtension(nextImageFile.name);
+            ch && stem && !stem.toLowerCase().includes(ch.toLowerCase())
+              ? `${ch} · ${stem}`
+              : stem || ch || '';
         }
       }
 
       const effectiveRawJson = rawJsonText || pngMeta?.workflowJson || '';
       const effectiveApiJson = pngMeta?.apiPromptJson;
 
-      if (effectiveRawJson || effectiveApiJson || pngMeta?.chibipromptMeta) {
+      if (
+        effectiveRawJson ||
+        effectiveApiJson ||
+        pngMeta?.chibipromptMeta ||
+        pngMeta?.a1111Meta
+      ) {
         try {
           const parsed = parseComfyWorkflowSource({
             rawJsonText: effectiveRawJson || undefined,
             apiPromptJsonText: effectiveApiJson,
             chibipromptMeta: pngMeta?.chibipromptMeta,
+            a1111Meta: pngMeta?.a1111Meta,
           });
           updated.workflowFileName = nextJsonFile
             ? nextJsonFile.name
@@ -590,7 +895,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
             type: 'ok',
             text: nextJsonFile
               ? `已解析工作流「${nextJsonFile.name}」（${formatFormatLabel(parsed.workflowFormat)}，共扫描到 ${parsed.nodeCandidates.length} 个文本/CLIP节点）`
-              : `已从 PNG 元数据自动提取工作流与提示词（${formatFormatLabel(parsed.workflowFormat)}）`,
+              : `已从 PNG 元数据自动提取工作流与提示词（${formatFormatLabel(parsed.workflowFormat)}，保留无损原图）`,
           });
         } catch (err) {
           setImportNotice({
@@ -624,16 +929,41 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       stripFileExtension(draft.workflowFileName) ||
       `工作流收藏 #${cards.length + 1}`;
     const tags = parseTagsInput(draft.tagsInput);
+    const cardId = `wf-card-${now}-${Math.random().toString(36).slice(2, 6)}`;
+
+    let storedInIdb = false;
+    if (draft.imageFile && isIndexedDbSupported()) {
+      storedInIdb = await saveCardImageBlob(cardId, {
+        blob: draft.imageFile,
+        mimeType: draft.imageFile.type || draft.originalImageMime || 'image/png',
+        width: draft.originalImageWidth,
+        height: draft.originalImageHeight,
+        byteSize: draft.imageFile.size,
+        updatedAt: now,
+      });
+    }
+
+    let fallbackInlineDataUrl = draft.originalImageDataUrl;
+    if (draft.imageFile && !storedInIdb && !fallbackInlineDataUrl) {
+      try {
+        fallbackInlineDataUrl = await encodeBlobToDataUrl(draft.imageFile);
+      } catch {
+        fallbackInlineDataUrl = undefined;
+      }
+    }
 
     let newCard: WorkflowCollectionCard = {
-      id: `wf-card-${now}-${Math.random().toString(36).slice(2, 6)}`,
+      id: cardId,
       title,
       tags,
-      thumbnailDataUrl: draft.originalImageDataUrl || draft.thumbnailDataUrl,
-      originalImageDataUrl: draft.originalImageDataUrl,
+      thumbnailDataUrl: storedInIdb ? '' : fallbackInlineDataUrl || '',
+      originalImageDataUrl: storedInIdb ? undefined : fallbackInlineDataUrl,
       originalImageMime: draft.originalImageMime,
       originalImageWidth: draft.originalImageWidth,
       originalImageHeight: draft.originalImageHeight,
+      hasOriginalImageBlob: Boolean(draft.imageFile || fallbackInlineDataUrl),
+      imageByteSize: draft.imageByteSize ?? draft.imageFile?.size,
+      autoImportedSource: 'manual',
       imageName: draft.imageName,
       workflowFileName: draft.workflowFileName || 'workflow.json',
       workflowFormat: draft.workflowFormat,
@@ -653,7 +983,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       updatedAt: now,
     };
 
-    const folderRes = await tryAutoWriteCardToFolder(newCard);
+    const folderRes = await tryAutoWriteCardToFolder(newCard, draft.imageFile ?? null);
     if (folderRes.written) {
       newCard = { ...newCard, lastFolderSyncAt: Date.now() };
     } else if (folderRes.error) {
@@ -663,8 +993,11 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       });
     }
 
-    const saveRes = commitCards([newCard, ...cards]);
+    const saveRes = commitCards([newCard, ...cardsRef.current]);
     if (saveRes.ok) {
+      if (draft.previewObjectUrl) {
+        URL.revokeObjectURL(draft.previewObjectUrl);
+      }
       setDraft({ ...EMPTY_DRAFT, isPrivate: privateView });
       const folderSuffix = folderRes.written
         ? `，已同步写入本地文件夹 (${folderRes.path})`
@@ -709,37 +1042,96 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     if (lightboxCardId === cardId) {
       setLightboxCardId(null);
     }
+    setSelectedCardIds((prev) => {
+      if (!prev.has(cardId)) return prev;
+      const next = new Set(prev);
+      next.delete(cardId);
+      return next;
+    });
+    invalidateCardImageCache([cardId]);
+    void deleteCardImageBlobsBatch([cardId]);
     commitCards(cards.filter((c) => c.id !== cardId));
   };
 
-  const handleDownloadCardOriginalImage = (card: WorkflowCollectionCard) => {
-    const src = card.originalImageDataUrl || card.thumbnailDataUrl;
-    if (!src) return;
-    try {
-      const blob = dataUrlToBlob(src);
-      const ext =
-        card.imageName.match(/\.([a-z0-9]{2,5})$/i)?.[1]?.toLowerCase() ||
-        (blob.type.includes('jpeg')
-          ? 'jpg'
-          : blob.type.includes('webp')
-          ? 'webp'
-          : 'png');
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${sanitizeFilenamePrefix(card.title)}.${ext}`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    } catch {
-      const a = document.createElement('a');
-      a.href = src;
-      a.download = card.imageName || `${sanitizeFilenamePrefix(card.title)}.png`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
+  const handleBulkTogglePrivate = (makePrivate: boolean) => {
+    if (selectedCardIds.size === 0) return;
+    const now = Date.now();
+    const res = commitCards(
+      cards.map((c) =>
+        selectedCardIds.has(c.id) ? { ...c, isPrivate: makePrivate, updatedAt: now } : c
+      )
+    );
+    if (res.ok) {
+      setImportNotice({
+        type: 'ok',
+        text: makePrivate
+          ? `已将选中的 ${selectedCardIds.size} 张卡片设为私密`
+          : `已将选中的 ${selectedCardIds.size} 张卡片取消私密`,
+      });
+      setSelectedCardIds(new Set());
     }
+  };
+
+  const handleBulkAddTags = () => {
+    const tagsToAdd = parseTagsInput(batchTagInput);
+    if (selectedCardIds.size === 0 || tagsToAdd.length === 0) return;
+    const now = Date.now();
+    const res = commitCards(
+      cards.map((c) => {
+        if (!selectedCardIds.has(c.id)) return c;
+        const mergedTags = Array.from(new Set([...c.tags, ...tagsToAdd]));
+        return { ...c, tags: mergedTags, updatedAt: now };
+      })
+    );
+    if (res.ok) {
+      setBatchTagInput('');
+      setImportNotice({
+        type: 'ok',
+        text: `已为选中的 ${selectedCardIds.size} 张卡片批量添加标签：${tagsToAdd.join('、')}`,
+      });
+    }
+  };
+
+  const handleBulkDeleteSelected = () => {
+    if (selectedCardIds.size === 0) return;
+    const ids = Array.from(selectedCardIds);
+    if (editingCardId && selectedCardIds.has(editingCardId)) {
+      setEditingCardId(null);
+    }
+    if (lightboxCardId && selectedCardIds.has(lightboxCardId)) {
+      setLightboxCardId(null);
+    }
+    invalidateCardImageCache(ids);
+    void deleteCardImageBlobsBatch(ids);
+    const res = commitCards(cards.filter((c) => !selectedCardIds.has(c.id)));
+    if (res.ok) {
+      setSelectedCardIds(new Set());
+      setConfirmBulkDelete(false);
+      setImportNotice({
+        type: 'ok',
+        text: `已批量删除 ${ids.length} 张卡片及其本地缓存原图`,
+      });
+    }
+  };
+
+  const handleDownloadCardOriginalImage = async (card: WorkflowCollectionCard) => {
+    const resolved = await resolveCardImageBlob(card);
+    if (!resolved) return;
+    const ext =
+      card.imageName.match(/\.([a-z0-9]{2,5})$/i)?.[1]?.toLowerCase() ||
+      (resolved.mimeType.includes('jpeg')
+        ? 'jpg'
+        : resolved.mimeType.includes('webp')
+        ? 'webp'
+        : 'png');
+    const url = URL.createObjectURL(resolved.blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${sanitizeFilenamePrefix(card.title)}.${ext}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   };
 
   const handleDownloadCardJson = (card: WorkflowCollectionCard) => {
@@ -787,9 +1179,9 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       });
 
       commitCards(
-        cards.map((c) =>
+        cardsRef.current.map((c) =>
           c.id === card.id
-            ? { ...c, lastRunAt: Date.now(), lastPromptId: res.promptId }
+            ? { ...card, lastRunAt: Date.now(), lastPromptId: res.promptId }
             : c
         )
       );
@@ -943,7 +1335,9 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     const finalCard = folderRes.written
       ? { ...updated, lastFolderSyncAt: Date.now() }
       : updated;
-    const res = commitCards(cards.map((c) => (c.id === finalCard.id ? finalCard : c)));
+    const res = commitCards(
+      cardsRef.current.map((c) => (c.id === finalCard.id ? finalCard : c))
+    );
     if (res.ok) {
       setSaveFeedback(
         folderRes.written
@@ -956,15 +1350,24 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
   const handleSaveAsNewCard = async () => {
     const updated = buildUpdatedEditingCard();
-    if (!updated) return;
+    if (!updated || !editingCard) return;
     const now = Date.now();
     const baseTitle = updated.title;
     const newTitle =
-      baseTitle === editingCard?.title ? `${baseTitle} · 微调` : baseTitle;
+      baseTitle === editingCard.title ? `${baseTitle} · 微调` : baseTitle;
+    const newId = `wf-card-${now}-${Math.random().toString(36).slice(2, 6)}`;
+
+    let clonedHasBlob = Boolean(updated.hasOriginalImageBlob);
+    if (editingCard.hasOriginalImageBlob && isIndexedDbSupported()) {
+      const copied = await copyCardImageBlob(editingCard.id, newId);
+      clonedHasBlob = copied || clonedHasBlob;
+    }
+
     let cloned: WorkflowCollectionCard = {
       ...updated,
-      id: `wf-card-${now}-${Math.random().toString(36).slice(2, 6)}`,
+      id: newId,
       title: newTitle,
+      hasOriginalImageBlob: clonedHasBlob,
       lastRunAt: undefined,
       lastPromptId: undefined,
       lastFolderSyncAt: undefined,
@@ -975,7 +1378,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     if (folderRes.written) {
       cloned = { ...cloned, lastFolderSyncAt: Date.now() };
     }
-    const res = commitCards([cloned, ...cards]);
+    const res = commitCards([cloned, ...cardsRef.current]);
     if (res.ok) {
       setEditingCardId(cloned.id);
       setEditTitle(cloned.title);
@@ -991,34 +1394,58 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   const handleRunFromDrawer = async () => {
     const updated = buildUpdatedEditingCard();
     if (!updated) return;
-    commitCards(cards.map((c) => (c.id === updated.id ? updated : c)));
+    commitCards(cardsRef.current.map((c) => (c.id === updated.id ? updated : c)));
     await handleRunCard(updated);
   };
 
-  const handleExportCollection = () => {
-    const payload = buildCardExportPayload(cards);
-    const blob = new Blob([payload], { type: 'application/json;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `chibiprompt-workflow-cards-${new Date().toISOString().slice(0, 10)}.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+  const handleExportCollection = async () => {
+    setIsExportingJson(true);
+    try {
+      const { payload, omittedLargeImagesCount } = await buildCardExportPayloadAsync(cards);
+      const blob = new Blob([payload], { type: 'application/json;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `chibiprompt-workflow-cards-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      if (omittedLargeImagesCount > 0) {
+        setImportNotice({
+          type: 'warn',
+          text: `已导出公开收藏集；因图片总体积过大，${omittedLargeImagesCount} 张卡片在 JSON 中仅保留元数据（完整原图建议通过「同步本地文件夹」落盘备份）`,
+        });
+      }
+    } finally {
+      setIsExportingJson(false);
+    }
   };
 
-  const handleExportPrivateCollection = () => {
-    const payload = buildCardExportPayload(cards, { onlyPrivate: true });
-    const blob = new Blob([payload], { type: 'application/json;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `chibiprompt-private-workflow-cards-${new Date().toISOString().slice(0, 10)}.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+  const handleExportPrivateCollection = async () => {
+    setIsExportingJson(true);
+    try {
+      const { payload, omittedLargeImagesCount } = await buildCardExportPayloadAsync(cards, {
+        onlyPrivate: true,
+      });
+      const blob = new Blob([payload], { type: 'application/json;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `chibiprompt-private-workflow-cards-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      if (omittedLargeImagesCount > 0) {
+        setImportNotice({
+          type: 'warn',
+          text: `已导出私密卡片；因图片总体积过大，${omittedLargeImagesCount} 张卡片在 JSON 中仅保留元数据（完整原图建议绑定本地文件夹落盘）`,
+        });
+      }
+    } finally {
+      setIsExportingJson(false);
+    }
   };
 
   const handleImportCollection = async (input: FileList | File[]) => {
@@ -1027,14 +1454,34 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
     setIsImportingBatch(true);
     setImportNotice(null);
+    setSkippedDetails([]);
+    setShowSkippedDetails(false);
+    setBatchProgress({
+      processed: 0,
+      total: files.length,
+      succeeded: 0,
+      skipped: 0,
+      currentFile: files[0]?.name ?? '',
+    });
 
     const importedJsonCards: WorkflowCollectionCard[] = [];
     const importedPngCards: WorkflowCollectionCard[] = [];
+    const blobEntriesToSave: { cardId: string; record: StoredCardImageRecord }[] = [];
+    const blobsByCardId = new Map<string, Blob>();
     const skipped: { fileName: string; reason: string }[] = [];
 
     try {
-      for (const file of files) {
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
         const lower = file.name.toLowerCase();
+        setBatchProgress({
+          processed: i,
+          total: files.length,
+          succeeded: importedPngCards.length + importedJsonCards.length,
+          skipped: skipped.length,
+          currentFile: file.name,
+        });
+
         if (file.type === 'application/json' || lower.endsWith('.json')) {
           try {
             const text = await file.text();
@@ -1067,7 +1514,8 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
               });
               continue;
             }
-            importedJsonCards.push(...normalized);
+            const { cards: lightCards } = await migrateCardInlineImagesToIdb(normalized);
+            importedJsonCards.push(...lightCards);
           } catch {
             skipped.push({
               fileName: file.name,
@@ -1077,9 +1525,23 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         } else if (file.type === 'image/png' || lower.endsWith('.png')) {
           const pngResult = await buildWorkflowCardFromPngFile(file, {
             isPrivate: privateView,
+            knownCharacterHints,
+            indexSeed: i,
           });
           if (pngResult.ok) {
             importedPngCards.push(pngResult.card);
+            blobsByCardId.set(pngResult.card.id, pngResult.imageBlob);
+            blobEntriesToSave.push({
+              cardId: pngResult.card.id,
+              record: {
+                blob: pngResult.imageBlob,
+                mimeType: pngResult.mimeType,
+                width: pngResult.card.originalImageWidth,
+                height: pngResult.card.originalImageHeight,
+                byteSize: pngResult.imageBlob.size,
+                updatedAt: pngResult.card.updatedAt,
+              },
+            });
           } else {
             skipped.push({
               fileName: pngResult.fileName,
@@ -1092,28 +1554,49 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
             reason: '仅支持收藏集 .json 或内嵌 ComfyUI 参数的 .png 图片',
           });
         }
+
+        if (i > 0 && i % 6 === 0) {
+          await new Promise((r) => setTimeout(r, 0));
+        }
+      }
+
+      if (blobEntriesToSave.length > 0 && isIndexedDbSupported()) {
+        await saveCardImageBlobsBatch(blobEntriesToSave);
       }
 
       const allImported = [...importedPngCards, ...importedJsonCards];
+      setSkippedDetails(skipped);
+
       if (allImported.length > 0) {
-        let cardsToMerge = allImported;
+        const merged = mergeImportedWorkflowCards(cardsRef.current, allImported);
+        const importedCount = allImported.length;
+        const newlyAddedCards = merged.slice(0, importedCount);
+
+        let cardsAfterSync = merged;
         let folderSyncedCount = 0;
         if (boundDirHandle && dirPermState === 'granted') {
           const { succeededIds } = await writeCardsBatchToLocalDirectory(
             boundDirHandle,
-            allImported
+            newlyAddedCards,
+            {
+              blobsByCardId,
+              onProgress: (done, total, currentTitle) => {
+                setSyncProgress({ done, total, currentTitle });
+              },
+            }
           );
+          setSyncProgress(null);
           if (succeededIds.length > 0) {
             folderSyncedCount = succeededIds.length;
             const okSet = new Set(succeededIds);
             const syncTime = Date.now();
-            cardsToMerge = allImported.map((c) =>
+            cardsAfterSync = merged.map((c) =>
               okSet.has(c.id) ? { ...c, lastFolderSyncAt: syncTime } : c
             );
           }
         }
-        const merged = mergeImportedWorkflowCards(cards, cardsToMerge);
-        const res = commitCards(merged);
+
+        const res = commitCards(cardsAfterSync);
         if (res.ok) {
           const parts: string[] = [];
           if (importedPngCards.length > 0 && importedJsonCards.length > 0) {
@@ -1122,7 +1605,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
             );
           } else if (importedPngCards.length > 0) {
             parts.push(
-              `已从 ${importedPngCards.length} 张 PNG 自动提取工作流并生成收藏卡片（保留原图不压缩）`
+              `已从 ${importedPngCards.length} 张 PNG 自动提取工作流并生成收藏卡片（保留原图不压缩，已自动生成默认标题与基础标签）`
             );
           } else {
             parts.push(`已导入 ${importedJsonCards.length} 张工作流收藏卡片`);
@@ -1142,12 +1625,14 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
           }
 
           if (skipped.length > 0) {
-            const skipDetail = skipped
+            const previewSkip = skipped
+              .slice(0, 3)
               .map((s) => `${s.fileName}（${s.reason}）`)
               .join('、');
+            const moreSuffix = skipped.length > 3 ? ` 等共 ${skipped.length} 个文件` : '';
             setImportNotice({
               type: 'warn',
-              text: `${parts.join('')}；已跳过 ${skipped.length} 个文件：${skipDetail}`,
+              text: `${parts.join('')}；已跳过 ${skipped.length} 个文件：${previewSkip}${moreSuffix}`,
             });
           } else {
             setImportNotice({
@@ -1157,18 +1642,22 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
           }
         }
       } else {
-        const errDetail = skipped
+        const previewSkip = skipped
+          .slice(0, 3)
           .map((s) => `${s.fileName}（${s.reason}）`)
           .join('、');
+        const moreSuffix = skipped.length > 3 ? ` 等共 ${skipped.length} 个文件` : '';
         setImportNotice({
           type: 'err',
-          text: errDetail
-            ? `导入失败：${errDetail}`
+          text: previewSkip
+            ? `导入失败：${previewSkip}${moreSuffix}`
             : '导入失败：未识别到有效的收藏集 JSON 或内嵌工作流的 PNG 图片',
         });
       }
     } finally {
       setIsImportingBatch(false);
+      setBatchProgress(null);
+      setSyncProgress(null);
     }
   };
 
@@ -1176,7 +1665,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-[#1E2028]/35 backdrop-blur-xs p-3 sm:p-5"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-[#1E2028]/35 backdrop-blur-xs p-2 sm:p-5"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
@@ -1200,34 +1689,34 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
             void handleImportCollection(e.dataTransfer.files);
           }
         }}
-        className={`relative w-full max-w-[1280px] h-[90vh] flex flex-col rounded-[16px] bg-[#F4F4F7] border shadow-[0_24px_60px_rgba(18,22,33,0.18)] overflow-hidden transition-colors ${
+        className={`relative w-full max-w-[1280px] h-[92vh] sm:h-[90vh] flex flex-col rounded-[16px] bg-[#F4F4F7] border shadow-[0_24px_60px_rgba(18,22,33,0.18)] overflow-hidden overflow-x-hidden transition-colors ${
           isBatchDragging ? 'border-[#7C5CFC] ring-2 ring-[#7C5CFC]/25' : 'border-[#E0E0E6]'
         }`}
       >
-        {/* 顶栏 */}
-        <header className="shrink-0 h-[56px] px-5 bg-white border-b border-[#E0E0E6] flex items-center justify-between gap-3">
-          <div className="flex items-center gap-3 min-w-0">
+        {/* 顶栏（支持半屏/窄屏自动换行，无右侧裁切） */}
+        <header className="shrink-0 min-h-[56px] px-3.5 sm:px-5 py-2 bg-white border-b border-[#E0E0E6] flex flex-wrap items-center justify-between gap-2.5">
+          <div className="flex items-center gap-2.5 min-w-0">
             <div className="w-8 h-8 rounded-[10px] bg-[#F4F2FF] border border-[#DDD8FA] flex items-center justify-center text-[#6B48F5] shrink-0">
               <Layers className="w-4 h-4" />
             </div>
             <div className="min-w-0">
-              <div className="flex items-center gap-2">
-                <h2 className="text-[14.5px] font-bold text-[#1E2028] truncate">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h2 className="text-[14px] sm:text-[14.5px] font-bold text-[#1E2028] truncate">
                   参考图与工作流收藏工作台
                 </h2>
                 <span className="text-[11.5px] text-[#686E7E] tabular-nums whitespace-nowrap">
                   {privateView
-                    ? `· 私密区 ${privateCards.length} 张卡片`
+                    ? `· 私密区 ${privateCards.length} 张`
                     : `· ${publicCards.length} 张卡片`}
                 </span>
               </div>
-              <p className="text-[11px] text-[#8E94A4] truncate">
-                独立工作流库 · 不影响角色槽位与可爱预设快填 · 目标 ComfyUI: {comfyUrl || '未配置'}
+              <p className="text-[11px] text-[#8E94A4] truncate max-w-[460px]">
+                独立工作流库 · 不影响角色槽位与可爱预设快填 · ComfyUI: {comfyUrl || '未配置'}
               </p>
             </div>
           </div>
 
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
             <button
               type="button"
               onClick={() => void handleSelectLocalFolder()}
@@ -1249,7 +1738,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
               ) : (
                 <FolderOpen className="w-3.5 h-3.5 shrink-0" />
               )}
-              <span className="max-w-[130px] truncate">
+              <span className="max-w-[120px] truncate">
                 {boundDirHandle ? `文件夹: ${boundDirHandle.name}` : '选择本地文件夹'}
               </span>
             </button>
@@ -1260,6 +1749,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                 setPrivateView((prev) => !prev);
                 setActiveTagFilter('ALL');
                 setLightboxCardId(null);
+                setSelectedCardIds(new Set());
               }}
               title={
                 privateView
@@ -1296,14 +1786,14 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                   return next;
                 });
               }}
-              className={`h-8 px-3 inline-flex items-center gap-1.5 text-[12px] font-medium rounded-[10px] border transition-colors whitespace-nowrap cursor-pointer ${
+              className={`h-8 px-2.5 sm:px-3 inline-flex items-center gap-1.5 text-[11.5px] sm:text-[12px] font-medium rounded-[10px] border transition-colors whitespace-nowrap cursor-pointer ${
                 createPanelOpen
                   ? 'border-[#7C5CFC] bg-[#F4F2FF] text-[#6B48F5]'
                   : 'border-[#E0E0E6] bg-white text-[#4C5264] hover:border-[#7C5CFC]/50 hover:text-[#6B48F5]'
               }`}
             >
               <Plus className="w-3.5 h-3.5" />
-              <span>{createPanelOpen ? '收起导入建卡' : '导入图片 + JSON 建卡'}</span>
+              <span>{createPanelOpen ? '收起建卡' : '导入图片 + JSON 建卡'}</span>
             </button>
 
             <input
@@ -1354,12 +1844,16 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
             <button
               type="button"
-              onClick={handleExportCollection}
-              disabled={publicCards.length === 0}
+              onClick={() => void handleExportCollection()}
+              disabled={publicCards.length === 0 || isExportingJson}
               title="导出公开收藏集（默认自动排除私密卡片）"
               className="h-8 px-2.5 inline-flex items-center gap-1 text-[11.5px] font-medium rounded-[10px] border border-[#E0E0E6] bg-white text-[#4C5264] hover:border-[#7C5CFC]/40 hover:text-[#7C5CFC] disabled:opacity-40 transition-colors whitespace-nowrap cursor-pointer"
             >
-              <Download className="w-3.5 h-3.5" />
+              {isExportingJson ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Download className="w-3.5 h-3.5" />
+              )}
               <span>导出集</span>
             </button>
 
@@ -1367,7 +1861,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
               type="button"
               onClick={onClose}
               aria-label="关闭收藏工作台"
-              className="h-8 w-8 inline-flex items-center justify-center rounded-[10px] border border-[#E0E0E6] bg-white text-[#5A6072] hover:text-[#1E2028] transition-colors cursor-pointer"
+              className="h-8 w-8 inline-flex items-center justify-center rounded-[10px] border border-[#E0E0E6] bg-white text-[#5A6072] hover:text-[#1E2028] transition-colors cursor-pointer shrink-0"
             >
               <X className="w-4 h-4" />
             </button>
@@ -1375,11 +1869,11 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         </header>
 
         {/* 主体区 */}
-        <div className="flex-1 min-h-0 overflow-y-auto p-4 sm:p-5 space-y-4">
-          {/* 本地文件夹绑定状态与同步条 */}
-          {(boundDirHandle || folderNotice || !fsApiSupported) && (
+        <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden p-3.5 sm:p-5 space-y-3.5">
+          {/* 本地文件夹绑定状态与沙箱降级同步条 */}
+          {(boundDirHandle || folderNotice || !fsApiSupported || inRestrictedIframe) && (
             <div
-              className={`rounded-[12px] border px-4 py-2.5 flex flex-wrap items-center justify-between gap-2.5 text-[12px] ${
+              className={`rounded-[12px] border px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2.5 text-[12px] ${
                 folderNotice?.type === 'err'
                   ? 'border-[#F8C8D2] bg-[#FFF1F3] text-[#B42343]'
                   : folderNotice?.type === 'warn' || (boundDirHandle && dirPermState !== 'granted')
@@ -1402,8 +1896,12 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                     <span>
                       已绑定本地文件夹 <strong className="font-semibold">「{boundDirHandle.name}」</strong>
                       {dirPermState === 'granted'
-                        ? '（读写已授权 · 建卡/微调保存自动落盘未压缩原图与 JSON）'
+                        ? '（读写已授权 · 建卡/微调/批量导入自动写入未压缩原图 + .workflow.json + .card.json）'
                         : '（页面刷新后需点击右侧「授权写入」恢复磁盘写入权限）'}
+                    </span>
+                  ) : inRestrictedIframe ? (
+                    <span>
+                      当前处于受限预览 iframe 沙箱：若浏览器拦截本地文件夹授权，将自动降级为 IndexedDB 原图缓存 +「导出集 / 单卡下载」（拉取到本地 <code className="font-mono text-[11px] bg-[#F2F3F7] px-1 rounded">npm run dev</code> 独立窗口打开即可直写本地文件夹）。
                     </span>
                   ) : (
                     <span>
@@ -1436,8 +1934,8 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                       <FolderSync className="w-3.5 h-3.5" />
                     )}
                     <span>
-                      {isSyncingFolder
-                        ? '写入中...'
+                      {isSyncingFolder && syncProgress
+                        ? `写入中 ${syncProgress.done}/${syncProgress.total}`
                         : `同步${privateView ? '私密' : '公开'}卡片 (${scopedCards.length})`}
                     </span>
                   </button>
@@ -1465,6 +1963,34 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
             </div>
           )}
 
+          {/* 批量导入进度条 */}
+          {batchProgress && (
+            <div className="rounded-[12px] border border-[#DDD8FA] bg-[#F4F2FF] px-4 py-2.5 text-[12px] text-[#5B3DF5] space-y-1.5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <Loader2 className="w-4 h-4 animate-spin shrink-0" />
+                  <span className="font-medium truncate">
+                    正在批量解析并保留原图：{batchProgress.currentFile}
+                  </span>
+                </div>
+                <span className="font-mono text-[11px] tabular-nums shrink-0">
+                  {batchProgress.processed + 1} / {batchProgress.total}（成功 {batchProgress.succeeded} · 跳过 {batchProgress.skipped}）
+                </span>
+              </div>
+              <div className="h-1.5 rounded-full bg-white overflow-hidden">
+                <div
+                  className="h-full bg-[#7C5CFC] transition-all duration-150"
+                  style={{
+                    width: `${Math.min(
+                      100,
+                      Math.round(((batchProgress.processed + 1) / Math.max(1, batchProgress.total)) * 100)
+                    )}%`,
+                  }}
+                />
+              </div>
+            </div>
+          )}
+
           {/* 个人私密区提示与专属导出条 */}
           {privateView && (
             <div className="rounded-[12px] border border-[#F5B8C4] bg-[#FFF5F7] px-4 py-2.5 flex flex-wrap items-center justify-between gap-2.5">
@@ -1481,8 +2007,8 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
               <div className="flex items-center gap-2 shrink-0">
                 <button
                   type="button"
-                  onClick={handleExportPrivateCollection}
-                  disabled={privateCards.length === 0}
+                  onClick={() => void handleExportPrivateCollection()}
+                  disabled={privateCards.length === 0 || isExportingJson}
                   className="h-7 px-2.5 inline-flex items-center gap-1 rounded-[8px] border border-[#F5B8C4] bg-white text-[11.5px] font-medium text-[#C93B58] hover:border-[#E85D75] disabled:opacity-40 cursor-pointer whitespace-nowrap"
                 >
                   <Download className="w-3.5 h-3.5" />
@@ -1502,18 +2028,19 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
               </div>
             </div>
           )}
+
           {/* 批量拖入提示条 */}
           {isBatchDragging && !isDragging && (
             <div className="rounded-[12px] border-2 border-dashed border-[#7C5CFC] bg-[#F4F2FF] px-4 py-3 text-center text-[12px] font-medium text-[#5B3DF5]">
-              松开即可通过「导入集」批量导入含 ComfyUI 参数的 PNG 图片或收藏集 .json
+              松开即可通过「导入集」批量导入含 ComfyUI 参数的 PNG 图片（保留原图不压缩）或收藏集 .json
             </div>
           )}
 
-          {/* 导入反馈条（折叠建卡面板时依然可见） */}
+          {/* 导入反馈条（折叠建卡面板时依然可见，支持展开跳过明细） */}
           {!createPanelOpen && importNotice && (
             <div
               role="status"
-              className={`rounded-[12px] border px-4 py-2.5 flex items-center justify-between gap-2 text-[12px] ${
+              className={`rounded-[12px] border px-4 py-2.5 text-[12px] space-y-2 ${
                 importNotice.type === 'err'
                   ? 'border-[#F8C8D2] bg-[#FFF1F3] text-[#B42343]'
                   : importNotice.type === 'warn'
@@ -1521,22 +2048,49 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                   : 'border-emerald-200 bg-emerald-50/90 text-emerald-900'
               }`}
             >
-              <div className="flex items-center gap-2 min-w-0">
-                {importNotice.type === 'err' || importNotice.type === 'warn' ? (
-                  <AlertCircle className="w-4 h-4 shrink-0" />
-                ) : (
-                  <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-600" />
-                )}
-                <span className="break-words">{importNotice.text}</span>
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex items-start gap-2 min-w-0 flex-1">
+                  {importNotice.type === 'err' || importNotice.type === 'warn' ? (
+                    <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                  ) : (
+                    <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5 text-emerald-600" />
+                  )}
+                  <span className="break-words">{importNotice.text}</span>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  {skippedDetails.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setShowSkippedDetails((v) => !v)}
+                      className="text-[11px] font-medium underline cursor-pointer whitespace-nowrap"
+                    >
+                      {showSkippedDetails ? '收起跳过明细' : `查看跳过明细 (${skippedDetails.length})`}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setImportNotice(null);
+                      setSkippedDetails([]);
+                      setShowSkippedDetails(false);
+                    }}
+                    aria-label="关闭导入提示"
+                    className="p-0.5 opacity-70 hover:opacity-100 cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
               </div>
-              <button
-                type="button"
-                onClick={() => setImportNotice(null)}
-                aria-label="关闭导入提示"
-                className="p-0.5 opacity-70 hover:opacity-100 cursor-pointer shrink-0"
-              >
-                <X className="w-3.5 h-3.5" />
-              </button>
+              {showSkippedDetails && skippedDetails.length > 0 && (
+                <div className="max-h-32 overflow-y-auto rounded-[8px] bg-white/75 border border-black/10 p-2 text-[11px] space-y-1">
+                  {skippedDetails.map((item, idx) => (
+                    <div key={`${item.fileName}-${idx}`} className="flex items-center justify-between gap-2">
+                      <span className="font-mono truncate">{item.fileName}</span>
+                      <span className="shrink-0 opacity-85">{item.reason}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 
@@ -1638,13 +2192,16 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                     新建收藏卡片（参考图 + ComfyUI 工作流 JSON）
                   </h3>
                   <p className="text-[11.5px] text-[#686E7E]">
-                    支持同时拖入 1 张参考图与 1 个 .json 工作流；若仅拖入含 ComfyUI 元数据的 PNG，将自动尝试提取内置工作流与提示词。
+                    支持同时拖入 1 张参考图与 1 个 .json 工作流；若仅拖入含 ComfyUI 元数据的 PNG，将自动提取内置工作流与提示词并保留无损原图。
                   </p>
                 </div>
                 {(draft.thumbnailDataUrl || draft.rawWorkflowJson || draft.extractedPositive) && (
                   <button
                     type="button"
                     onClick={() => {
+                      if (draft.previewObjectUrl) {
+                        URL.revokeObjectURL(draft.previewObjectUrl);
+                      }
                       setDraft(EMPTY_DRAFT);
                       setImportNotice(null);
                     }}
@@ -1859,33 +2416,146 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
             </section>
           )}
 
-          {/* 搜索与标签筛选栏 */}
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="flex flex-wrap items-center gap-2 flex-1 min-w-[240px]">
-              <div className="relative w-full sm:w-[260px]">
-                <Search className="w-3.5 h-3.5 text-[#949AA8] absolute left-3 top-1/2 -translate-y-1/2" />
-                <input
-                  type="text"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="搜索卡片名称、标签或提示词..."
-                  className="w-full h-8 pl-8 pr-3 rounded-[9px] border border-[#E0E0E6] bg-white text-[12px] text-[#1E2028] focus:outline-none focus:border-[#7C5CFC]"
-                />
-              </div>
+          {/* 搜索、标签筛选与批量整理栏 */}
+          <div className="space-y-2.5">
+            <div className="flex flex-wrap items-center justify-between gap-2.5">
+              <div className="flex flex-wrap items-center gap-2 flex-1 min-w-[200px]">
+                <div className="relative w-full sm:w-[250px]">
+                  <Search className="w-3.5 h-3.5 text-[#949AA8] absolute left-3 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="text"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    placeholder="搜索卡片名称、标签或提示词..."
+                    className="w-full h-8 pl-8 pr-7 rounded-[9px] border border-[#E0E0E6] bg-white text-[12px] text-[#1E2028] focus:outline-none focus:border-[#7C5CFC]"
+                  />
+                  {searchQuery && (
+                    <button
+                      type="button"
+                      onClick={() => setSearchQuery('')}
+                      aria-label="清空搜索"
+                      className="absolute right-2 top-1/2 -translate-y-1/2 text-[#949AA8] hover:text-[#1E2028] cursor-pointer"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
 
-              <div className="flex flex-wrap items-center gap-1.5">
                 <button
                   type="button"
-                  onClick={() => setActiveTagFilter('ALL')}
-                  className={`h-7 px-2.5 rounded-[8px] text-[11.5px] font-medium border transition-colors cursor-pointer whitespace-nowrap ${
-                    activeTagFilter === 'ALL'
+                  onClick={() => {
+                    setBatchSelectMode((v) => !v);
+                    setSelectedCardIds(new Set());
+                  }}
+                  className={`h-8 px-2.5 inline-flex items-center gap-1.5 rounded-[9px] border text-[11.5px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                    batchSelectMode
+                      ? 'border-[#7C5CFC] bg-[#F4F2FF] text-[#6B48F5]'
+                      : 'border-[#E0E0E6] bg-white text-[#4C5264] hover:border-[#7C5CFC]/40 hover:text-[#6B48F5]'
+                  }`}
+                >
+                  <CheckSquare className="w-3.5 h-3.5" />
+                  <span>{batchSelectMode ? '退出批量整理' : '批量整理'}</span>
+                </button>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2.5">
+                <div className="flex flex-wrap items-center gap-1.5 text-[11.5px]">
+                  <Lock className="w-3.5 h-3.5 text-[#6B48F5] shrink-0" />
+                  <span className="text-[#4C5264] whitespace-nowrap">Seed:</span>
+                  <select
+                    aria-label="工作台 Seed 模式"
+                    value={workbenchSeedOverride}
+                    onChange={(e) =>
+                      setWorkbenchSeedOverride(e.target.value as 'card' | 'fixed' | 'random')
+                    }
+                    className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-white text-[11.5px] text-[#1E2028] focus:outline-none focus:border-[#7C5CFC]"
+                  >
+                    <option value="card">跟随卡片（默认固定不随机）</option>
+                    <option value="fixed">统一固定 Seed</option>
+                    <option value="random">每次运行随机 Seed</option>
+                  </select>
+                  {workbenchSeedOverride === 'fixed' && (
+                    <>
+                      <input
+                        type="number"
+                        min={0}
+                        value={workbenchFixedSeed}
+                        onChange={(e) => {
+                          const v = parseInt(e.target.value, 10);
+                          setWorkbenchFixedSeed(Number.isFinite(v) && v >= 0 ? v : 0);
+                        }}
+                        className="w-[120px] h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-white text-[11px] font-mono tabular-nums text-[#1E2028] focus:outline-none focus:border-[#7C5CFC]"
+                      />
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setWorkbenchFixedSeed(Math.floor(Math.random() * 2147483647))
+                        }
+                        title="随机换一个固定 Seed"
+                        className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-white text-[#686E7E] hover:text-[#6B48F5] cursor-pointer"
+                      >
+                        <Dices className="w-3.5 h-3.5" />
+                      </button>
+                    </>
+                  )}
+                </div>
+
+                <label
+                  title="开启后直接将卡片内微调过的提示词注入当前 Studio 设置的 ComfyUI 模型方案发送"
+                  className="inline-flex items-center gap-1.5 text-[11.5px] text-[#4C5264] cursor-pointer select-none whitespace-nowrap"
+                >
+                  <input
+                    type="checkbox"
+                    checked={preferStudioProfile}
+                    onChange={(e) => setPreferStudioProfile(e.target.checked)}
+                    className="w-3.5 h-3.5 accent-[#7C5CFC]"
+                  />
+                  <span>固定使用当前 Studio 模型方案</span>
+                </label>
+              </div>
+            </div>
+
+            {/* 分类标签快捷筛选条（大库时自动折叠冗余标签） */}
+            <div className="flex flex-wrap items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => setActiveTagFilter('ALL')}
+                className={`h-7 px-2.5 rounded-[8px] text-[11.5px] font-medium border transition-colors cursor-pointer whitespace-nowrap tabular-nums ${
+                  activeTagFilter === 'ALL'
+                    ? 'border-[#7C5CFC] bg-[#F4F2FF] text-[#6B48F5]'
+                    : 'border-[#E0E0E6] bg-white text-[#686E7E] hover:text-[#1E2028]'
+                }`}
+              >
+                全部 ({scopedCards.length})
+              </button>
+              {untaggedCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setActiveTagFilter('__UNTAGGED__')}
+                  className={`h-7 px-2.5 rounded-[8px] text-[11.5px] font-medium border transition-colors cursor-pointer whitespace-nowrap tabular-nums ${
+                    activeTagFilter === '__UNTAGGED__'
                       ? 'border-[#7C5CFC] bg-[#F4F2FF] text-[#6B48F5]'
                       : 'border-[#E0E0E6] bg-white text-[#686E7E] hover:text-[#1E2028]'
                   }`}
                 >
-                  全部 ({scopedCards.length})
+                  未分类 ({untaggedCount})
                 </button>
-                {allCategoryTags.map(([tag, count]) => (
+              )}
+              {modifiedCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setActiveTagFilter('__MODIFIED__')}
+                  className={`h-7 px-2.5 rounded-[8px] text-[11.5px] font-medium border transition-colors cursor-pointer whitespace-nowrap tabular-nums ${
+                    activeTagFilter === '__MODIFIED__'
+                      ? 'border-[#7C5CFC] bg-[#F4F2FF] text-[#6B48F5]'
+                      : 'border-[#E0E0E6] bg-white text-[#686E7E] hover:text-[#1E2028]'
+                  }`}
+                >
+                  已微调 ({modifiedCount})
+                </button>
+              )}
+              {(showAllTags ? allCategoryTags : allCategoryTags.slice(0, 12)).map(
+                ([tag, count]) => (
                   <button
                     key={tag}
                     type="button"
@@ -1898,65 +2568,146 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                   >
                     {tag} ({count})
                   </button>
-                ))}
-              </div>
+                )
+              )}
+              {allCategoryTags.length > 12 && (
+                <button
+                  type="button"
+                  onClick={() => setShowAllTags((v) => !v)}
+                  className="h-7 px-2.5 rounded-[8px] text-[11px] font-medium border border-dashed border-[#D2D4DF] bg-white text-[#6B48F5] hover:bg-[#F4F2FF] cursor-pointer whitespace-nowrap"
+                >
+                  {showAllTags
+                    ? '收起标签'
+                    : `展开全部标签 (+${allCategoryTags.length - 12})`}
+                </button>
+              )}
             </div>
 
-            <div className="flex flex-wrap items-center gap-3">
-              <div className="flex items-center gap-1.5 text-[11.5px]">
-                <Lock className="w-3.5 h-3.5 text-[#6B48F5] shrink-0" />
-                <span className="text-[#4C5264] whitespace-nowrap">Seed:</span>
-                <select
-                  aria-label="工作台 Seed 模式"
-                  value={workbenchSeedOverride}
-                  onChange={(e) =>
-                    setWorkbenchSeedOverride(e.target.value as 'card' | 'fixed' | 'random')
-                  }
-                  className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-white text-[11.5px] text-[#1E2028] focus:outline-none focus:border-[#7C5CFC]"
-                >
-                  <option value="card">跟随卡片（默认固定不随机）</option>
-                  <option value="fixed">统一固定 Seed</option>
-                  <option value="random">每次运行随机 Seed</option>
-                </select>
-                {workbenchSeedOverride === 'fixed' && (
-                  <>
-                    <input
-                      type="number"
-                      min={0}
-                      value={workbenchFixedSeed}
-                      onChange={(e) => {
-                        const v = parseInt(e.target.value, 10);
-                        setWorkbenchFixedSeed(Number.isFinite(v) && v >= 0 ? v : 0);
-                      }}
-                      className="w-[130px] h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-white text-[11px] font-mono tabular-nums text-[#1E2028] focus:outline-none focus:border-[#7C5CFC]"
-                    />
+            {/* 批量整理操作条 */}
+            {batchSelectMode && (
+              <div className="rounded-[12px] border border-[#DDD8FA] bg-white px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2.5 text-[11.5px]">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-semibold text-[#1E2028] tabular-nums">
+                    已选 {selectedCardIds.size} 张
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setSelectedCardIds((prev) => {
+                        const next = new Set(prev);
+                        for (const c of pagedCards) next.add(c.id);
+                        return next;
+                      })
+                    }
+                    className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-[#FAFAFC] text-[#4C5264] hover:text-[#6B48F5] cursor-pointer whitespace-nowrap"
+                  >
+                    全选本页 ({pagedCards.length})
+                  </button>
+                  {filteredCards.length > pagedCards.length && (
                     <button
                       type="button"
                       onClick={() =>
-                        setWorkbenchFixedSeed(Math.floor(Math.random() * 2147483647))
+                        setSelectedCardIds(new Set(filteredCards.map((c) => c.id)))
                       }
-                      title="随机换一个固定 Seed"
-                      className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-white text-[#686E7E] hover:text-[#6B48F5] cursor-pointer"
+                      className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-[#FAFAFC] text-[#4C5264] hover:text-[#6B48F5] cursor-pointer whitespace-nowrap"
                     >
-                      <Dices className="w-3.5 h-3.5" />
+                      全选筛选结果 ({filteredCards.length})
                     </button>
-                  </>
-                )}
-              </div>
+                  )}
+                  {selectedCardIds.size > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setSelectedCardIds(new Set())}
+                      className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-white text-[#686E7E] hover:text-[#1E2028] cursor-pointer whitespace-nowrap"
+                    >
+                      清空选择
+                    </button>
+                  )}
+                </div>
 
-              <label
-                title="开启后直接将卡片内微调过的提示词注入当前 Studio 设置的 ComfyUI 模型方案发送"
-                className="inline-flex items-center gap-1.5 text-[11.5px] text-[#4C5264] cursor-pointer select-none whitespace-nowrap"
-              >
-                <input
-                  type="checkbox"
-                  checked={preferStudioProfile}
-                  onChange={(e) => setPreferStudioProfile(e.target.checked)}
-                  className="w-3.5 h-3.5 accent-[#7C5CFC]"
-                />
-                <span>固定使用当前 Studio 模型方案</span>
-              </label>
-            </div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <div className="flex items-center gap-1">
+                    <input
+                      type="text"
+                      value={batchTagInput}
+                      onChange={(e) => setBatchTagInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          handleBulkAddTags();
+                        }
+                      }}
+                      placeholder="批量添加标签（空格/逗号分隔）"
+                      className="w-[175px] h-7 px-2 rounded-[7px] border border-[#E0E0E6] text-[11.5px] focus:outline-none focus:border-[#7C5CFC]"
+                    />
+                    <button
+                      type="button"
+                      disabled={selectedCardIds.size === 0 || !batchTagInput.trim()}
+                      onClick={handleBulkAddTags}
+                      className="h-7 px-2 inline-flex items-center gap-1 rounded-[7px] border border-[#DDD8FA] bg-[#F4F2FF] text-[#6B48F5] font-medium disabled:opacity-40 cursor-pointer whitespace-nowrap"
+                    >
+                      <Tag className="w-3 h-3" />
+                      <span>打标签</span>
+                    </button>
+                  </div>
+
+                  <button
+                    type="button"
+                    disabled={selectedCardIds.size === 0}
+                    onClick={() => handleBulkTogglePrivate(!privateView)}
+                    className="h-7 px-2 inline-flex items-center gap-1 rounded-[7px] border border-[#F5B8C4] bg-[#FFF5F7] text-[#C93B58] font-medium disabled:opacity-40 cursor-pointer whitespace-nowrap"
+                  >
+                    {privateView ? <Eye className="w-3 h-3" /> : <EyeOff className="w-3 h-3" />}
+                    <span>{privateView ? '批量取消私密' : '批量设为私密'}</span>
+                  </button>
+
+                  {boundDirHandle && (
+                    <button
+                      type="button"
+                      disabled={selectedCardIds.size === 0 || isSyncingFolder}
+                      onClick={() =>
+                        void handleSyncScopedCardsToFolder(
+                          cards.filter((c) => selectedCardIds.has(c.id))
+                        )
+                      }
+                      className="h-7 px-2 inline-flex items-center gap-1 rounded-[7px] border border-emerald-300 bg-emerald-50 text-emerald-800 font-medium disabled:opacity-40 cursor-pointer whitespace-nowrap"
+                    >
+                      <FolderSync className="w-3 h-3" />
+                      <span>写入文件夹</span>
+                    </button>
+                  )}
+
+                  {confirmBulkDelete ? (
+                    <div className="inline-flex items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={handleBulkDeleteSelected}
+                        className="h-7 px-2 rounded-[7px] bg-[#E85D75] text-white font-medium cursor-pointer whitespace-nowrap"
+                      >
+                        确认删除 ({selectedCardIds.size})
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setConfirmBulkDelete(false)}
+                        className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-white text-[#686E7E] cursor-pointer whitespace-nowrap"
+                      >
+                        取消
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={selectedCardIds.size === 0}
+                      onClick={() => setConfirmBulkDelete(true)}
+                      className="h-7 px-2 inline-flex items-center gap-1 rounded-[7px] border border-[#E0E0E6] bg-white text-[#B42343] hover:border-[#E85D75] disabled:opacity-40 cursor-pointer whitespace-nowrap"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                      <span>批量删除</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
 
           {/* 收藏卡片网格 */}
@@ -1977,7 +2728,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                   {scopedCards.length === 0
                     ? privateView
                       ? '你可以在导入建卡时勾选「设为私密」，或在公开卡片右上角一键「设为私密」移入此处。'
-                      : '点击上方「导入图片 + JSON 建卡」，拖入 1 张参考图和对应的 ComfyUI .json 文件，即可快速管理、可视化微调 Tag 并一键发送到 ComfyUI。'
+                      : '点击上方「导入图片 + JSON 建卡」，或使用「导入集」批量拖入含 ComfyUI 参数的 PNG 图片，即可保留无损原图、快速筛选微调并发送到 ComfyUI。'
                     : '尝试清空搜索关键词或切回「全部」分类标签。'}
                 </p>
               </div>
@@ -1996,165 +2747,249 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
               )}
             </div>
           ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3.5">
-              {filteredCards.map((card) => {
-                const isSendingThis =
-                  runStatus.state === 'sending' && runStatus.cardId === card.id;
-                const posDisplay = card.applyFineTuneOnSend
-                  ? card.fineTunedPositive
-                  : card.extractedPositive;
-                const negDisplay = card.applyFineTuneOnSend
-                  ? card.fineTunedNegative
-                  : card.extractedNegative;
-                const hasModified =
-                  card.fineTunedPositive.trim() !== card.extractedPositive.trim() ||
-                  card.fineTunedNegative.trim() !== card.extractedNegative.trim();
+            <>
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3.5">
+                {pagedCards.map((card) => {
+                  const isSendingThis =
+                    runStatus.state === 'sending' && runStatus.cardId === card.id;
+                  const isSelected = selectedCardIds.has(card.id);
+                  const posDisplay = card.applyFineTuneOnSend
+                    ? card.fineTunedPositive
+                    : card.extractedPositive;
+                  const negDisplay = card.applyFineTuneOnSend
+                    ? card.fineTunedNegative
+                    : card.extractedNegative;
+                  const hasModified =
+                    card.fineTunedPositive.trim() !== card.extractedPositive.trim() ||
+                    card.fineTunedNegative.trim() !== card.extractedNegative.trim();
 
-                return (
-                  <article
-                    key={card.id}
-                    className="rounded-[14px] bg-white border border-[#E0E0E6] overflow-hidden flex flex-col hover:border-[#7C5CFC]/45 transition-colors"
-                  >
-                    {/* 缩略图与头部 */}
-                    <div className="flex gap-3 p-3.5 border-b border-[#EAEAEF]">
-                      {card.originalImageDataUrl || card.thumbnailDataUrl ? (
-                        <button
-                          type="button"
-                          onClick={() => setLightboxCardId(card.id)}
-                          title="点击查看大图（保留原图画质）"
-                          className="group relative w-[84px] h-[104px] rounded-[9px] overflow-hidden border border-[#E0E0E6] bg-[#FAFAFC] shrink-0 cursor-zoom-in focus:outline-none focus:ring-2 focus:ring-[#7C5CFC]/50"
-                        >
-                          <img
-                            src={card.originalImageDataUrl || card.thumbnailDataUrl}
-                            alt={card.title}
-                            referrerPolicy="no-referrer"
-                            className="w-full h-full object-cover transition-transform duration-200 group-hover:scale-105"
-                          />
-                          <span className="absolute right-1 bottom-1 w-5 h-5 rounded-md bg-black/55 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
-                            <ZoomIn className="w-3 h-3" />
-                          </span>
-                        </button>
-                      ) : (
-                        <div className="w-[84px] h-[104px] rounded-[9px] border border-[#E0E0E6] bg-[#FAFAFC] flex flex-col items-center justify-center text-[#949AA8] shrink-0">
-                          <FileJson className="w-5 h-5 mb-1" />
-                          <span className="text-[10px]">纯 JSON</span>
-                        </div>
-                      )}
+                  return (
+                    <article
+                      key={card.id}
+                      className={`rounded-[14px] bg-white border overflow-hidden flex flex-col transition-colors ${
+                        isSelected
+                          ? 'border-[#7C5CFC] ring-2 ring-[#7C5CFC]/20'
+                          : 'border-[#E0E0E6] hover:border-[#7C5CFC]/45'
+                      }`}
+                    >
+                      {/* 缩略图与头部 */}
+                      <div className="flex gap-3 p-3.5 border-b border-[#EAEAEF]">
+                        {batchSelectMode && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSelectedCardIds((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(card.id)) next.delete(card.id);
+                                else next.add(card.id);
+                                return next;
+                              });
+                            }}
+                            aria-label={isSelected ? '取消选择此卡片' : '选择此卡片'}
+                            className="self-start mt-0.5 text-[#7C5CFC] cursor-pointer shrink-0"
+                          >
+                            {isSelected ? (
+                              <CheckSquare className="w-4 h-4" />
+                            ) : (
+                              <Square className="w-4 h-4 text-[#949AA8]" />
+                            )}
+                          </button>
+                        )}
 
-                      <div className="min-w-0 flex-1 flex flex-col justify-between">
-                        <div className="space-y-1">
-                          <div className="flex items-start justify-between gap-2">
-                            <h4 className="text-[13.5px] font-semibold text-[#1E2028] leading-snug line-clamp-2">
-                              {card.title}
-                            </h4>
-                            <div className="flex items-center gap-1 shrink-0">
-                              <button
-                                type="button"
-                                onClick={() => handleToggleCardPrivate(card.id)}
-                                title={card.isPrivate ? '取消私密并移回公开列表' : '设为私密（移入私密区）'}
-                                className={`h-6 px-1.5 inline-flex items-center gap-1 rounded-[6px] border text-[10.5px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
-                                  card.isPrivate
-                                    ? 'border-[#F5B8C4] bg-[#FFF1F3] text-[#C93B58] hover:border-[#E85D75]'
-                                    : 'border-[#E0E0E6] bg-white text-[#686E7E] hover:border-[#E85D75]/50 hover:text-[#C93B58]'
-                                }`}
-                              >
-                                {card.isPrivate ? (
-                                  <Eye className="w-3 h-3" />
-                                ) : (
-                                  <EyeOff className="w-3 h-3" />
+                        <CardThumbnailPreview
+                          card={card}
+                          onOpenLightbox={(id) => setLightboxCardId(id)}
+                        />
+
+                        <div className="min-w-0 flex-1 flex flex-col justify-between">
+                          <div className="space-y-1">
+                            <div className="flex items-start justify-between gap-1.5">
+                              <h4 className="text-[13.5px] font-semibold text-[#1E2028] leading-snug line-clamp-2 break-words">
+                                {card.title}
+                              </h4>
+                              <div className="flex items-center gap-0.5 shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() => handleToggleCardPrivate(card.id)}
+                                  title={card.isPrivate ? '取消私密并移回公开列表' : '设为私密（移入私密区）'}
+                                  className={`h-6 px-1.5 inline-flex items-center gap-1 rounded-[6px] border text-[10.5px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                                    card.isPrivate
+                                      ? 'border-[#F5B8C4] bg-[#FFF1F3] text-[#C93B58] hover:border-[#E85D75]'
+                                      : 'border-[#E0E0E6] bg-white text-[#686E7E] hover:border-[#E85D75]/50 hover:text-[#C93B58]'
+                                  }`}
+                                >
+                                  {card.isPrivate ? (
+                                    <Eye className="w-3 h-3" />
+                                  ) : (
+                                    <EyeOff className="w-3 h-3" />
+                                  )}
+                                  <span>{card.isPrivate ? '取消私密' : '设为私密'}</span>
+                                </button>
+                                {cardHasImage(card) && (
+                                  <button
+                                    type="button"
+                                    onClick={() => void handleDownloadCardOriginalImage(card)}
+                                    title="下载原始参考图"
+                                    className="p-1 text-[#949AA8] hover:text-[#7C5CFC] cursor-pointer"
+                                  >
+                                    <ImageDown className="w-3.5 h-3.5" />
+                                  </button>
                                 )}
-                                <span>{card.isPrivate ? '取消私密' : '设为私密'}</span>
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => handleDownloadCardJson(card)}
-                                title="下载卡片工作流 JSON"
-                                className="p-1 text-[#949AA8] hover:text-[#7C5CFC] cursor-pointer"
-                              >
-                                <Download className="w-3.5 h-3.5" />
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => handleDeleteCard(card.id)}
-                                title="删除此卡片"
-                                className="p-1 text-[#949AA8] hover:text-[#E85D75] cursor-pointer"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleDownloadCardJson(card)}
+                                  title="下载卡片工作流 JSON"
+                                  className="p-1 text-[#949AA8] hover:text-[#7C5CFC] cursor-pointer"
+                                >
+                                  <Download className="w-3.5 h-3.5" />
+                                </button>
+                                {boundDirHandle && (
+                                  <button
+                                    type="button"
+                                    onClick={() => void handleWriteSingleCardToFolder(card)}
+                                    title="写入当前绑定的本地文件夹"
+                                    className="p-1 text-[#949AA8] hover:text-emerald-600 cursor-pointer"
+                                  >
+                                    <FolderSync className="w-3.5 h-3.5" />
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => handleDeleteCard(card.id)}
+                                  title="删除此卡片"
+                                  className="p-1 text-[#949AA8] hover:text-[#E85D75] cursor-pointer"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            </div>
+
+                            <div className="text-[11px] text-[#686E7E] truncate">
+                              {card.tags.length > 0 ? card.tags.join(' · ') : '未分类'}
                             </div>
                           </div>
 
-                          <div className="text-[11px] text-[#686E7E] truncate">
-                            {card.tags.length > 0 ? card.tags.join(' · ') : '未分类'}
+                          <div className="text-[10.5px] text-[#8E94A4] font-mono tabular-nums flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                            <span>{formatFormatLabel(card.workflowFormat)}</span>
+                            {card.originalImageWidth && card.originalImageHeight && (
+                              <span>
+                                · {card.originalImageWidth}×{card.originalImageHeight}
+                              </span>
+                            )}
+                            {hasModified && (
+                              <span className="text-[#6B48F5] font-sans font-medium">
+                                · 已微调
+                              </span>
+                            )}
+                            {card.lastPromptId && (
+                              <span className="text-emerald-600">
+                                · #{card.lastPromptId.slice(0, 6)}
+                              </span>
+                            )}
                           </div>
                         </div>
-
-                        <div className="text-[10.5px] text-[#8E94A4] font-mono tabular-nums flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                          <span>{formatFormatLabel(card.workflowFormat)}</span>
-                          {hasModified && (
-                            <span className="text-[#6B48F5] font-sans font-medium">
-                              · 已微调
-                            </span>
-                          )}
-                          {card.lastPromptId && (
-                            <span className="text-emerald-600">
-                              · #{card.lastPromptId.slice(0, 6)}
-                            </span>
-                          )}
-                        </div>
                       </div>
-                    </div>
 
-                    {/* 可点击唤出微调的提示词摘要区 */}
-                    <button
-                      type="button"
-                      onClick={() => openFineTuner(card, 'positive')}
-                      title="点击唤出可视化 Tag 微调面板"
-                      className="flex-1 px-3.5 py-2.5 text-left bg-[#FAFAFC] hover:bg-[#F5F3FF]/60 transition-colors cursor-pointer space-y-1.5"
-                    >
-                      <div className="text-[11px] text-[#373C4B] font-mono line-clamp-2 break-words leading-relaxed">
-                        <span className="font-sans font-semibold text-[#6B48F5] mr-1">
-                          Pos:
-                        </span>
-                        {posDisplay || '（空）'}
-                      </div>
-                      <div className="text-[11px] text-[#686E7E] font-mono line-clamp-1 break-words">
-                        <span className="font-sans font-semibold text-[#E85D75] mr-1">
-                          Neg:
-                        </span>
-                        {negDisplay || '（空）'}
-                      </div>
-                    </button>
-
-                    {/* 卡片底部操作栏 */}
-                    <div className="px-3.5 py-2.5 bg-white border-t border-[#EAEAEF] flex items-center gap-2">
+                      {/* 可点击唤出微调的提示词摘要区 */}
                       <button
                         type="button"
                         onClick={() => openFineTuner(card, 'positive')}
-                        className="flex-1 h-8 px-2.5 inline-flex items-center justify-center gap-1.5 text-[11.5px] font-medium rounded-[9px] border border-[#E0E0E6] bg-white text-[#4C5264] hover:border-[#7C5CFC]/50 hover:text-[#6B48F5] transition-colors whitespace-nowrap cursor-pointer"
+                        title="点击唤出可视化 Tag 微调面板"
+                        className="flex-1 px-3.5 py-2.5 text-left bg-[#FAFAFC] hover:bg-[#F5F3FF]/60 transition-colors cursor-pointer space-y-1.5"
                       >
-                        <SlidersHorizontal className="w-3.5 h-3.5" />
-                        <span>微调提示词</span>
+                        <div className="text-[11px] text-[#373C4B] font-mono line-clamp-2 break-words leading-relaxed">
+                          <span className="font-sans font-semibold text-[#6B48F5] mr-1">
+                            Pos:
+                          </span>
+                          {posDisplay || '（空）'}
+                        </div>
+                        <div className="text-[11px] text-[#686E7E] font-mono line-clamp-1 break-words">
+                          <span className="font-sans font-semibold text-[#E85D75] mr-1">
+                            Neg:
+                          </span>
+                          {negDisplay || '（空）'}
+                        </div>
                       </button>
 
+                      {/* 卡片底部操作栏 */}
+                      <div className="px-3.5 py-2.5 bg-white border-t border-[#EAEAEF] flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => openFineTuner(card, 'positive')}
+                          className="flex-1 h-8 px-2.5 inline-flex items-center justify-center gap-1.5 text-[11.5px] font-medium rounded-[9px] border border-[#E0E0E6] bg-white text-[#4C5264] hover:border-[#7C5CFC]/50 hover:text-[#6B48F5] transition-colors whitespace-nowrap cursor-pointer"
+                        >
+                          <SlidersHorizontal className="w-3.5 h-3.5" />
+                          <span>微调提示词</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => void handleRunCard(card)}
+                          disabled={isSendingThis}
+                          className="flex-1 h-8 px-2.5 inline-flex items-center justify-center gap-1.5 text-[11.5px] font-medium rounded-[9px] bg-gradient-to-b from-[#8A6CFF] to-[#7C5CFC] text-white shadow-[0_2px_6px_rgba(124,92,252,0.24)] hover:brightness-105 disabled:opacity-50 transition-all whitespace-nowrap cursor-pointer"
+                        >
+                          {isSendingThis ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : (
+                            <Play className="w-3.5 h-3.5" />
+                          )}
+                          <span>{isSendingThis ? '发送中...' : '运行发送 UI'}</span>
+                        </button>
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+
+              {/* 大规模常驻分页控制条 */}
+              {filteredCards.length > 12 && (
+                <div className="rounded-[12px] border border-[#E0E0E6] bg-white px-3.5 py-2 flex flex-wrap items-center justify-between gap-2 text-[11.5px] text-[#4C5264]">
+                  <div className="flex items-center gap-2 tabular-nums">
+                    <span>
+                      显示第 {(safePage - 1) * pageSize + 1}–
+                      {Math.min(safePage * pageSize, filteredCards.length)} 张，共{' '}
+                      {filteredCards.length} 张
+                    </span>
+                    <select
+                      aria-label="每页显示卡片数"
+                      value={pageSize}
+                      onChange={(e) => setPageSize(Number(e.target.value) as 24 | 48 | 96)}
+                      className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-[#FAFAFC] text-[11px] text-[#1E2028]"
+                    >
+                      <option value={24}>每页 24 张</option>
+                      <option value={48}>每页 48 张</option>
+                      <option value={96}>每页 96 张</option>
+                    </select>
+                  </div>
+
+                  {totalPages > 1 && (
+                    <div className="flex items-center gap-1.5 tabular-nums">
                       <button
                         type="button"
-                        onClick={() => void handleRunCard(card)}
-                        disabled={isSendingThis}
-                        className="flex-1 h-8 px-2.5 inline-flex items-center justify-center gap-1.5 text-[11.5px] font-medium rounded-[9px] bg-gradient-to-b from-[#8A6CFF] to-[#7C5CFC] text-white shadow-[0_2px_6px_rgba(124,92,252,0.24)] hover:brightness-105 disabled:opacity-50 transition-all whitespace-nowrap cursor-pointer"
+                        disabled={safePage <= 1}
+                        onClick={() => setPage((p) => Math.max(1, p - 1))}
+                        className="h-7 px-2.5 inline-flex items-center gap-1 rounded-[7px] border border-[#E0E0E6] bg-white hover:border-[#7C5CFC]/50 disabled:opacity-40 cursor-pointer"
                       >
-                        {isSendingThis ? (
-                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        ) : (
-                          <Play className="w-3.5 h-3.5" />
-                        )}
-                        <span>{isSendingThis ? '发送中...' : '运行发送 UI'}</span>
+                        <ChevronLeft className="w-3.5 h-3.5" />
+                        <span>上一页</span>
+                      </button>
+                      <span className="px-2 font-mono text-[11px]">
+                        {safePage} / {totalPages}
+                      </span>
+                      <button
+                        type="button"
+                        disabled={safePage >= totalPages}
+                        onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                        className="h-7 px-2.5 inline-flex items-center gap-1 rounded-[7px] border border-[#E0E0E6] bg-white hover:border-[#7C5CFC]/50 disabled:opacity-40 cursor-pointer"
+                      >
+                        <span>下一页</span>
+                        <ChevronRight className="w-3.5 h-3.5" />
                       </button>
                     </div>
-                  </article>
-                );
-              })}
-            </div>
+                  )}
+                </div>
+              )}
+            </>
           )}
         </div>
 
@@ -2168,27 +3003,13 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
           >
             <aside className="w-full max-w-[760px] h-full bg-white border-l border-[#E0E0E6] shadow-[-16px_0_40px_rgba(18,22,33,0.14)] flex flex-col">
               {/* 抽屉头 */}
-              <div className="shrink-0 px-5 py-3.5 border-b border-[#EAEAEF] flex items-center justify-between gap-3">
-                <div className="flex items-center gap-3 min-w-0">
-                  {editingCard.originalImageDataUrl || editingCard.thumbnailDataUrl ? (
-                    <button
-                      type="button"
-                      onClick={() => setLightboxCardId(editingCard.id)}
-                      title="点击查看大图"
-                      className="shrink-0 rounded-[8px] overflow-hidden border border-[#E0E0E6] cursor-zoom-in"
-                    >
-                      <img
-                        src={editingCard.originalImageDataUrl || editingCard.thumbnailDataUrl}
-                        alt={editTitle}
-                        referrerPolicy="no-referrer"
-                        className="w-10 h-10 object-cover"
-                      />
-                    </button>
-                  ) : (
-                    <div className="w-10 h-10 rounded-[8px] border border-[#E0E0E6] bg-[#FAFAFC] flex items-center justify-center text-[#949AA8] shrink-0">
-                      <FileJson className="w-4 h-4" />
-                    </div>
-                  )}
+              <div className="shrink-0 px-4 sm:px-5 py-3.5 border-b border-[#EAEAEF] flex flex-wrap items-center justify-between gap-2.5">
+                <div className="flex items-center gap-3 min-w-0 flex-1">
+                  <DrawerThumbnailButton
+                    card={editingCard}
+                    alt={editTitle}
+                    onOpenLightbox={(id) => setLightboxCardId(id)}
+                  />
                   <div className="min-w-0">
                     <h3 className="text-[13.5px] font-bold text-[#1E2028] truncate">
                       提示词可视化微调 · {editingCard.title}
@@ -2548,9 +3369,9 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
             }}
           >
             {/* 顶部信息栏 */}
-            <div className="shrink-0 max-w-[1200px] w-full mx-auto flex flex-wrap items-center justify-between gap-3 pb-3 text-white">
+            <div className="shrink-0 max-w-[1200px] w-full mx-auto flex flex-wrap items-center justify-between gap-2.5 pb-3 text-white">
               <div className="flex flex-wrap items-center gap-2 min-w-0">
-                <h3 className="text-[14.5px] font-semibold truncate max-w-[360px]">
+                <h3 className="text-[14.5px] font-semibold truncate max-w-[320px] sm:max-w-[420px]">
                   {lightboxCard.title}
                 </h3>
 
@@ -2561,11 +3382,14 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                   </span>
                 )}
 
-                {lightboxCard.originalImageDataUrl ? (
+                {cardHasLosslessOriginal(lightboxCard) ? (
                   <span className="inline-flex items-center px-2 py-0.5 rounded-[6px] bg-emerald-500/20 border border-emerald-400/50 text-[11px] font-medium text-emerald-200 whitespace-nowrap tabular-nums">
                     原图无损
                     {lightboxCard.originalImageWidth && lightboxCard.originalImageHeight
                       ? ` · ${lightboxCard.originalImageWidth}×${lightboxCard.originalImageHeight}`
+                      : ''}
+                    {lightboxCard.imageByteSize
+                      ? ` · ${formatBytesCompact(lightboxCard.imageByteSize)}`
                       : ''}
                   </span>
                 ) : (
@@ -2588,7 +3412,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                 )}
               </div>
 
-              <div className="flex items-center gap-2 shrink-0">
+              <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 shrink-0">
                 {filteredCards.length > 1 && lightboxIndex >= 0 && (
                   <span className="text-[11.5px] text-white/70 font-mono tabular-nums mr-1">
                     {lightboxIndex + 1} / {filteredCards.length}
@@ -2597,11 +3421,33 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
                 <button
                   type="button"
-                  onClick={() => handleDownloadCardOriginalImage(lightboxCard)}
+                  onClick={() => handleToggleCardPrivate(lightboxCard.id)}
+                  className="h-8 px-2.5 inline-flex items-center gap-1.5 rounded-[8px] bg-white/10 hover:bg-white/20 border border-white/15 text-[11.5px] text-white cursor-pointer whitespace-nowrap"
+                >
+                  {lightboxCard.isPrivate ? (
+                    <Eye className="w-3.5 h-3.5" />
+                  ) : (
+                    <EyeOff className="w-3.5 h-3.5" />
+                  )}
+                  <span>{lightboxCard.isPrivate ? '取消私密' : '设为私密'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => void handleDownloadCardOriginalImage(lightboxCard)}
+                  className="h-8 px-2.5 inline-flex items-center gap-1.5 rounded-[8px] bg-white/10 hover:bg-white/20 border border-white/15 text-[11.5px] text-white cursor-pointer whitespace-nowrap"
+                >
+                  <ImageDown className="w-3.5 h-3.5" />
+                  <span>下载原图</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleDownloadCardJson(lightboxCard)}
                   className="h-8 px-2.5 inline-flex items-center gap-1.5 rounded-[8px] bg-white/10 hover:bg-white/20 border border-white/15 text-[11.5px] text-white cursor-pointer whitespace-nowrap"
                 >
                   <Download className="w-3.5 h-3.5" />
-                  <span>下载图片</span>
+                  <span>下载 JSON</span>
                 </button>
 
                 <button
@@ -2650,12 +3496,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                 </button>
               )}
 
-              <img
-                src={lightboxCard.originalImageDataUrl || lightboxCard.thumbnailDataUrl}
-                alt={lightboxCard.title}
-                referrerPolicy="no-referrer"
-                className="max-w-full max-h-[82vh] object-contain rounded-[10px] shadow-[0_24px_64px_rgba(0,0,0,0.55)] bg-black/25 select-none"
-              />
+              <LightboxImageElement card={lightboxCard} />
 
               {filteredCards.length > 1 && (
                 <button
@@ -2676,7 +3517,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
             </div>
 
             <div className="shrink-0 pt-2 text-center text-[11px] text-white/55">
-              点击空白处或按 Esc 关闭预览 · 左右方向键切换卡片
+              点击空白处或按 Esc 关闭预览 · 左右方向键切换卡片（当前{privateView ? '私密' : '公开'}视图范围）
             </div>
           </div>
         )}
