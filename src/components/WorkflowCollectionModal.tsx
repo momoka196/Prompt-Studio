@@ -422,6 +422,8 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const jsonInputRef = useRef<HTMLInputElement | null>(null);
   const collectionImportRef = useRef<HTMLInputElement | null>(null);
+  const bodyScrollRef = useRef<HTMLDivElement | null>(null);
+  const batchToolbarRef = useRef<HTMLDivElement | null>(null);
   const cardGridRef = useRef<HTMLDivElement | null>(null);
   const draftPreviewUrlRef = useRef<string | undefined>(undefined);
   const tombstonesRef = useRef<Record<string, DeletedCardTombstone>>(
@@ -442,6 +444,10 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   const deleteFlushScheduledRef = useRef(false);
   const deleteToastTimerRef = useRef<number | null>(null);
   const burstDeletedTotalRef = useRef(0);
+
+  const handleOpenLightbox = useCallback((id: string) => {
+    setLightboxCardId(id);
+  }, []);
 
   const enqueueFolderIo = useCallback(<T,>(task: () => Promise<T>): Promise<T> => {
     const run = folderIoQueueRef.current.then(task, task);
@@ -483,32 +489,43 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      const idbTombstones = await loadDeletedCardTombstonesFromIndexedDb();
-      if (!cancelled) {
-        tombstonesRef.current = mergeDeletedTombstonesMaps(
-          tombstonesRef.current,
-          idbTombstones
-        );
-      }
-      const savedHandle = await loadBoundDirectoryHandle();
-      if (cancelled || !savedHandle) return;
-      const perm = await ensureDirectoryWritePermission(savedHandle, false);
-      if (cancelled) return;
-      setBoundDirHandle(savedHandle);
-      setDirPermState(perm);
-      if (perm === 'granted') {
-        const snapshot = await loadFolderSyncStateSnapshot(savedHandle);
+      try {
+        const idbTombstones = await loadDeletedCardTombstonesFromIndexedDb();
         if (!cancelled) {
-          setFolderIndexMap(snapshot.entries);
-          if (Object.keys(snapshot.deletedTombstones).length > 0) {
-            const merged = mergeDeletedTombstonesMaps(
-              tombstonesRef.current,
-              snapshot.deletedTombstones
-            );
-            tombstonesRef.current = merged;
-            void saveDeletedCardTombstones(merged);
+          tombstonesRef.current = mergeDeletedTombstonesMaps(
+            tombstonesRef.current,
+            idbTombstones
+          );
+        }
+        const savedHandle = await loadBoundDirectoryHandle();
+        if (cancelled || !savedHandle) return;
+        const perm = await ensureDirectoryWritePermission(savedHandle, false);
+        if (cancelled) return;
+        setBoundDirHandle(savedHandle);
+        setDirPermState(perm);
+        if (perm === 'granted') {
+          const snapshot = await loadFolderSyncStateSnapshot(savedHandle);
+          if (!cancelled) {
+            if (Object.keys(snapshot.deletedTombstones).length > 0) {
+              const merged = mergeDeletedTombstonesMaps(
+                tombstonesRef.current,
+                snapshot.deletedTombstones
+              );
+              tombstonesRef.current = merged;
+              void saveDeletedCardTombstones(merged);
+            }
+            const filteredEntries = { ...snapshot.entries };
+            for (const delId of deletedIdsSessionRef.current) {
+              delete filteredEntries[delId];
+            }
+            for (const tombId of Object.keys(tombstonesRef.current)) {
+              delete filteredEntries[tombId];
+            }
+            setFolderIndexMap(filteredEntries);
           }
         }
+      } catch {
+        // 忽略挂载期的非致命目录恢复异常
       }
     })();
     return () => {
@@ -1433,7 +1450,10 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     void enqueueFolderIo(async () => {
       deleteFlushScheduledRef.current = false;
       const batchCards = Array.from(pendingDeleteCardsRef.current.values());
-      if (batchCards.length === 0) return;
+      if (batchCards.length === 0) {
+        burstDeletedTotalRef.current = 0;
+        return;
+      }
       pendingDeleteCardsRef.current.clear();
 
       const batchIds = batchCards.map((c) => c.id);
@@ -1450,85 +1470,111 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         diskFilesDeleted: false,
       }));
 
-      await deleteCardImageBlobsBatch(batchIds);
-      const updatedLocalTombstones = await recordDeletedCardTombstones(batchTombstones);
-      tombstonesRef.current = mergeDeletedTombstonesMaps(
-        tombstonesRef.current,
-        updatedLocalTombstones
-      );
-
       let removedFilesCount = 0;
       let folderWarnText: string | null = null;
       const activeDirHandle = boundDirHandleRef.current;
 
-      if (activeDirHandle) {
-        let perm = dirPermStateRef.current;
-        if (perm !== 'granted') {
-          perm = await ensureDirectoryWritePermission(activeDirHandle, true);
-          setDirPermState(perm);
-          dirPermStateRef.current = perm;
+      try {
+        try {
+          await deleteCardImageBlobsBatch(batchIds);
+        } catch (err) {
+          folderWarnText =
+            err instanceof Error
+              ? `部分缓存原图清理受限（${err.message}），卡片已从列表移除`
+              : '部分缓存原图清理受限，卡片已从列表移除';
         }
-        if (perm === 'granted') {
-          const delRes = await deleteCardsFromLocalDirectory(
-            activeDirHandle,
-            batchCards,
-            { extraTombstones: tombstonesRef.current }
-          );
-          removedFilesCount = delRes.removedFilesCount;
-          const cleanedIndex = { ...delRes.indexEntries };
-          for (const delId of deletedIdsSessionRef.current) {
-            delete cleanedIndex[delId];
-          }
-          setFolderIndexMap(cleanedIndex);
+
+        try {
+          const updatedLocalTombstones = await recordDeletedCardTombstones(batchTombstones);
           tombstonesRef.current = mergeDeletedTombstonesMaps(
             tombstonesRef.current,
-            delRes.deletedTombstones
+            updatedLocalTombstones
           );
-          await saveDeletedCardTombstones(tombstonesRef.current);
+        } catch {
+          // 内存墓碑已同步写入，IndexedDB 写入失败不阻断后续流程
+        }
 
-          if (delRes.failed.length > 0) {
-            folderWarnText = `已从工作台移除，但部分本地文件清理失败：${delRes.failed[0].error}`;
+        if (activeDirHandle) {
+          try {
+            // 在异步队列中仅做无手势的权限查询，绝不在丢失 user activation 后强行弹窗请求权限
+            let perm = dirPermStateRef.current;
+            if (perm !== 'granted') {
+              perm = await ensureDirectoryWritePermission(activeDirHandle, false);
+              setDirPermState(perm);
+              dirPermStateRef.current = perm;
+            }
+            if (perm === 'granted') {
+              const delRes = await deleteCardsFromLocalDirectory(
+                activeDirHandle,
+                batchCards,
+                { extraTombstones: tombstonesRef.current }
+              );
+              removedFilesCount = delRes.removedFilesCount;
+              const cleanedIndex = { ...delRes.indexEntries };
+              for (const delId of deletedIdsSessionRef.current) {
+                delete cleanedIndex[delId];
+              }
+              setFolderIndexMap(cleanedIndex);
+              tombstonesRef.current = mergeDeletedTombstonesMaps(
+                tombstonesRef.current,
+                delRes.deletedTombstones
+              );
+              await saveDeletedCardTombstones(tombstonesRef.current).catch(() => undefined);
+
+              if (delRes.failed.length > 0) {
+                folderWarnText = `已从工作台移除，但部分本地文件清理失败：${delRes.failed[0].error}`;
+              }
+            } else {
+              folderWarnText = `已从工作台删除 ${batchCards.length} 张卡片并记录墓碑（本地目录暂未授权写入，请点击上方「授权写入」后再同步）`;
+            }
+          } catch (err) {
+            folderWarnText =
+              err instanceof Error
+                ? `已从工作台移除并记录墓碑，本地文件夹清理异常：${err.message}`
+                : '已从工作台移除并记录墓碑，本地文件夹清理发生异常';
           }
+        }
+      } catch (err) {
+        folderWarnText =
+          err instanceof Error
+            ? `已从工作台移除，异步持久化出现异常：${err.message}`
+            : '已从工作台移除，异步持久化出现异常';
+      } finally {
+        // 若在磁盘清理期间又有新的连续删除入队，立即续排并保持提示连贯
+        if (pendingDeleteCardsRef.current.size > 0) {
+          scheduleDeletePersistenceFlush();
         } else {
-          folderWarnText = `已从浏览器缓存删除 ${batchCards.length} 张卡片并记录删除墓碑（当前未获文件夹写权限，下次扫描不会误复活）`;
+          const finalBurstCount = Math.max(burstDeletedTotalRef.current, batchCards.length);
+          burstDeletedTotalRef.current = 0;
+
+          if (folderWarnText) {
+            setDeleteStatus({
+              phase: 'warn',
+              count: finalBurstCount,
+              text: folderWarnText,
+            });
+          } else {
+            const doneText = activeDirHandle
+              ? finalBurstCount === 1
+                ? `已彻底删除「${batchCards[0].title}」（同步移除本地文件 ${removedFilesCount} 个）`
+                : `已连续彻底删除 ${finalBurstCount} 张卡片（同步清理缓存与本地文件）`
+              : finalBurstCount === 1
+              ? `已彻底删除「${batchCards[0].title}」`
+              : `已连续彻底删除 ${finalBurstCount} 张卡片及其缓存原图`;
+            setDeleteStatus({
+              phase: 'done',
+              count: finalBurstCount,
+              text: doneText,
+            });
+            if (deleteToastTimerRef.current !== null) {
+              window.clearTimeout(deleteToastTimerRef.current);
+            }
+            deleteToastTimerRef.current = window.setTimeout(() => {
+              setDeleteStatus((prev) => (prev?.phase === 'done' ? null : prev));
+              deleteToastTimerRef.current = null;
+            }, 3200);
+          }
         }
-      }
-
-      // 若在磁盘清理期间又有新的连续删除入队，立即续排并保持提示连贯
-      if (pendingDeleteCardsRef.current.size > 0) {
-        scheduleDeletePersistenceFlush();
-        return;
-      }
-
-      const finalBurstCount = Math.max(burstDeletedTotalRef.current, batchCards.length);
-      burstDeletedTotalRef.current = 0;
-
-      if (folderWarnText) {
-        setDeleteStatus({
-          phase: 'warn',
-          count: finalBurstCount,
-          text: folderWarnText,
-        });
-      } else {
-        const doneText = activeDirHandle
-          ? finalBurstCount === 1
-            ? `已彻底删除「${batchCards[0].title}」（同步移除本地文件 ${removedFilesCount} 个）`
-            : `已连续彻底删除 ${finalBurstCount} 张卡片（同步清理缓存与本地文件）`
-          : finalBurstCount === 1
-          ? `已彻底删除「${batchCards[0].title}」`
-          : `已连续彻底删除 ${finalBurstCount} 张卡片及其缓存原图`;
-        setDeleteStatus({
-          phase: 'done',
-          count: finalBurstCount,
-          text: doneText,
-        });
-        if (deleteToastTimerRef.current !== null) {
-          window.clearTimeout(deleteToastTimerRef.current);
-        }
-        deleteToastTimerRef.current = window.setTimeout(() => {
-          setDeleteStatus((prev) => (prev?.phase === 'done' ? null : prev));
-          deleteToastTimerRef.current = null;
-        }, 3200);
       }
     });
   }, [enqueueFolderIo]);
@@ -1539,6 +1585,8 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         (c) => !deletedIdsSessionRef.current.has(c.id)
       );
       if (uniqueNewTargets.length === 0) return;
+
+      const prevScrollTop = bodyScrollRef.current?.scrollTop ?? null;
 
       // 键盘/连续删卡焦点保护：若当前焦点位于待删除卡片按钮上，删后平滑落回同位置的下一张卡
       let activeDeleteBtnIndex = -1;
@@ -1633,8 +1681,28 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
           : `正在清理 ${pendingTotal} 张卡片缓存...`,
       });
 
-      if (activeDeleteBtnIndex >= 0) {
-        window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        if (bodyScrollRef.current && prevScrollTop !== null) {
+          const maxScroll = Math.max(
+            0,
+            bodyScrollRef.current.scrollHeight - bodyScrollRef.current.clientHeight
+          );
+          bodyScrollRef.current.scrollTop = Math.min(prevScrollTop, maxScroll);
+        }
+
+        if (isBulk && batchToolbarRef.current) {
+          const fallbackTarget =
+            batchToolbarRef.current.querySelector<HTMLButtonElement>(
+              '[data-batch-exit-btn]'
+            ) ??
+            batchToolbarRef.current.querySelector<HTMLButtonElement>(
+              '[data-batch-delete-trigger]'
+            );
+          fallbackTarget?.focus({ preventScroll: true });
+          return;
+        }
+
+        if (activeDeleteBtnIndex >= 0) {
           if (
             document.activeElement &&
             document.activeElement !== document.body
@@ -1650,15 +1718,20 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
               nextBtns[Math.min(activeDeleteBtnIndex, nextBtns.length - 1)];
             targetBtn?.focus({ preventScroll: true });
           }
-        });
-      }
+        }
+      });
 
       scheduleDeletePersistenceFlush();
     },
     [commitCards, scheduleDeletePersistenceFlush]
   );
 
-  const handleDeleteCard = (cardId: string) => {
+  const handleDeleteCard = (
+    cardId: string,
+    e?: React.MouseEvent<HTMLButtonElement>
+  ) => {
+    e?.preventDefault();
+    e?.stopPropagation();
     if (deletedIdsSessionRef.current.has(cardId)) return;
     const target = cardsRef.current.find((c) => c.id === cardId);
     if (!target) return;
@@ -1730,7 +1803,9 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     }
   };
 
-  const handleBulkDeleteSelected = () => {
+  const handleBulkDeleteSelected = (e?: React.MouseEvent<HTMLButtonElement>) => {
+    e?.preventDefault();
+    e?.stopPropagation();
     if (selectedCardIds.size === 0) return;
     const targets = cardsRef.current.filter(
       (c) =>
@@ -2554,7 +2629,10 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         </header>
 
         {/* 主体区 */}
-        <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden p-3.5 sm:p-5 space-y-3.5">
+        <div
+          ref={bodyScrollRef}
+          className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden p-3.5 sm:p-5 space-y-3.5"
+        >
           {/* 本地文件夹绑定状态与沙箱降级同步条 */}
           {(boundDirHandle || folderNotice || !fsApiSupported || inRestrictedIframe) && (
             <div
@@ -3354,7 +3432,10 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
             {/* 批量整理操作条（放大按钮热区 + 拉开间距 + 危险删除视觉隔离与二次确认） */}
             {batchSelectMode && (
-              <div className="rounded-[13px] border border-[#DDD8FA] bg-white px-3.5 sm:px-4 py-3 flex flex-col gap-3 shadow-[0_2px_10px_rgba(124,92,252,0.06)]">
+              <div
+                ref={batchToolbarRef}
+                className="rounded-[13px] border border-[#DDD8FA] bg-white px-3.5 sm:px-4 py-3 flex flex-col gap-3 shadow-[0_2px_10px_rgba(124,92,252,0.06)]"
+              >
                 {/* 顶部选区控制与退出按钮 */}
                 <div className="flex flex-wrap items-center justify-between gap-2.5 pb-2.5 border-b border-[#EFEFF4]">
                   <div className="flex flex-wrap items-center gap-2.5">
@@ -3363,13 +3444,15 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                     </span>
                     <button
                       type="button"
-                      onClick={() =>
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
                         setSelectedCardIds((prev) => {
                           const next = new Set(prev);
                           for (const c of pagedCards) next.add(c.id);
                           return next;
-                        })
-                      }
+                        });
+                      }}
                       className="min-h-[38px] px-3.5 py-1.5 rounded-[9px] border border-[#E0E0E6] bg-[#FAFAFC] text-[12px] font-medium text-[#4C5264] hover:border-[#7C5CFC]/45 hover:text-[#6B48F5] transition-colors cursor-pointer whitespace-nowrap"
                     >
                       全选本页 ({pagedCards.length})
@@ -3377,9 +3460,11 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                     {filteredCards.length > pagedCards.length && (
                       <button
                         type="button"
-                        onClick={() =>
-                          setSelectedCardIds(new Set(filteredCards.map((c) => c.id)))
-                        }
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setSelectedCardIds(new Set(filteredCards.map((c) => c.id)));
+                        }}
                         className="min-h-[38px] px-3.5 py-1.5 rounded-[9px] border border-[#E0E0E6] bg-[#FAFAFC] text-[12px] font-medium text-[#4C5264] hover:border-[#7C5CFC]/45 hover:text-[#6B48F5] transition-colors cursor-pointer whitespace-nowrap"
                       >
                         全选筛选结果 ({filteredCards.length})
@@ -3388,7 +3473,9 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                     {selectedCardIds.size > 0 && (
                       <button
                         type="button"
-                        onClick={() => {
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
                           setSelectedCardIds(new Set());
                           setConfirmBulkDelete(false);
                         }}
@@ -3401,7 +3488,10 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
                   <button
                     type="button"
-                    onClick={() => {
+                    data-batch-exit-btn
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
                       setBatchSelectMode(false);
                       setSelectedCardIds(new Set());
                       setConfirmBulkDelete(false);
@@ -3478,7 +3568,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                       <div className="inline-flex flex-wrap items-center gap-2.5 p-1.5 rounded-[10px] border border-[#F5B8C4] bg-[#FFF1F3]">
                         <button
                           type="button"
-                          onClick={handleBulkDeleteSelected}
+                          onClick={(e) => handleBulkDeleteSelected(e)}
                           className="min-h-[38px] px-4 py-1.5 inline-flex items-center gap-1.5 rounded-[8px] bg-[#D92D4B] text-white text-[12px] font-semibold shadow-[0_2px_8px_rgba(217,45,75,0.28)] hover:bg-[#BE1E3A] transition-colors cursor-pointer whitespace-nowrap"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
@@ -3486,7 +3576,11 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                         </button>
                         <button
                           type="button"
-                          onClick={() => setConfirmBulkDelete(false)}
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            setConfirmBulkDelete(false);
+                          }}
                           className="min-h-[38px] px-3.5 py-1.5 rounded-[8px] border border-[#E0E0E6] bg-white text-[12px] font-medium text-[#4C5264] hover:text-[#1E2028] transition-colors cursor-pointer whitespace-nowrap"
                         >
                           取消
@@ -3495,8 +3589,13 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                     ) : (
                       <button
                         type="button"
+                        data-batch-delete-trigger
                         disabled={selectedCardIds.size === 0}
-                        onClick={() => setConfirmBulkDelete(true)}
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setConfirmBulkDelete(true);
+                        }}
                         className="min-h-[38px] px-4 py-1.5 inline-flex items-center gap-1.5 rounded-[9px] border border-[#F5B8C4] bg-[#FFF5F7] text-[12px] font-semibold text-[#B42343] hover:bg-[#FFE6EC] hover:border-[#E85D75] disabled:opacity-40 disabled:hover:bg-[#FFF5F7] transition-colors cursor-pointer whitespace-nowrap"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
@@ -3606,7 +3705,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
                         <CardThumbnailPreview
                           card={card}
-                          onOpenLightbox={(id) => setLightboxCardId(id)}
+                          onOpenLightbox={handleOpenLightbox}
                         />
 
                         <div className="min-w-0 flex-1 flex flex-col justify-between">
@@ -3664,7 +3763,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                                 <button
                                   type="button"
                                   data-card-delete-btn={card.id}
-                                  onClick={() => handleDeleteCard(card.id)}
+                                  onClick={(e) => handleDeleteCard(card.id, e)}
                                   title="删除此卡片"
                                   aria-label={`删除卡片 ${card.title}`}
                                   className="w-7 h-7 inline-flex items-center justify-center rounded-[7px] text-[#949AA8] hover:bg-[#FFF1F3] hover:text-[#E85D75] cursor-pointer"

@@ -2600,36 +2600,41 @@ export async function deleteCardsFromLocalDirectory(
     ): Promise<void> {
       if (depth > 8 || unresolvedCards.size === 0) return;
       const subDirs: { name: string; handle: FileSystemDirectoryHandle }[] = [];
-      const iter = (
-        dirHandle as unknown as {
-          values: () => AsyncIterable<FileSystemHandle>;
-        }
-      ).values();
+      try {
+        const iter = (
+          dirHandle as unknown as {
+            values: () => AsyncIterable<FileSystemHandle>;
+          }
+        ).values();
 
-      for await (const handle of iter) {
-        const name = handle.name;
-        const lower = name.toLowerCase();
-        if (handle.kind === 'directory') {
-          if (name.startsWith('.') || lower === 'node_modules') continue;
-          subDirs.push({ name, handle: handle as FileSystemDirectoryHandle });
-        } else if (handle.kind === 'file' && lower.endsWith('.card.json')) {
-          try {
-            const rawMeta = JSON.parse(
-              await (await (handle as FileSystemFileHandle).getFile()).text()
-            ) as Partial<WorkflowCollectionCard>;
-            if (rawMeta.id && unresolvedCards.has(rawMeta.id)) {
-              const key = relSegments.join('/');
-              const bucket = matchedDirPaths.get(key) ?? {
-                segments: relSegments,
-                cardIds: [],
-              };
-              bucket.cardIds.push(rawMeta.id);
-              matchedDirPaths.set(key, bucket);
+        for await (const handle of iter) {
+          const name = handle.name;
+          const lower = name.toLowerCase();
+          if (handle.kind === 'directory') {
+            if (name.startsWith('.') || lower === 'node_modules') continue;
+            subDirs.push({ name, handle: handle as FileSystemDirectoryHandle });
+          } else if (handle.kind === 'file' && lower.endsWith('.card.json')) {
+            try {
+              const rawMeta = JSON.parse(
+                await (await (handle as FileSystemFileHandle).getFile()).text()
+              ) as Partial<WorkflowCollectionCard>;
+              if (rawMeta.id && unresolvedCards.has(rawMeta.id)) {
+                const key = relSegments.join('/');
+                const bucket = matchedDirPaths.get(key) ?? {
+                  segments: relSegments,
+                  cardIds: [],
+                };
+                bucket.cardIds.push(rawMeta.id);
+                matchedDirPaths.set(key, bucket);
+              }
+            } catch {
+              // ignore corrupt or missing .card.json
             }
-          } catch {
-            // ignore corrupt .card.json
           }
         }
+      } catch {
+        // ignore missing or inaccessible directory handle
+        return;
       }
 
       for (const sub of subDirs) {
@@ -2643,22 +2648,31 @@ export async function deleteCardsFromLocalDirectory(
       for (const cardId of bucket.cardIds) {
         const card = unresolvedCards.get(cardId);
         if (!card) continue;
-        const res = await removeMatchedCardFilesInDir(
-          rootHandle,
-          bucket.segments,
-          cardId,
-          card.imageName ? [card.imageName] : undefined
-        );
-        if (res.matched) {
-          removedFilesCount += res.removedCount;
-        }
-        unresolvedCards.delete(cardId);
-        deletedIds.push(cardId);
-        if (deletedTombstones[cardId]) {
-          deletedTombstones[cardId] = {
-            ...deletedTombstones[cardId],
-            diskFilesDeleted: true,
-          };
+        try {
+          const res = await removeMatchedCardFilesInDir(
+            rootHandle,
+            bucket.segments,
+            cardId,
+            card.imageName ? [card.imageName] : undefined
+          );
+          if (res.matched) {
+            removedFilesCount += res.removedCount;
+          }
+          unresolvedCards.delete(cardId);
+          deletedIds.push(cardId);
+          if (deletedTombstones[cardId]) {
+            deletedTombstones[cardId] = {
+              ...deletedTombstones[cardId],
+              diskFilesDeleted: true,
+            };
+          }
+        } catch (err) {
+          unresolvedCards.delete(cardId);
+          failed.push({
+            cardId: card.id,
+            title: card.title,
+            error: err instanceof Error ? err.message : '删除本地文件失败',
+          });
         }
       }
     }

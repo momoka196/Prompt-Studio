@@ -423,6 +423,20 @@ export default function App() {
     []
   );
 
+  const handleCloseWorkbench = useCallback(() => {
+    setWorkbenchOpen(false);
+  }, []);
+
+  const handleOpenSettingsFromWorkbench = useCallback(() => {
+    setWorkbenchOpen(false);
+    setSettingsOpen(true);
+  }, []);
+
+  const knownCharacterHints = useMemo(
+    () => config.characters.map((c) => c.name),
+    [config.characters]
+  );
+
   const comfyProfiles = useMemo(
     () =>
       config.comfyProfiles && config.comfyProfiles.length > 0
@@ -1367,17 +1381,14 @@ export default function App() {
 
       <WorkflowCollectionModal
         open={workbenchOpen}
-        onClose={() => setWorkbenchOpen(false)}
+        onClose={handleCloseWorkbench}
         cards={workflowCards}
         onChangeCards={handleChangeWorkflowCards}
         comfyUrl={config.comfyUrl}
         activeProfile={activeProfile}
         activeCharacterName={activeCharacter?.name ?? '角色'}
-        knownCharacterHints={config.characters.map((c) => c.name)}
-        onOpenSettings={() => {
-          setWorkbenchOpen(false);
-          setSettingsOpen(true);
-        }}
+        knownCharacterHints={knownCharacterHints}
+        onOpenSettings={handleOpenSettingsFromWorkbench}
       />
     </div>
   );
