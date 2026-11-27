@@ -180,7 +180,8 @@ export type NegativeGuardRuleId =
   | 'anti-bg-override'
   | 'anti-pose-expr-conflict'
   | 'anti-doll-plastic'
-  | 'anti-sitting';
+  | 'anti-sitting'
+  | 'anti-top-head-bow';
 
 export interface NegativeGuardRuleBadge {
   id: NegativeGuardRuleId;

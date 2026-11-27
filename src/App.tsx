@@ -19,6 +19,7 @@ import {
   DEFAULT_COMFY_PROFILES,
   DEFAULT_COMFY_SEED,
   DEFAULT_STUDIO_CONFIG,
+  HAIRSTYLE_PRESETS,
   SHARED_BODY_TYPE_STRING,
 } from './data/presets';
 import {
@@ -36,6 +37,7 @@ import {
   WorkflowCollectionCard,
 } from './types/studio';
 import {
+  applyHairstyleToAppearanceText,
   buildCopyAllOutput,
   buildNegativePromptWithMeta,
   buildWorkflowSnippet,
@@ -263,6 +265,7 @@ function normalizeStudioConfig(raw: Partial<StudioConfig>): StudioConfig {
       : rawShared.background ?? defaults.shared.background;
 
   const needsAppearanceClean = (raw.appearanceCleanedVersion ?? 0) < 1;
+  const needsYiSideBowMigration = (raw.appearanceCleanedVersion ?? 0) < 2;
   const needsBodyTypeInit = (raw.bodyTypeInitializedVersion ?? 0) < 1;
   const rawBodyTypeText = rawShared.bodyType?.text ?? '';
   const normalizedBodyType =
@@ -271,7 +274,7 @@ function normalizeStudioConfig(raw: Partial<StudioConfig>): StudioConfig {
       : rawShared.bodyType ?? { text: SHARED_BODY_TYPE_STRING, weight: 1.0 };
 
   return {
-    appearanceCleanedVersion: 1,
+    appearanceCleanedVersion: 2,
     bodyTypeInitializedVersion: 1,
     comfyUrl: raw.comfyUrl || defaults.comfyUrl,
     comfyUnetName: raw.comfyUnetName || defaults.comfyUnetName,
@@ -292,7 +295,7 @@ function normalizeStudioConfig(raw: Partial<StudioConfig>): StudioConfig {
         ? raw.characters.map((c) => {
             const defaultChar = defaults.characters.find((dc) => dc.id === c.id);
             const rawAppearanceText = c.appearance?.text ?? '';
-            const cleanedAppearanceText = needsAppearanceClean
+            let cleanedAppearanceText = needsAppearanceClean
               ? stripLegacyExpressionTokensFromAppearance(c.id, rawAppearanceText)
               : rawAppearanceText;
             const inferredHairId =
@@ -301,22 +304,37 @@ function normalizeStudioConfig(raw: Partial<StudioConfig>): StudioConfig {
                   defaultChar?.hairstyleId ??
                   'hair-side-ponytail'
                 : defaultChar?.hairstyleId ?? null;
+            const resolvedHairstyleId =
+              c.hairstyleId !== undefined ? c.hairstyleId : inferredHairId;
+            const resolvedAccessoryId =
+              c.hairAccessoryId !== undefined
+                ? c.hairAccessoryId
+                : defaultChar?.hairAccessoryId ?? null;
+            if (
+              needsYiSideBowMigration &&
+              c.id === 'char-yi' &&
+              resolvedHairstyleId === 'hair-side-ponytail' &&
+              (!resolvedAccessoryId || resolvedAccessoryId === 'acc-preset-bow') &&
+              /\bblack(?:\s+hair)?\s+bow\b/i.test(cleanedAppearanceText)
+            ) {
+              cleanedAppearanceText = applyHairstyleToAppearanceText(
+                cleanedAppearanceText,
+                HAIRSTYLE_PRESETS[0].tags,
+                { accessoryId: resolvedAccessoryId ?? 'acc-preset-bow' }
+              );
+            }
             return {
               ...c,
               appearance: {
                 text: cleanedAppearanceText,
                 weight: c.appearance?.weight ?? 1.0,
               },
-              hairstyleId:
-                c.hairstyleId !== undefined ? c.hairstyleId : inferredHairId,
+              hairstyleId: resolvedHairstyleId,
               hairBangsId:
                 c.hairBangsId !== undefined
                   ? c.hairBangsId
                   : defaultChar?.hairBangsId ?? null,
-              hairAccessoryId:
-                c.hairAccessoryId !== undefined
-                  ? c.hairAccessoryId
-                  : defaultChar?.hairAccessoryId ?? null,
+              hairAccessoryId: resolvedAccessoryId,
               enableFourthLora: Boolean(c.enableFourthLora),
               forbiddenTags: c.forbiddenTags ?? '',
             };
