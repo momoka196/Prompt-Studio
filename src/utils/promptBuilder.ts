@@ -215,13 +215,107 @@ const PLUSH_KEYWORD_RE =
 const PAJAMA_KEYWORD_RE =
   /\b(?:pajamas?|pyjamas?|nightwear|sleepwear|loungewear|roomwear|homewear|nightgown)\b|睡衣|居家服|家居服/i;
 
-const DOLL_PLASTIC_TEXTURE_TAG_RE =
-  /\b(?:doll[- ]?like|doll[- ]?skin|doll[- ]?face|doll[- ]?joints?|ball[- ]?jointed\s*doll|bjd|porcelain\s*skin|plastic\s*skin|plastic\s*texture|plastic\s*look|plastic\s*shine|plastic\s*sheen|waxy\s*skin|wax\s*skin|vinyl\s*skin|vinyl\s*texture|rubber(?:y)?\s*skin|latex\s*skin|glossy\s*skin|synthetic\s*skin|artificial\s*skin|fake\s*skin|resin\s*skin|mannequin)\b|^plastic$/i;
+export const FORBIDDEN_TAGS_MAP = {
+  generalAntiTexture: [
+    'plastic skin',
+    'doll-like',
+    'mannequin',
+    'smooth plastic',
+    'doll skin',
+    'doll face',
+    'doll joints',
+    'ball-jointed doll',
+    'bjd',
+    'porcelain skin',
+    'plastic texture',
+    'plastic look',
+    'plastic shine',
+    'plastic sheen',
+    'waxy skin',
+    'wax skin',
+    'vinyl skin',
+    'vinyl texture',
+    'rubber skin',
+    'rubbery skin',
+    'latex skin',
+    'glossy skin',
+    'synthetic skin',
+    'artificial skin',
+    'fake skin',
+    'resin skin',
+  ],
+} as const;
+
+function escapeRegExpTerm(term: string): string {
+  return term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+const GENERAL_ANTI_TEXTURE_PHRASE_PATTERN = FORBIDDEN_TAGS_MAP.generalAntiTexture
+  .slice()
+  .sort((a, b) => b.length - a.length)
+  .map((term) => escapeRegExpTerm(term).replace(/\s+/g, '\\s+'))
+  .join('|');
+
+const DOLL_PLASTIC_TEXTURE_TAG_RE = new RegExp(
+  `\\b(?:${GENERAL_ANTI_TEXTURE_PHRASE_PATTERN}|doll[- ]?like|doll[- ]?skin|doll[- ]?face|doll[- ]?joints?|ball[- ]?jointed\\s*doll|plastic\\s*skin|smooth\\s*plastic)\\b|^plastic$`,
+  'i'
+);
+
+const DOLL_PLASTIC_FULLTEXT_WEIGHTED_RE = new RegExp(
+  `\\(\\s*(?:${GENERAL_ANTI_TEXTURE_PHRASE_PATTERN}|doll[- ]?like|doll[- ]?skin|doll[- ]?face|doll[- ]?joints?|ball[- ]?jointed\\s*doll|plastic\\s*skin|smooth\\s*plastic)\\s*:[0-9.]+\\s*\\)`,
+  'gi'
+);
+
+const DOLL_PLASTIC_FULLTEXT_BARE_RE = new RegExp(
+  `\\b(?:${GENERAL_ANTI_TEXTURE_PHRASE_PATTERN}|doll[- ]?like|doll[- ]?skin|doll[- ]?face|doll[- ]?joints?|ball[- ]?jointed\\s*doll|plastic\\s*skin|smooth\\s*plastic)\\b`,
+  'gi'
+);
 
 export function isDollPlasticTextureTag(raw: string): boolean {
   const clean = stripWeightSyntax(raw).replace(/\s+/g, ' ').trim();
   if (!clean) return false;
+  if (
+    FORBIDDEN_TAGS_MAP.generalAntiTexture.some(
+      (forbidden) => clean === forbidden || clean.includes(forbidden)
+    )
+  ) {
+    return true;
+  }
   return DOLL_PLASTIC_TEXTURE_TAG_RE.test(clean);
+}
+
+export function stripForbiddenAntiTextureFullText(rawText: string): {
+  cleanedText: string;
+  removedTerms: string[];
+} {
+  if (!rawText || !rawText.trim()) {
+    return { cleanedText: rawText, removedTerms: [] };
+  }
+  const removed = new Set<string>();
+  let next = rawText.replace(DOLL_PLASTIC_FULLTEXT_WEIGHTED_RE, (match) => {
+    const clean = stripWeightSyntax(match).replace(/\s+/g, ' ').trim();
+    if (clean) removed.add(clean);
+    return '';
+  });
+  next = next.replace(DOLL_PLASTIC_FULLTEXT_BARE_RE, (match) => {
+    const clean = match.replace(/\s+/g, ' ').trim().toLowerCase();
+    if (clean) removed.add(clean);
+    return '';
+  });
+
+  // 清理残余的空括号权重包装与多余逗号
+  next = next
+    .replace(/\(\s*(?:,\s*)*:[0-9.]+\s*\)/g, '')
+    .replace(/\(\s*\)/g, '')
+    .replace(/\s*,\s*(?:,\s*)+/g, ', ')
+    .replace(/^[\s,，]+|[\s,，]+$/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+
+  return {
+    cleanedText: next,
+    removedTerms: Array.from(removed),
+  };
 }
 
 const VISIBLE_FINGER_HAND_ACTION_RE =
@@ -624,6 +718,7 @@ interface ResolvedCharacterPromptData {
   segments: PromptSegment[];
   fullText: string;
   resolvedAdjustments: string[];
+  filteredAntiTextureTags: string[];
   hasBackgroundLock: boolean;
   hasHandSleeveConflict: boolean;
   hasPoseExprGuard: boolean;
@@ -635,6 +730,7 @@ function resolveAndBuildCharacterSegments(
   includeAppearance: boolean
 ): ResolvedCharacterPromptData {
   const resolvedAdjustments: string[] = [];
+  const filteredAntiTextureSet = new Set<string>();
   const bgRaw = shared.background.text.trim();
   const hasBackgroundLock = bgRaw.length > 0;
   const compRaw = shared.composition.text.trim();
@@ -683,7 +779,14 @@ function resolveAndBuildCharacterSegments(
     );
 
   const cleanTagsForSlot = (key: string, rawText: string): string => {
-    const tokens = splitPromptTags(rawText);
+    const preScrubbed = stripForbiddenAntiTextureFullText(rawText);
+    if (preScrubbed.removedTerms.length > 0) {
+      hasPoseExprGuard = true;
+      preScrubbed.removedTerms.forEach((t) => filteredAntiTextureSet.add(t));
+      resolvedAdjustments.push('已对正向进行全文级严格过滤，移除类玩偶/塑料质感词，提升画面自然度');
+    }
+
+    const tokens = splitPromptTags(preScrubbed.cleanedText);
     const out: string[] = [];
 
     for (const token of tokens) {
@@ -693,7 +796,8 @@ function resolveAndBuildCharacterSegments(
       // 过滤类玩偶/塑料质感词，保持自然皮肤质感
       if (isDollPlasticTextureTag(clean)) {
         hasPoseExprGuard = true;
-        resolvedAdjustments.push('已过滤正向中的类玩偶/塑料质感词，提升画面自然度');
+        filteredAntiTextureSet.add(clean);
+        resolvedAdjustments.push('已对正向进行全文级严格过滤，移除类玩偶/塑料质感词，提升画面自然度');
         continue;
       }
 
@@ -892,17 +996,26 @@ function resolveAndBuildCharacterSegments(
     const finalRaw = crossDeduped.join(', ');
     if (!finalRaw) continue;
 
+    const slotFullTextFiltered = stripForbiddenAntiTextureFullText(finalRaw);
+    if (slotFullTextFiltered.removedTerms.length > 0) {
+      hasPoseExprGuard = true;
+      slotFullTextFiltered.removedTerms.forEach((t) => filteredAntiTextureSet.add(t));
+      resolvedAdjustments.push('已对正向进行全文级严格过滤，移除类玩偶/塑料质感词，提升画面自然度');
+    }
+    const strictlyFilteredRaw = slotFullTextFiltered.cleanedText;
+    if (!strictlyFilteredRaw) continue;
+
     const effectiveWeight = computeEffectiveSlotWeight(
       item.key,
-      finalRaw,
+      strictlyFilteredRaw,
       item.slot.weight
     );
-    const formatted = formatWeightedText(finalRaw, effectiveWeight);
+    const formatted = formatWeightedText(strictlyFilteredRaw, effectiveWeight);
     segments.push({
       key: item.key,
       label: item.label,
       layer: item.layer,
-      rawText: finalRaw,
+      rawText: strictlyFilteredRaw,
       weight: effectiveWeight,
       formatted,
     });
@@ -915,10 +1028,18 @@ function resolveAndBuildCharacterSegments(
     .filter(Boolean)
     .join(', ');
   const soloAnchor = soloPrefix ? `${soloPrefix}, ` : '';
+  const assembledFullText = soloAnchor + baseText;
+  const fullTextPass = stripForbiddenAntiTextureFullText(assembledFullText);
+  if (fullTextPass.removedTerms.length > 0) {
+    hasPoseExprGuard = true;
+    fullTextPass.removedTerms.forEach((t) => filteredAntiTextureSet.add(t));
+    resolvedAdjustments.push('已对正向进行全文级严格过滤，移除类玩偶/塑料质感词，提升画面自然度');
+  }
   return {
     segments,
-    fullText: soloAnchor + baseText,
+    fullText: fullTextPass.cleanedText,
     resolvedAdjustments: Array.from(new Set(resolvedAdjustments)),
+    filteredAntiTextureTags: Array.from(filteredAntiTextureSet),
     hasBackgroundLock,
     hasHandSleeveConflict,
     hasPoseExprGuard,
@@ -1061,11 +1182,19 @@ export function buildNegativePromptWithMeta(
     !SITTING_OR_CROUCHING_TAG_RE.test(combinedPositive);
 
   const rawBaseNegativePrompt = buildSharedNegativePrompt(shared).trim();
-  const filteredDollPlasticTags: string[] = [];
+  const filteredDollPlasticTags: string[] = Array.from(
+    new Set(charResolutions.flatMap((r) => r.filteredAntiTextureTags))
+  );
   const filteredBaseParts: string[] = [];
   const existingCleanSet = new Set<string>();
   if (rawBaseNegativePrompt) {
-    for (const part of splitPromptTags(rawBaseNegativePrompt)) {
+    const negFullTextPass = stripForbiddenAntiTextureFullText(rawBaseNegativePrompt);
+    for (const term of negFullTextPass.removedTerms) {
+      if (!filteredDollPlasticTags.includes(term)) {
+        filteredDollPlasticTags.push(term);
+      }
+    }
+    for (const part of splitPromptTags(negFullTextPass.cleanedText)) {
       const clean = stripWeightSyntax(part).replace(/\s+/g, ' ').trim();
       if (!clean) continue;
       if (isDollPlasticTextureTag(part)) {

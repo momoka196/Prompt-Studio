@@ -55,10 +55,12 @@ import { WorkflowCollectionModal } from './components/WorkflowCollectionModal';
 import {
   loadUiCache,
   loadWorkflowCards,
+  loadWorkflowCardsFromIndexedDb,
   normalizeWorkflowCards,
   patchUiCache,
   saveConfigSafely,
   saveWorkflowCardsSafely,
+  saveWorkflowCardsToIndexedDb,
   STUDIO_CONFIG_KEY,
   STUDIO_HISTORY_KEY,
 } from './utils/storageCache';
@@ -381,9 +383,30 @@ export default function App() {
   const [validation, setValidation] = useState<ComfyValidationMap>(EMPTY_VALIDATION);
   const [probingLoaders, setProbingLoaders] = useState(false);
   const lastAutoSnapshotRef = useRef<string>(JSON.stringify(config));
+  const cardsMutatedRef = useRef(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const idbCards = await loadWorkflowCardsFromIndexedDb();
+      if (cancelled || cardsMutatedRef.current) return;
+      if (idbCards.length > 0) {
+        setWorkflowCards(idbCards);
+      } else {
+        const legacyLocal = loadWorkflowCards();
+        if (legacyLocal.length > 0) {
+          void saveWorkflowCardsToIndexedDb(legacyLocal);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const handleChangeWorkflowCards = useCallback(
     (next: WorkflowCollectionCard[]): { ok: boolean; error?: string } => {
+      cardsMutatedRef.current = true;
       const saveRes = saveWorkflowCardsSafely(next);
       if (saveRes.ok) {
         setWorkflowCards(next);

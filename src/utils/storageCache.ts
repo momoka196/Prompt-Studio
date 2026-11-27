@@ -184,6 +184,12 @@ export function normalizeWorkflowCards(raw: unknown): WorkflowCollectionCard[] {
     const rec = item as Partial<WorkflowCollectionCard>;
     if (!rec.id || typeof rec.id !== 'string') continue;
     const now = Date.now();
+    const rawThumb =
+      typeof rec.thumbnailDataUrl === 'string' ? rec.thumbnailDataUrl : '';
+    const rawOriginal =
+      typeof rec.originalImageDataUrl === 'string' && rec.originalImageDataUrl
+        ? rec.originalImageDataUrl
+        : undefined;
     cards.push({
       id: rec.id,
       title:
@@ -195,8 +201,22 @@ export function normalizeWorkflowCards(raw: unknown): WorkflowCollectionCard[] {
             .filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
             .map((t) => t.trim())
         : [],
-      thumbnailDataUrl:
-        typeof rec.thumbnailDataUrl === 'string' ? rec.thumbnailDataUrl : '',
+      thumbnailDataUrl: rawThumb || rawOriginal || '',
+      originalImageDataUrl: rawOriginal,
+      originalImageMime:
+        typeof rec.originalImageMime === 'string' ? rec.originalImageMime : undefined,
+      originalImageWidth:
+        typeof rec.originalImageWidth === 'number' &&
+        Number.isFinite(rec.originalImageWidth) &&
+        rec.originalImageWidth > 0
+          ? Math.round(rec.originalImageWidth)
+          : undefined,
+      originalImageHeight:
+        typeof rec.originalImageHeight === 'number' &&
+        Number.isFinite(rec.originalImageHeight) &&
+        rec.originalImageHeight > 0
+          ? Math.round(rec.originalImageHeight)
+          : undefined,
       imageName: typeof rec.imageName === 'string' ? rec.imageName : '',
       workflowFileName:
         typeof rec.workflowFileName === 'string' ? rec.workflowFileName : 'workflow.json',
@@ -250,6 +270,8 @@ export function normalizeWorkflowCards(raw: unknown): WorkflowCollectionCard[] {
       lastRunAt: typeof rec.lastRunAt === 'number' ? rec.lastRunAt : undefined,
       lastPromptId:
         typeof rec.lastPromptId === 'string' ? rec.lastPromptId : undefined,
+      lastFolderSyncAt:
+        typeof rec.lastFolderSyncAt === 'number' ? rec.lastFolderSyncAt : undefined,
       createdAt: typeof rec.createdAt === 'number' ? rec.createdAt : now,
       updatedAt: typeof rec.updatedAt === 'number' ? rec.updatedAt : now,
     });
@@ -267,20 +289,180 @@ export function loadWorkflowCards(): WorkflowCollectionCard[] {
   }
 }
 
+export function mergeImportedWorkflowCards(
+  existing: WorkflowCollectionCard[],
+  incoming: WorkflowCollectionCard[]
+): WorkflowCollectionCard[] {
+  const existingIds = new Set(existing.map((c) => c.id));
+  const now = Date.now();
+  const dedupedIncoming = incoming.map((card, idx) => {
+    let nextId = card.id;
+    if (existingIds.has(nextId)) {
+      nextId = `${card.id}-imp-${now}-${idx}`;
+    }
+    existingIds.add(nextId);
+    return nextId === card.id ? card : { ...card, id: nextId };
+  });
+  return [...dedupedIncoming, ...existing];
+}
+
+const STUDIO_IDB_NAME = 'chibiprompt_studio_db_v1';
+const STUDIO_IDB_CARDS_STORE = 'workflow_cards';
+const STUDIO_IDB_FS_STORE = 'fs_handles';
+const STUDIO_IDB_CARDS_KEY = 'cards_v1';
+const STUDIO_IDB_DIR_KEY = 'bound_workflow_dir';
+
+function isIndexedDbSupported(): boolean {
+  return typeof window !== 'undefined' && typeof window.indexedDB !== 'undefined';
+}
+
+function openStudioDb(): Promise<IDBDatabase | null> {
+  if (!isIndexedDbSupported()) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    try {
+      const req = window.indexedDB.open(STUDIO_IDB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(STUDIO_IDB_CARDS_STORE)) {
+          db.createObjectStore(STUDIO_IDB_CARDS_STORE);
+        }
+        if (!db.objectStoreNames.contains(STUDIO_IDB_FS_STORE)) {
+          db.createObjectStore(STUDIO_IDB_FS_STORE);
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+export async function loadWorkflowCardsFromIndexedDb(): Promise<WorkflowCollectionCard[]> {
+  const db = await openStudioDb();
+  if (!db) return [];
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(STUDIO_IDB_CARDS_STORE, 'readonly');
+      const store = tx.objectStore(STUDIO_IDB_CARDS_STORE);
+      const req = store.get(STUDIO_IDB_CARDS_KEY);
+      req.onsuccess = () => {
+        resolve(normalizeWorkflowCards(req.result));
+      };
+      req.onerror = () => resolve([]);
+    } catch {
+      resolve([]);
+    }
+  });
+}
+
+export async function saveWorkflowCardsToIndexedDb(
+  cards: WorkflowCollectionCard[]
+): Promise<boolean> {
+  const db = await openStudioDb();
+  if (!db) return false;
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(STUDIO_IDB_CARDS_STORE, 'readwrite');
+      const store = tx.objectStore(STUDIO_IDB_CARDS_STORE);
+      const req = store.put(cards, STUDIO_IDB_CARDS_KEY);
+      req.onsuccess = () => resolve(true);
+      req.onerror = () => resolve(false);
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+export async function saveBoundDirectoryHandle(
+  handle: FileSystemDirectoryHandle | null
+): Promise<void> {
+  const db = await openStudioDb();
+  if (!db) return;
+  await new Promise<void>((resolve) => {
+    try {
+      const tx = db.transaction(STUDIO_IDB_FS_STORE, 'readwrite');
+      const store = tx.objectStore(STUDIO_IDB_FS_STORE);
+      const req = handle
+        ? store.put(handle, STUDIO_IDB_DIR_KEY)
+        : store.delete(STUDIO_IDB_DIR_KEY);
+      req.onsuccess = () => resolve();
+      req.onerror = () => resolve();
+    } catch {
+      resolve();
+    }
+  });
+}
+
+export async function loadBoundDirectoryHandle(): Promise<FileSystemDirectoryHandle | null> {
+  const db = await openStudioDb();
+  if (!db) return null;
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(STUDIO_IDB_FS_STORE, 'readonly');
+      const store = tx.objectStore(STUDIO_IDB_FS_STORE);
+      const req = store.get(STUDIO_IDB_DIR_KEY);
+      req.onsuccess = () => {
+        const res = req.result as FileSystemDirectoryHandle | undefined;
+        resolve(res && typeof res.getDirectoryHandle === 'function' ? res : null);
+      };
+      req.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+function buildLightweightCardsForLocalStorage(
+  cards: WorkflowCollectionCard[]
+): WorkflowCollectionCard[] {
+  return cards.map((c) => {
+    const thumbTooBig = (c.thumbnailDataUrl?.length ?? 0) > 48_000;
+    return {
+      ...c,
+      originalImageDataUrl: undefined,
+      thumbnailDataUrl: thumbTooBig ? '' : c.thumbnailDataUrl,
+    };
+  });
+}
+
 export function saveWorkflowCardsSafely(cards: WorkflowCollectionCard[]): {
   ok: boolean;
   error?: string;
 } {
+  const idbAvailable = isIndexedDbSupported();
+  if (idbAvailable) {
+    void saveWorkflowCardsToIndexedDb(cards);
+  }
+
   try {
     const payload = JSON.stringify(cards);
     localStorage.setItem(STUDIO_WORKFLOW_CARDS_KEY, payload);
     return { ok: true };
   } catch {
-    return {
-      ok: false,
-      error:
-        '本地存储空间已满（QuotaExceeded），本次收藏卡片未能写入缓存。请先导出备份并清理部分旧卡片。',
-    };
+    // 原图无损体积极易超出 localStorage ~5MB 限制；自动降级为 IndexedDB 完整持久化 + localStorage 轻量索引兜底
+    try {
+      const lightPayload = JSON.stringify(buildLightweightCardsForLocalStorage(cards));
+      localStorage.setItem(STUDIO_WORKFLOW_CARDS_KEY, lightPayload);
+      if (idbAvailable) {
+        return { ok: true };
+      }
+      return {
+        ok: true,
+        error:
+          '当前环境 localStorage 容量已达上限，已降级保存卡片结构与提示词（建议绑定本地文件夹落盘保存原图）。',
+      };
+    } catch {
+      if (idbAvailable) {
+        return { ok: true };
+      }
+      return {
+        ok: false,
+        error:
+          '本地存储空间已满（QuotaExceeded），本次收藏卡片未能写入缓存。建议绑定本地文件夹写入或导出备份。',
+      };
+    }
   }
 }
+
 

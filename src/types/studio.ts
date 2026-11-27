@@ -249,6 +249,10 @@ export interface WorkflowCollectionCard {
   title: string;
   tags: string[];
   thumbnailDataUrl: string;
+  originalImageDataUrl?: string;
+  originalImageMime?: string;
+  originalImageWidth?: number;
+  originalImageHeight?: number;
   imageName: string;
   workflowFileName: string;
   workflowFormat: WorkflowJsonFormat;
@@ -267,6 +271,7 @@ export interface WorkflowCollectionCard {
   fixedSeed?: number;
   lastRunAt?: number;
   lastPromptId?: string;
+  lastFolderSyncAt?: number;
   createdAt: number;
   updatedAt: number;
 }

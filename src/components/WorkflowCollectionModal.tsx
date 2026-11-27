@@ -3,12 +3,17 @@ import {
   AlertCircle,
   Check,
   CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   CopyPlus,
   Dices,
   Download,
   Eye,
   EyeOff,
   FileJson,
+  FolderCheck,
+  FolderOpen,
+  FolderSync,
   ImagePlus,
   Layers,
   Loader2,
@@ -24,6 +29,7 @@ import {
   Trash2,
   Upload,
   X,
+  ZoomIn,
 } from 'lucide-react';
 import { DEFAULT_COMFY_SEED } from '../data/presets';
 import {
@@ -36,14 +42,26 @@ import {
 import { sanitizeFilenamePrefix } from '../utils/promptBuilder';
 import {
   buildCardExportPayload,
+  buildWorkflowCardFromPngFile,
+  dataUrlToBlob,
+  ensureDirectoryWritePermission,
   extractComfyMetadataFromPngFile,
+  isFileSystemAccessSupported,
   parseComfyWorkflowSource,
   parsePromptToTagItems,
-  resizeImageToThumbnail,
+  pickLocalWorkflowDirectory,
+  readImageOriginalData,
   sendWorkflowCardToComfyUI,
   serializeTagItemsToPrompt,
+  writeCardsBatchToLocalDirectory,
+  writeCardToLocalDirectory,
 } from '../utils/workflowLibrary';
-import { normalizeWorkflowCards } from '../utils/storageCache';
+import {
+  loadBoundDirectoryHandle,
+  mergeImportedWorkflowCards,
+  normalizeWorkflowCards,
+  saveBoundDirectoryHandle,
+} from '../utils/storageCache';
 
 interface WorkflowCollectionModalProps {
   open: boolean;
@@ -60,6 +78,10 @@ interface DraftImportState {
   title: string;
   tagsInput: string;
   thumbnailDataUrl: string;
+  originalImageDataUrl?: string;
+  originalImageMime?: string;
+  originalImageWidth?: number;
+  originalImageHeight?: number;
   imageName: string;
   workflowFileName: string;
   workflowFormat: WorkflowJsonFormat;
@@ -89,6 +111,10 @@ const EMPTY_DRAFT: DraftImportState = {
   title: '',
   tagsInput: '',
   thumbnailDataUrl: '',
+  originalImageDataUrl: undefined,
+  originalImageMime: undefined,
+  originalImageWidth: undefined,
+  originalImageHeight: undefined,
   imageName: '',
   workflowFileName: '',
   workflowFormat: 'unknown',
@@ -139,6 +165,8 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     () => cards.filter((c) => !c.isPrivate).length === 0
   );
   const [isDragging, setIsDragging] = useState(false);
+  const [isBatchDragging, setIsBatchDragging] = useState(false);
+  const [isImportingBatch, setIsImportingBatch] = useState(false);
   const [importNotice, setImportNotice] = useState<{
     type: 'ok' | 'err' | 'warn';
     text: string;
@@ -153,6 +181,19 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   const [preferStudioProfile, setPreferStudioProfile] = useState(false);
   const [workbenchSeedOverride, setWorkbenchSeedOverride] = useState<'card' | 'fixed' | 'random'>('card');
   const [workbenchFixedSeed, setWorkbenchFixedSeed] = useState<number>(DEFAULT_COMFY_SEED);
+
+  // Local folder binding state (File System Access API + graceful fallback)
+  const fsApiSupported = useMemo(() => isFileSystemAccessSupported(), []);
+  const [boundDirHandle, setBoundDirHandle] = useState<FileSystemDirectoryHandle | null>(null);
+  const [dirPermState, setDirPermState] = useState<'none' | 'granted' | 'prompt' | 'denied'>('none');
+  const [folderNotice, setFolderNotice] = useState<{
+    type: 'ok' | 'warn' | 'err';
+    text: string;
+  } | null>(null);
+  const [isSyncingFolder, setIsSyncingFolder] = useState(false);
+
+  // Lightbox state
+  const [lightboxCardId, setLightboxCardId] = useState<string | null>(null);
 
   // Fine-tuning drawer state
   const [editingCardId, setEditingCardId] = useState<string | null>(null);
@@ -182,41 +223,18 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   );
 
   useEffect(() => {
-    if (!open) {
-      setPrivateView(false);
-      setActiveTagFilter('ALL');
-      return;
-    }
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        if (editingCardId) {
-          setEditingCardId(null);
-        } else {
-          onClose();
-        }
-      }
+    let cancelled = false;
+    void (async () => {
+      const savedHandle = await loadBoundDirectoryHandle();
+      if (cancelled || !savedHandle) return;
+      const perm = await ensureDirectoryWritePermission(savedHandle, false);
+      if (cancelled) return;
+      setBoundDirHandle(savedHandle);
+      setDirPermState(perm);
+    })();
+    return () => {
+      cancelled = true;
     };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [open, editingCardId, onClose]);
-
-  const openFineTuner = useCallback((card: WorkflowCollectionCard, initialTab: 'positive' | 'negative' = 'positive') => {
-    setEditingCardId(card.id);
-    setEditTab(initialTab);
-    setEditTitle(card.title);
-    setEditTagsInput(card.tags.join(', '));
-    setEditPosNodeId(card.positiveNodeId);
-    setEditNegNodeId(card.negativeNodeId);
-    setEditPosText(card.fineTunedPositive);
-    setEditNegText(card.fineTunedNegative);
-    setEditPosTags(parsePromptToTagItems(card.fineTunedPositive));
-    setEditNegTags(parsePromptToTagItems(card.fineTunedNegative));
-    setEditApplyOnSend(card.applyFineTuneOnSend);
-    setEditIsPrivate(Boolean(card.isPrivate));
-    setEditSeedMode(card.seedMode ?? 'workflow');
-    setEditFixedSeed(card.fixedSeed ?? DEFAULT_COMFY_SEED);
-    setNewTagInput('');
-    setSaveFeedback(null);
   }, []);
 
   const publicCards = useMemo(() => cards.filter((c) => !c.isPrivate), [cards]);
@@ -252,6 +270,81 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     });
   }, [scopedCards, activeTagFilter, searchQuery]);
 
+  const lightboxIndex = useMemo(() => {
+    if (!lightboxCardId) return -1;
+    return filteredCards.findIndex((c) => c.id === lightboxCardId);
+  }, [filteredCards, lightboxCardId]);
+
+  const lightboxCard = useMemo(() => {
+    if (!lightboxCardId) return null;
+    if (lightboxIndex >= 0) return filteredCards[lightboxIndex];
+    return scopedCards.find((c) => c.id === lightboxCardId) ?? null;
+  }, [filteredCards, lightboxCardId, lightboxIndex, scopedCards]);
+
+  useEffect(() => {
+    if (!open) {
+      setPrivateView(false);
+      setActiveTagFilter('ALL');
+      setLightboxCardId(null);
+      return;
+    }
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (lightboxCardId) {
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          setLightboxCardId(null);
+          return;
+        }
+        if (e.key === 'ArrowLeft' && filteredCards.length > 1) {
+          e.preventDefault();
+          const curIdx = filteredCards.findIndex((c) => c.id === lightboxCardId);
+          const prevIdx =
+            curIdx <= 0 ? filteredCards.length - 1 : curIdx - 1;
+          setLightboxCardId(filteredCards[prevIdx].id);
+          return;
+        }
+        if (e.key === 'ArrowRight' && filteredCards.length > 1) {
+          e.preventDefault();
+          const curIdx = filteredCards.findIndex((c) => c.id === lightboxCardId);
+          const nextIdx =
+            curIdx < 0 || curIdx >= filteredCards.length - 1 ? 0 : curIdx + 1;
+          setLightboxCardId(filteredCards[nextIdx].id);
+          return;
+        }
+        return;
+      }
+
+      if (e.key === 'Escape') {
+        if (editingCardId) {
+          setEditingCardId(null);
+        } else {
+          onClose();
+        }
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [open, editingCardId, lightboxCardId, filteredCards, onClose]);
+
+  const openFineTuner = useCallback((card: WorkflowCollectionCard, initialTab: 'positive' | 'negative' = 'positive') => {
+    setEditingCardId(card.id);
+    setEditTab(initialTab);
+    setEditTitle(card.title);
+    setEditTagsInput(card.tags.join(', '));
+    setEditPosNodeId(card.positiveNodeId);
+    setEditNegNodeId(card.negativeNodeId);
+    setEditPosText(card.fineTunedPositive);
+    setEditNegText(card.fineTunedNegative);
+    setEditPosTags(parsePromptToTagItems(card.fineTunedPositive));
+    setEditNegTags(parsePromptToTagItems(card.fineTunedNegative));
+    setEditApplyOnSend(card.applyFineTuneOnSend);
+    setEditIsPrivate(Boolean(card.isPrivate));
+    setEditSeedMode(card.seedMode ?? 'workflow');
+    setEditFixedSeed(card.fixedSeed ?? DEFAULT_COMFY_SEED);
+    setNewTagInput('');
+    setSaveFeedback(null);
+  }, []);
+
   const commitCards = useCallback(
     (next: WorkflowCollectionCard[]) => {
       const res = onChangeCards(next);
@@ -264,6 +357,128 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     },
     [onChangeCards]
   );
+
+  const handleSelectLocalFolder = async () => {
+    const result = await pickLocalWorkflowDirectory();
+    if (!result.ok) {
+      if (result.cancelled) return;
+      setFolderNotice({
+        type: result.unsupported || result.iframeBlocked ? 'warn' : 'err',
+        text: result.message,
+      });
+      return;
+    }
+
+    const perm = await ensureDirectoryWritePermission(result.handle, true);
+    setBoundDirHandle(result.handle);
+    setDirPermState(perm);
+    await saveBoundDirectoryHandle(result.handle);
+
+    if (perm === 'granted') {
+      setFolderNotice({
+        type: 'ok',
+        text: `已绑定本地文件夹「${result.handle.name}」：后续建卡、微调保存与批量导入将自动把未压缩原图与工作流 JSON 落盘写入对应子文件夹`,
+      });
+    } else {
+      setFolderNotice({
+        type: 'warn',
+        text: `已选择文件夹「${result.handle.name}」，但暂未获得写入权限；请点击「授权写入」或降级使用导出下载`,
+      });
+    }
+  };
+
+  const handleUnbindLocalFolder = async () => {
+    setBoundDirHandle(null);
+    setDirPermState('none');
+    await saveBoundDirectoryHandle(null);
+    setFolderNotice({
+      type: 'ok',
+      text: '已解绑本地文件夹（卡片仍完整保存在浏览器 IndexedDB 缓存中）',
+    });
+  };
+
+  const handleReauthorizeLocalFolder = async () => {
+    if (!boundDirHandle) return;
+    const perm = await ensureDirectoryWritePermission(boundDirHandle, true);
+    setDirPermState(perm);
+    if (perm === 'granted') {
+      setFolderNotice({
+        type: 'ok',
+        text: `已重新授权本地文件夹「${boundDirHandle.name}」写入权限`,
+      });
+    } else {
+      setFolderNotice({
+        type: 'warn',
+        text: `未能获取「${boundDirHandle.name}」写入权限，可重新选择本地文件夹或使用导出下载`,
+      });
+    }
+  };
+
+  const tryAutoWriteCardToFolder = useCallback(
+    async (card: WorkflowCollectionCard): Promise<{ written: boolean; path?: string; error?: string }> => {
+      if (!boundDirHandle || dirPermState !== 'granted') {
+        return { written: false };
+      }
+      const res = await writeCardToLocalDirectory(boundDirHandle, card);
+      if (res.ok) {
+        return { written: true, path: res.relativePath };
+      }
+      return { written: false, error: res.error };
+    },
+    [boundDirHandle, dirPermState]
+  );
+
+  const handleSyncScopedCardsToFolder = async () => {
+    if (!boundDirHandle) {
+      await handleSelectLocalFolder();
+      return;
+    }
+    const perm = await ensureDirectoryWritePermission(boundDirHandle, true);
+    setDirPermState(perm);
+    if (perm !== 'granted') {
+      setFolderNotice({
+        type: 'warn',
+        text: `未获得「${boundDirHandle.name}」写入权限，无法写入磁盘；已保留浏览器缓存并可使用「导出集」下载`,
+      });
+      return;
+    }
+    const targetCards = scopedCards;
+    if (targetCards.length === 0) {
+      setFolderNotice({
+        type: 'warn',
+        text: privateView ? '当前私密区暂无卡片可同步' : '当前公开区暂无卡片可同步',
+      });
+      return;
+    }
+
+    setIsSyncingFolder(true);
+    try {
+      const { succeededIds, failed } = await writeCardsBatchToLocalDirectory(
+        boundDirHandle,
+        targetCards
+      );
+      if (succeededIds.length > 0) {
+        const now = Date.now();
+        const okSet = new Set(succeededIds);
+        commitCards(
+          cards.map((c) => (okSet.has(c.id) ? { ...c, lastFolderSyncAt: now } : c))
+        );
+      }
+      if (failed.length === 0) {
+        setFolderNotice({
+          type: 'ok',
+          text: `已将 ${succeededIds.length} 张${privateView ? '私密' : '公开'}卡片（含未压缩原图 + workflow.json + card.json）同步写入本地文件夹「${boundDirHandle.name}」`,
+        });
+      } else {
+        setFolderNotice({
+          type: 'warn',
+          text: `已同步 ${succeededIds.length} 张，${failed.length} 张写入失败（${failed[0]?.title}: ${failed[0]?.error}）`,
+        });
+      }
+    } finally {
+      setIsSyncingFolder(false);
+    }
+  };
 
   const handleFilesIngest = useCallback(async (files: FileList | File[]) => {
     const list = Array.from(files);
@@ -296,12 +511,12 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       return;
     }
 
-    let thumbUrl = '';
+    let originalImage: Awaited<ReturnType<typeof readImageOriginalData>> | null = null;
     let pngMeta: Awaited<ReturnType<typeof extractComfyMetadataFromPngFile>> | null = null;
 
     if (nextImageFile) {
       try {
-        thumbUrl = await resizeImageToThumbnail(nextImageFile);
+        originalImage = await readImageOriginalData(nextImageFile);
         if (
           nextImageFile.type === 'image/png' ||
           nextImageFile.name.toLowerCase().endsWith('.png')
@@ -329,8 +544,12 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
     setDraft((prev) => {
       const updated = { ...prev };
-      if (nextImageFile) {
-        updated.thumbnailDataUrl = thumbUrl;
+      if (nextImageFile && originalImage) {
+        updated.thumbnailDataUrl = originalImage.dataUrl;
+        updated.originalImageDataUrl = originalImage.dataUrl;
+        updated.originalImageMime = originalImage.mimeType;
+        updated.originalImageWidth = originalImage.width;
+        updated.originalImageHeight = originalImage.height;
         updated.imageName = nextImageFile.name;
         if (!updated.title.trim()) {
           updated.title =
@@ -382,7 +601,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       } else if (nextImageFile) {
         setImportNotice({
           type: 'warn',
-          text: '已载入参考图缩略图（该图片未内嵌 ComfyUI 工作流，请再拖入对应的 .json 工作流文件）',
+          text: '已载入原始参考图（未压缩；该图片未内嵌 ComfyUI 工作流，请再拖入对应的 .json 工作流文件）',
         });
       }
 
@@ -390,7 +609,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     });
   }, []);
 
-  const handleSaveNewCard = () => {
+  const handleSaveNewCard = async () => {
     if (!draft.rawWorkflowJson && !draft.apiPromptJson && !draft.extractedPositive) {
       setImportNotice({
         type: 'err',
@@ -406,11 +625,15 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       `工作流收藏 #${cards.length + 1}`;
     const tags = parseTagsInput(draft.tagsInput);
 
-    const newCard: WorkflowCollectionCard = {
+    let newCard: WorkflowCollectionCard = {
       id: `wf-card-${now}-${Math.random().toString(36).slice(2, 6)}`,
       title,
       tags,
-      thumbnailDataUrl: draft.thumbnailDataUrl,
+      thumbnailDataUrl: draft.originalImageDataUrl || draft.thumbnailDataUrl,
+      originalImageDataUrl: draft.originalImageDataUrl,
+      originalImageMime: draft.originalImageMime,
+      originalImageWidth: draft.originalImageWidth,
+      originalImageHeight: draft.originalImageHeight,
       imageName: draft.imageName,
       workflowFileName: draft.workflowFileName || 'workflow.json',
       workflowFormat: draft.workflowFormat,
@@ -430,15 +653,28 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       updatedAt: now,
     };
 
+    const folderRes = await tryAutoWriteCardToFolder(newCard);
+    if (folderRes.written) {
+      newCard = { ...newCard, lastFolderSyncAt: Date.now() };
+    } else if (folderRes.error) {
+      setFolderNotice({
+        type: 'warn',
+        text: `已保存到浏览器缓存，但写入本地文件夹失败：${folderRes.error}`,
+      });
+    }
+
     const saveRes = commitCards([newCard, ...cards]);
     if (saveRes.ok) {
       setDraft({ ...EMPTY_DRAFT, isPrivate: privateView });
+      const folderSuffix = folderRes.written
+        ? `，已同步写入本地文件夹 (${folderRes.path})`
+        : '';
       setImportNotice({
         type: 'ok',
         text:
           newCard.isPrivate && !privateView
-            ? `已保存私密卡片「${newCard.title}」（已收入私密区，点击顶部「私密」可查看）`
-            : `已保存收藏卡片「${newCard.title}」`,
+            ? `已保存私密卡片「${newCard.title}」（已收入私密区，点击顶部「私密」可查看${folderSuffix}）`
+            : `已保存收藏卡片「${newCard.title}」${folderSuffix}`,
       });
       setCreatePanelOpen(false);
     }
@@ -470,7 +706,40 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     if (editingCardId === cardId) {
       setEditingCardId(null);
     }
+    if (lightboxCardId === cardId) {
+      setLightboxCardId(null);
+    }
     commitCards(cards.filter((c) => c.id !== cardId));
+  };
+
+  const handleDownloadCardOriginalImage = (card: WorkflowCollectionCard) => {
+    const src = card.originalImageDataUrl || card.thumbnailDataUrl;
+    if (!src) return;
+    try {
+      const blob = dataUrlToBlob(src);
+      const ext =
+        card.imageName.match(/\.([a-z0-9]{2,5})$/i)?.[1]?.toLowerCase() ||
+        (blob.type.includes('jpeg')
+          ? 'jpg'
+          : blob.type.includes('webp')
+          ? 'webp'
+          : 'png');
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${sanitizeFilenamePrefix(card.title)}.${ext}`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch {
+      const a = document.createElement('a');
+      a.href = src;
+      a.download = card.imageName || `${sanitizeFilenamePrefix(card.title)}.png`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    }
   };
 
   const handleDownloadCardJson = (card: WorkflowCollectionCard) => {
@@ -667,38 +936,55 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     };
   };
 
-  const handleSaveToCurrentCard = () => {
+  const handleSaveToCurrentCard = async () => {
     const updated = buildUpdatedEditingCard();
     if (!updated) return;
-    const res = commitCards(cards.map((c) => (c.id === updated.id ? updated : c)));
+    const folderRes = await tryAutoWriteCardToFolder(updated);
+    const finalCard = folderRes.written
+      ? { ...updated, lastFolderSyncAt: Date.now() }
+      : updated;
+    const res = commitCards(cards.map((c) => (c.id === finalCard.id ? finalCard : c)));
     if (res.ok) {
-      setSaveFeedback('已保存到当前卡片');
-      window.setTimeout(() => setSaveFeedback(null), 1800);
+      setSaveFeedback(
+        folderRes.written
+          ? '已保存到当前卡片并同步写入本地文件夹'
+          : '已保存到当前卡片'
+      );
+      window.setTimeout(() => setSaveFeedback(null), 2200);
     }
   };
 
-  const handleSaveAsNewCard = () => {
+  const handleSaveAsNewCard = async () => {
     const updated = buildUpdatedEditingCard();
     if (!updated) return;
     const now = Date.now();
     const baseTitle = updated.title;
     const newTitle =
       baseTitle === editingCard?.title ? `${baseTitle} · 微调` : baseTitle;
-    const cloned: WorkflowCollectionCard = {
+    let cloned: WorkflowCollectionCard = {
       ...updated,
       id: `wf-card-${now}-${Math.random().toString(36).slice(2, 6)}`,
       title: newTitle,
       lastRunAt: undefined,
       lastPromptId: undefined,
+      lastFolderSyncAt: undefined,
       createdAt: now,
       updatedAt: now,
     };
+    const folderRes = await tryAutoWriteCardToFolder(cloned);
+    if (folderRes.written) {
+      cloned = { ...cloned, lastFolderSyncAt: Date.now() };
+    }
     const res = commitCards([cloned, ...cards]);
     if (res.ok) {
       setEditingCardId(cloned.id);
       setEditTitle(cloned.title);
-      setSaveFeedback(`已另存为新卡片「${cloned.title}」`);
-      window.setTimeout(() => setSaveFeedback(null), 2000);
+      setSaveFeedback(
+        folderRes.written
+          ? `已另存为新卡片「${cloned.title}」并写入本地文件夹`
+          : `已另存为新卡片「${cloned.title}」`
+      );
+      window.setTimeout(() => setSaveFeedback(null), 2200);
     }
   };
 
@@ -735,57 +1021,154 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     URL.revokeObjectURL(url);
   };
 
-  const handleImportCollection = async (file: File) => {
+  const handleImportCollection = async (input: FileList | File[]) => {
+    const files = Array.from(input);
+    if (files.length === 0) return;
+
+    setIsImportingBatch(true);
+    setImportNotice(null);
+
+    const importedJsonCards: WorkflowCollectionCard[] = [];
+    const importedPngCards: WorkflowCollectionCard[] = [];
+    const skipped: { fileName: string; reason: string }[] = [];
+
     try {
-      const text = await file.text();
-      const parsed = JSON.parse(text) as unknown;
-      const rawArr = Array.isArray(parsed)
-        ? parsed
-        : parsed && typeof parsed === 'object' && Array.isArray((parsed as Record<string, unknown>).cards)
-        ? (parsed as Record<string, unknown>).cards
-        : parsed &&
-          typeof parsed === 'object' &&
-          Array.isArray((parsed as Record<string, unknown>).workflowCards)
-        ? (parsed as Record<string, unknown>).workflowCards
-        : null;
+      for (const file of files) {
+        const lower = file.name.toLowerCase();
+        if (file.type === 'application/json' || lower.endsWith('.json')) {
+          try {
+            const text = await file.text();
+            const parsed = JSON.parse(text) as unknown;
+            const rawArr = Array.isArray(parsed)
+              ? parsed
+              : parsed &&
+                typeof parsed === 'object' &&
+                Array.isArray((parsed as Record<string, unknown>).cards)
+              ? (parsed as Record<string, unknown>).cards
+              : parsed &&
+                typeof parsed === 'object' &&
+                Array.isArray((parsed as Record<string, unknown>).workflowCards)
+              ? (parsed as Record<string, unknown>).workflowCards
+              : null;
 
-      if (!rawArr) {
+            if (!rawArr) {
+              skipped.push({
+                fileName: file.name,
+                reason: '未找到有效的收藏卡片列表（需包含 cards 数组）',
+              });
+              continue;
+            }
+
+            const normalized = normalizeWorkflowCards(rawArr);
+            if (normalized.length === 0) {
+              skipped.push({
+                fileName: file.name,
+                reason: '卡片数据结构无效或为空',
+              });
+              continue;
+            }
+            importedJsonCards.push(...normalized);
+          } catch {
+            skipped.push({
+              fileName: file.name,
+              reason: '无法解析收藏集 JSON 文件',
+            });
+          }
+        } else if (file.type === 'image/png' || lower.endsWith('.png')) {
+          const pngResult = await buildWorkflowCardFromPngFile(file, {
+            isPrivate: privateView,
+          });
+          if (pngResult.ok) {
+            importedPngCards.push(pngResult.card);
+          } else {
+            skipped.push({
+              fileName: pngResult.fileName,
+              reason: pngResult.reason,
+            });
+          }
+        } else {
+          skipped.push({
+            fileName: file.name,
+            reason: '仅支持收藏集 .json 或内嵌 ComfyUI 参数的 .png 图片',
+          });
+        }
+      }
+
+      const allImported = [...importedPngCards, ...importedJsonCards];
+      if (allImported.length > 0) {
+        let cardsToMerge = allImported;
+        let folderSyncedCount = 0;
+        if (boundDirHandle && dirPermState === 'granted') {
+          const { succeededIds } = await writeCardsBatchToLocalDirectory(
+            boundDirHandle,
+            allImported
+          );
+          if (succeededIds.length > 0) {
+            folderSyncedCount = succeededIds.length;
+            const okSet = new Set(succeededIds);
+            const syncTime = Date.now();
+            cardsToMerge = allImported.map((c) =>
+              okSet.has(c.id) ? { ...c, lastFolderSyncAt: syncTime } : c
+            );
+          }
+        }
+        const merged = mergeImportedWorkflowCards(cards, cardsToMerge);
+        const res = commitCards(merged);
+        if (res.ok) {
+          const parts: string[] = [];
+          if (importedPngCards.length > 0 && importedJsonCards.length > 0) {
+            parts.push(
+              `已导入 ${allImported.length} 张卡片（PNG ${importedPngCards.length} 张 + JSON ${importedJsonCards.length} 张）`
+            );
+          } else if (importedPngCards.length > 0) {
+            parts.push(
+              `已从 ${importedPngCards.length} 张 PNG 自动提取工作流并生成收藏卡片（保留原图不压缩）`
+            );
+          } else {
+            parts.push(`已导入 ${importedJsonCards.length} 张工作流收藏卡片`);
+          }
+
+          if (folderSyncedCount > 0 && boundDirHandle) {
+            parts.push(`，已同步写入「${boundDirHandle.name}」`);
+          }
+
+          const importedPrivateCount = allImported.filter((c) =>
+            Boolean(c.isPrivate)
+          ).length;
+          if (importedPrivateCount > 0 && !privateView) {
+            parts.push(
+              `（其中 ${importedPrivateCount} 张为私密卡片，已自动归入「私密」区）`
+            );
+          }
+
+          if (skipped.length > 0) {
+            const skipDetail = skipped
+              .map((s) => `${s.fileName}（${s.reason}）`)
+              .join('、');
+            setImportNotice({
+              type: 'warn',
+              text: `${parts.join('')}；已跳过 ${skipped.length} 个文件：${skipDetail}`,
+            });
+          } else {
+            setImportNotice({
+              type: 'ok',
+              text: parts.join(''),
+            });
+          }
+        }
+      } else {
+        const errDetail = skipped
+          .map((s) => `${s.fileName}（${s.reason}）`)
+          .join('、');
         setImportNotice({
           type: 'err',
-          text: '导入失败：未找到有效的收藏卡片列表（需包含 cards 数组）',
-        });
-        return;
-      }
-
-      const normalized = normalizeWorkflowCards(rawArr);
-      if (normalized.length === 0) {
-        setImportNotice({
-          type: 'err',
-          text: '导入失败：卡片数据结构无效或为空',
-        });
-        return;
-      }
-
-      const existingIds = new Set(cards.map((c) => c.id));
-      const merged = [
-        ...normalized.map((c, idx) =>
-          existingIds.has(c.id) ? { ...c, id: `${c.id}-imp-${Date.now()}-${idx}` } : c
-        ),
-        ...cards,
-      ];
-      const res = commitCards(merged);
-      if (res.ok) {
-        const importedPrivateCount = normalized.filter((c) => Boolean(c.isPrivate)).length;
-        setImportNotice({
-          type: 'ok',
-          text:
-            importedPrivateCount > 0 && !privateView
-              ? `已导入 ${normalized.length} 张卡片（其中 ${importedPrivateCount} 张为私密卡片，已自动归入「私密」区）`
-              : `已导入 ${normalized.length} 张工作流收藏卡片`,
+          text: errDetail
+            ? `导入失败：${errDetail}`
+            : '导入失败：未识别到有效的收藏集 JSON 或内嵌工作流的 PNG 图片',
         });
       }
-    } catch {
-      setImportNotice({ type: 'err', text: '导入失败：无法解析收藏集 JSON 文件' });
+    } finally {
+      setIsImportingBatch(false);
     }
   };
 
@@ -798,7 +1181,29 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="relative w-full max-w-[1280px] h-[90vh] flex flex-col rounded-[16px] bg-[#F4F4F7] border border-[#E0E0E6] shadow-[0_24px_60px_rgba(18,22,33,0.18)] overflow-hidden">
+      <div
+        onDragOver={(e) => {
+          if (e.dataTransfer.types?.includes('Files')) {
+            e.preventDefault();
+            setIsBatchDragging(true);
+          }
+        }}
+        onDragLeave={(e) => {
+          if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+            setIsBatchDragging(false);
+          }
+        }}
+        onDrop={(e) => {
+          if (e.dataTransfer.files?.length) {
+            e.preventDefault();
+            setIsBatchDragging(false);
+            void handleImportCollection(e.dataTransfer.files);
+          }
+        }}
+        className={`relative w-full max-w-[1280px] h-[90vh] flex flex-col rounded-[16px] bg-[#F4F4F7] border shadow-[0_24px_60px_rgba(18,22,33,0.18)] overflow-hidden transition-colors ${
+          isBatchDragging ? 'border-[#7C5CFC] ring-2 ring-[#7C5CFC]/25' : 'border-[#E0E0E6]'
+        }`}
+      >
         {/* 顶栏 */}
         <header className="shrink-0 h-[56px] px-5 bg-white border-b border-[#E0E0E6] flex items-center justify-between gap-3">
           <div className="flex items-center gap-3 min-w-0">
@@ -825,9 +1230,36 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
           <div className="flex items-center gap-2 shrink-0">
             <button
               type="button"
+              onClick={() => void handleSelectLocalFolder()}
+              title={
+                boundDirHandle
+                  ? `当前已绑定本地文件夹：${boundDirHandle.name}（点击更换绑定文件夹）`
+                  : '选择并绑定本地文件夹，将未压缩原图与工作流 JSON 直接落盘写入本地'
+              }
+              className={`h-8 px-2.5 inline-flex items-center gap-1.5 text-[11.5px] font-medium rounded-[10px] border transition-colors whitespace-nowrap cursor-pointer ${
+                boundDirHandle && dirPermState === 'granted'
+                  ? 'border-emerald-300 bg-emerald-50/90 text-emerald-800 hover:border-emerald-400'
+                  : boundDirHandle
+                  ? 'border-amber-300 bg-amber-50/90 text-amber-800 hover:border-amber-400'
+                  : 'border-[#E0E0E6] bg-white text-[#4C5264] hover:border-[#7C5CFC]/50 hover:text-[#6B48F5]'
+              }`}
+            >
+              {boundDirHandle && dirPermState === 'granted' ? (
+                <FolderCheck className="w-3.5 h-3.5 shrink-0 text-emerald-600" />
+              ) : (
+                <FolderOpen className="w-3.5 h-3.5 shrink-0" />
+              )}
+              <span className="max-w-[130px] truncate">
+                {boundDirHandle ? `文件夹: ${boundDirHandle.name}` : '选择本地文件夹'}
+              </span>
+            </button>
+
+            <button
+              type="button"
               onClick={() => {
                 setPrivateView((prev) => !prev);
                 setActiveTagFilter('ALL');
+                setLightboxCardId(null);
               }}
               title={
                 privateView
@@ -877,21 +1309,47 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
             <input
               ref={collectionImportRef}
               type="file"
-              accept=".json,application/json"
+              accept=".json,application/json,.png,image/png"
+              multiple
               className="hidden"
               onChange={(e) => {
-                const file = e.target.files?.[0];
-                if (file) void handleImportCollection(file);
+                if (e.target.files?.length) {
+                  void handleImportCollection(e.target.files);
+                }
                 e.target.value = '';
               }}
             />
             <button
               type="button"
+              disabled={isImportingBatch}
               onClick={() => collectionImportRef.current?.click()}
-              className="h-8 px-2.5 inline-flex items-center gap-1 text-[11.5px] font-medium rounded-[10px] border border-[#E0E0E6] bg-white text-[#4C5264] hover:border-[#7C5CFC]/40 hover:text-[#7C5CFC] transition-colors whitespace-nowrap cursor-pointer"
+              onDragOver={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setIsBatchDragging(true);
+              }}
+              onDragLeave={() => setIsBatchDragging(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setIsBatchDragging(false);
+                if (e.dataTransfer.files?.length) {
+                  void handleImportCollection(e.dataTransfer.files);
+                }
+              }}
+              title="支持导入收藏集 .json，或单张/多张内嵌 ComfyUI prompt / workflow 元数据的 PNG 图片（支持多选与拖入）"
+              className={`h-8 px-2.5 inline-flex items-center gap-1 text-[11.5px] font-medium rounded-[10px] border transition-colors whitespace-nowrap cursor-pointer disabled:opacity-50 ${
+                isBatchDragging
+                  ? 'border-[#7C5CFC] bg-[#F4F2FF] text-[#6B48F5]'
+                  : 'border-[#E0E0E6] bg-white text-[#4C5264] hover:border-[#7C5CFC]/40 hover:text-[#7C5CFC]'
+              }`}
             >
-              <Upload className="w-3.5 h-3.5" />
-              <span>导入集</span>
+              {isImportingBatch ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Upload className="w-3.5 h-3.5" />
+              )}
+              <span>{isImportingBatch ? '导入中...' : '导入集'}</span>
             </button>
 
             <button
@@ -918,6 +1376,95 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
         {/* 主体区 */}
         <div className="flex-1 min-h-0 overflow-y-auto p-4 sm:p-5 space-y-4">
+          {/* 本地文件夹绑定状态与同步条 */}
+          {(boundDirHandle || folderNotice || !fsApiSupported) && (
+            <div
+              className={`rounded-[12px] border px-4 py-2.5 flex flex-wrap items-center justify-between gap-2.5 text-[12px] ${
+                folderNotice?.type === 'err'
+                  ? 'border-[#F8C8D2] bg-[#FFF1F3] text-[#B42343]'
+                  : folderNotice?.type === 'warn' || (boundDirHandle && dirPermState !== 'granted')
+                  ? 'border-amber-200 bg-amber-50/90 text-amber-900'
+                  : boundDirHandle
+                  ? 'border-emerald-200 bg-emerald-50/90 text-emerald-900'
+                  : 'border-[#E0E0E6] bg-white text-[#4C5264]'
+              }`}
+            >
+              <div className="flex items-center gap-2 min-w-0 flex-1">
+                {boundDirHandle && dirPermState === 'granted' ? (
+                  <FolderCheck className="w-4 h-4 shrink-0 text-emerald-600" />
+                ) : (
+                  <FolderOpen className="w-4 h-4 shrink-0 opacity-80" />
+                )}
+                <div className="min-w-0 flex-1">
+                  {folderNotice ? (
+                    <span className="break-words">{folderNotice.text}</span>
+                  ) : boundDirHandle ? (
+                    <span>
+                      已绑定本地文件夹 <strong className="font-semibold">「{boundDirHandle.name}」</strong>
+                      {dirPermState === 'granted'
+                        ? '（读写已授权 · 建卡/微调保存自动落盘未压缩原图与 JSON）'
+                        : '（页面刷新后需点击右侧「授权写入」恢复磁盘写入权限）'}
+                    </span>
+                  ) : (
+                    <span>
+                      当前浏览器环境暂不支持直接写入本地磁盘文件夹，已自动使用 IndexedDB 浏览器存储保留原图并支持「导出集 / 单卡下载」。
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                {boundDirHandle && dirPermState !== 'granted' && (
+                  <button
+                    type="button"
+                    onClick={() => void handleReauthorizeLocalFolder()}
+                    className="h-7 px-2.5 rounded-[8px] border border-amber-300 bg-white text-[11.5px] font-medium text-amber-800 hover:bg-amber-50 cursor-pointer whitespace-nowrap"
+                  >
+                    授权写入
+                  </button>
+                )}
+                {boundDirHandle && (
+                  <button
+                    type="button"
+                    disabled={isSyncingFolder || scopedCards.length === 0}
+                    onClick={() => void handleSyncScopedCardsToFolder()}
+                    className="h-7 px-2.5 inline-flex items-center gap-1 rounded-[8px] border border-emerald-300 bg-white text-[11.5px] font-medium text-emerald-800 hover:bg-emerald-50 disabled:opacity-45 cursor-pointer whitespace-nowrap"
+                  >
+                    {isSyncingFolder ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <FolderSync className="w-3.5 h-3.5" />
+                    )}
+                    <span>
+                      {isSyncingFolder
+                        ? '写入中...'
+                        : `同步${privateView ? '私密' : '公开'}卡片 (${scopedCards.length})`}
+                    </span>
+                  </button>
+                )}
+                {boundDirHandle && (
+                  <button
+                    type="button"
+                    onClick={() => void handleUnbindLocalFolder()}
+                    className="h-7 px-2 rounded-[8px] border border-[#E0E0E6] bg-white text-[11px] text-[#686E7E] hover:text-[#1E2028] cursor-pointer whitespace-nowrap"
+                  >
+                    解绑
+                  </button>
+                )}
+                {folderNotice && (
+                  <button
+                    type="button"
+                    onClick={() => setFolderNotice(null)}
+                    aria-label="关闭文件夹提示"
+                    className="p-0.5 opacity-70 hover:opacity-100 cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
           {/* 个人私密区提示与专属导出条 */}
           {privateView && (
             <div className="rounded-[12px] border border-[#F5B8C4] bg-[#FFF5F7] px-4 py-2.5 flex flex-wrap items-center justify-between gap-2.5">
@@ -946,6 +1493,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                   onClick={() => {
                     setPrivateView(false);
                     setActiveTagFilter('ALL');
+                    setLightboxCardId(null);
                   }}
                   className="h-7 px-2.5 rounded-[8px] border border-[#E0E0E6] bg-white text-[11.5px] font-medium text-[#4C5264] hover:text-[#1E2028] cursor-pointer whitespace-nowrap"
                 >
@@ -954,6 +1502,44 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
               </div>
             </div>
           )}
+          {/* 批量拖入提示条 */}
+          {isBatchDragging && !isDragging && (
+            <div className="rounded-[12px] border-2 border-dashed border-[#7C5CFC] bg-[#F4F2FF] px-4 py-3 text-center text-[12px] font-medium text-[#5B3DF5]">
+              松开即可通过「导入集」批量导入含 ComfyUI 参数的 PNG 图片或收藏集 .json
+            </div>
+          )}
+
+          {/* 导入反馈条（折叠建卡面板时依然可见） */}
+          {!createPanelOpen && importNotice && (
+            <div
+              role="status"
+              className={`rounded-[12px] border px-4 py-2.5 flex items-center justify-between gap-2 text-[12px] ${
+                importNotice.type === 'err'
+                  ? 'border-[#F8C8D2] bg-[#FFF1F3] text-[#B42343]'
+                  : importNotice.type === 'warn'
+                  ? 'border-amber-200 bg-amber-50/90 text-amber-800'
+                  : 'border-emerald-200 bg-emerald-50/90 text-emerald-900'
+              }`}
+            >
+              <div className="flex items-center gap-2 min-w-0">
+                {importNotice.type === 'err' || importNotice.type === 'warn' ? (
+                  <AlertCircle className="w-4 h-4 shrink-0" />
+                ) : (
+                  <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-600" />
+                )}
+                <span className="break-words">{importNotice.text}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setImportNotice(null)}
+                aria-label="关闭导入提示"
+                className="p-0.5 opacity-70 hover:opacity-100 cursor-pointer shrink-0"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
+
           {/* 存储容量警告 */}
           {storageWarning && (
             <div className="rounded-[12px] border border-[#F8C8D2] bg-[#FFF1F3] px-4 py-2.5 flex items-center justify-between gap-2 text-[12px] text-[#B42343]">
@@ -1074,12 +1660,16 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                 <div
                   onDragOver={(e) => {
                     e.preventDefault();
+                    e.stopPropagation();
                     setIsDragging(true);
+                    setIsBatchDragging(false);
                   }}
                   onDragLeave={() => setIsDragging(false)}
                   onDrop={(e) => {
                     e.preventDefault();
+                    e.stopPropagation();
                     setIsDragging(false);
+                    setIsBatchDragging(false);
                     if (e.dataTransfer.files?.length) {
                       void handleFilesIngest(e.dataTransfer.files);
                     }
@@ -1111,7 +1701,14 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                       </div>
                       <div className="text-[11px] text-[#686E7E] space-y-0.5">
                         <div className="truncate">
-                          参考图：{draft.imageName || '未选择（图片会自动压缩为轻量缩略图）'}
+                          参考图：
+                          {draft.imageName
+                            ? `${draft.imageName}${
+                                draft.originalImageWidth && draft.originalImageHeight
+                                  ? ` (${draft.originalImageWidth}×${draft.originalImageHeight} 原图无损)`
+                                  : ' (原图不压缩)'
+                              }`
+                            : '未选择（保留原图不压缩）'}
                         </div>
                         <div className="truncate">
                           工作流：{draft.workflowFileName || '未导入'}
@@ -1249,7 +1846,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
                       <button
                         type="button"
-                        onClick={handleSaveNewCard}
+                        onClick={() => void handleSaveNewCard()}
                         className="h-9 px-4 inline-flex items-center gap-1.5 text-[12.5px] font-medium rounded-[10px] bg-gradient-to-b from-[#8A6CFF] to-[#7C5CFC] text-white shadow-[0_2px_8px_rgba(124,92,252,0.24)] hover:brightness-105 cursor-pointer whitespace-nowrap shrink-0"
                       >
                         <Save className="w-3.5 h-3.5" />
@@ -1420,13 +2017,23 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                   >
                     {/* 缩略图与头部 */}
                     <div className="flex gap-3 p-3.5 border-b border-[#EAEAEF]">
-                      {card.thumbnailDataUrl ? (
-                        <img
-                          src={card.thumbnailDataUrl}
-                          alt={card.title}
-                          referrerPolicy="no-referrer"
-                          className="w-[84px] h-[104px] rounded-[9px] object-cover border border-[#E0E0E6] bg-[#FAFAFC] shrink-0"
-                        />
+                      {card.originalImageDataUrl || card.thumbnailDataUrl ? (
+                        <button
+                          type="button"
+                          onClick={() => setLightboxCardId(card.id)}
+                          title="点击查看大图（保留原图画质）"
+                          className="group relative w-[84px] h-[104px] rounded-[9px] overflow-hidden border border-[#E0E0E6] bg-[#FAFAFC] shrink-0 cursor-zoom-in focus:outline-none focus:ring-2 focus:ring-[#7C5CFC]/50"
+                        >
+                          <img
+                            src={card.originalImageDataUrl || card.thumbnailDataUrl}
+                            alt={card.title}
+                            referrerPolicy="no-referrer"
+                            className="w-full h-full object-cover transition-transform duration-200 group-hover:scale-105"
+                          />
+                          <span className="absolute right-1 bottom-1 w-5 h-5 rounded-md bg-black/55 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                            <ZoomIn className="w-3 h-3" />
+                          </span>
+                        </button>
                       ) : (
                         <div className="w-[84px] h-[104px] rounded-[9px] border border-[#E0E0E6] bg-[#FAFAFC] flex flex-col items-center justify-center text-[#949AA8] shrink-0">
                           <FileJson className="w-5 h-5 mb-1" />
@@ -1563,13 +2170,20 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
               {/* 抽屉头 */}
               <div className="shrink-0 px-5 py-3.5 border-b border-[#EAEAEF] flex items-center justify-between gap-3">
                 <div className="flex items-center gap-3 min-w-0">
-                  {editingCard.thumbnailDataUrl ? (
-                    <img
-                      src={editingCard.thumbnailDataUrl}
-                      alt={editTitle}
-                      referrerPolicy="no-referrer"
-                      className="w-10 h-10 rounded-[8px] object-cover border border-[#E0E0E6] shrink-0"
-                    />
+                  {editingCard.originalImageDataUrl || editingCard.thumbnailDataUrl ? (
+                    <button
+                      type="button"
+                      onClick={() => setLightboxCardId(editingCard.id)}
+                      title="点击查看大图"
+                      className="shrink-0 rounded-[8px] overflow-hidden border border-[#E0E0E6] cursor-zoom-in"
+                    >
+                      <img
+                        src={editingCard.originalImageDataUrl || editingCard.thumbnailDataUrl}
+                        alt={editTitle}
+                        referrerPolicy="no-referrer"
+                        className="w-10 h-10 object-cover"
+                      />
+                    </button>
                   ) : (
                     <div className="w-10 h-10 rounded-[8px] border border-[#E0E0E6] bg-[#FAFAFC] flex items-center justify-center text-[#949AA8] shrink-0">
                       <FileJson className="w-4 h-4" />
@@ -1887,7 +2501,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                 <div className="flex flex-wrap items-center justify-end gap-2">
                   <button
                     type="button"
-                    onClick={handleSaveToCurrentCard}
+                    onClick={() => void handleSaveToCurrentCard()}
                     className="h-9 px-3.5 inline-flex items-center gap-1.5 text-[12px] font-medium rounded-[10px] border border-[#E0E0E6] bg-white text-[#1E2028] hover:border-[#7C5CFC]/50 hover:text-[#6B48F5] cursor-pointer whitespace-nowrap"
                   >
                     <Save className="w-3.5 h-3.5" />
@@ -1896,7 +2510,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
                   <button
                     type="button"
-                    onClick={handleSaveAsNewCard}
+                    onClick={() => void handleSaveAsNewCard()}
                     className="h-9 px-3.5 inline-flex items-center gap-1.5 text-[12px] font-medium rounded-[10px] border border-[#DDD8FA] bg-[#F4F2FF] text-[#6B48F5] hover:bg-[#EBE6FF] cursor-pointer whitespace-nowrap"
                   >
                     <CopyPlus className="w-3.5 h-3.5" />
@@ -1921,7 +2535,153 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
             </aside>
           </div>
         )}
+
+        {/* 参考图大图预览灯箱（支持 Esc 关闭、左右切换、原图无损展示与旧缩略图降级标注） */}
+        {lightboxCard && (
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label={`参考图大图预览：${lightboxCard.title}`}
+            className="fixed inset-0 z-[70] flex flex-col bg-[#0E1016]/88 backdrop-blur-sm p-3 sm:p-6"
+            onClick={(e) => {
+              if (e.target === e.currentTarget) setLightboxCardId(null);
+            }}
+          >
+            {/* 顶部信息栏 */}
+            <div className="shrink-0 max-w-[1200px] w-full mx-auto flex flex-wrap items-center justify-between gap-3 pb-3 text-white">
+              <div className="flex flex-wrap items-center gap-2 min-w-0">
+                <h3 className="text-[14.5px] font-semibold truncate max-w-[360px]">
+                  {lightboxCard.title}
+                </h3>
+
+                {lightboxCard.isPrivate && (
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-[6px] bg-[#E85D75]/25 border border-[#E85D75]/60 text-[11px] font-medium text-[#FFD3DC] whitespace-nowrap">
+                    <EyeOff className="w-3 h-3" />
+                    <span>私密</span>
+                  </span>
+                )}
+
+                {lightboxCard.originalImageDataUrl ? (
+                  <span className="inline-flex items-center px-2 py-0.5 rounded-[6px] bg-emerald-500/20 border border-emerald-400/50 text-[11px] font-medium text-emerald-200 whitespace-nowrap tabular-nums">
+                    原图无损
+                    {lightboxCard.originalImageWidth && lightboxCard.originalImageHeight
+                      ? ` · ${lightboxCard.originalImageWidth}×${lightboxCard.originalImageHeight}`
+                      : ''}
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center px-2 py-0.5 rounded-[6px] bg-amber-500/20 border border-amber-400/50 text-[11px] font-medium text-amber-200 whitespace-nowrap">
+                    仅历史缩略图（无原始高清图）
+                  </span>
+                )}
+
+                {lightboxCard.tags.length > 0 && (
+                  <div className="flex flex-wrap items-center gap-1">
+                    {lightboxCard.tags.map((tag) => (
+                      <span
+                        key={tag}
+                        className="px-2 py-0.5 rounded-[6px] bg-white/10 border border-white/15 text-[11px] text-white/85 whitespace-nowrap"
+                      >
+                        {tag}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0">
+                {filteredCards.length > 1 && lightboxIndex >= 0 && (
+                  <span className="text-[11.5px] text-white/70 font-mono tabular-nums mr-1">
+                    {lightboxIndex + 1} / {filteredCards.length}
+                  </span>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => handleDownloadCardOriginalImage(lightboxCard)}
+                  className="h-8 px-2.5 inline-flex items-center gap-1.5 rounded-[8px] bg-white/10 hover:bg-white/20 border border-white/15 text-[11.5px] text-white cursor-pointer whitespace-nowrap"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>下载图片</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    const target = lightboxCard;
+                    setLightboxCardId(null);
+                    openFineTuner(target, 'positive');
+                  }}
+                  className="h-8 px-2.5 inline-flex items-center gap-1.5 rounded-[8px] bg-white/10 hover:bg-white/20 border border-white/15 text-[11.5px] text-white cursor-pointer whitespace-nowrap"
+                >
+                  <SlidersHorizontal className="w-3.5 h-3.5" />
+                  <span>微调提示词</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setLightboxCardId(null)}
+                  aria-label="关闭大图预览"
+                  className="h-8 w-8 inline-flex items-center justify-center rounded-[8px] bg-white/10 hover:bg-white/20 border border-white/15 text-white cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            {/* 中心大图展示舞台 + 左右导航 */}
+            <div
+              className="relative flex-1 min-h-0 flex items-center justify-center max-w-[1360px] w-full mx-auto"
+              onClick={(e) => {
+                if (e.target === e.currentTarget) setLightboxCardId(null);
+              }}
+            >
+              {filteredCards.length > 1 && (
+                <button
+                  type="button"
+                  aria-label="上一张参考图"
+                  onClick={() => {
+                    const prevIdx =
+                      lightboxIndex <= 0 ? filteredCards.length - 1 : lightboxIndex - 1;
+                    setLightboxCardId(filteredCards[prevIdx].id);
+                  }}
+                  className="absolute left-1 sm:left-3 z-10 w-10 h-10 rounded-full bg-black/50 hover:bg-black/75 border border-white/20 text-white flex items-center justify-center cursor-pointer transition-colors"
+                >
+                  <ChevronLeft className="w-5 h-5" />
+                </button>
+              )}
+
+              <img
+                src={lightboxCard.originalImageDataUrl || lightboxCard.thumbnailDataUrl}
+                alt={lightboxCard.title}
+                referrerPolicy="no-referrer"
+                className="max-w-full max-h-[82vh] object-contain rounded-[10px] shadow-[0_24px_64px_rgba(0,0,0,0.55)] bg-black/25 select-none"
+              />
+
+              {filteredCards.length > 1 && (
+                <button
+                  type="button"
+                  aria-label="下一张参考图"
+                  onClick={() => {
+                    const nextIdx =
+                      lightboxIndex < 0 || lightboxIndex >= filteredCards.length - 1
+                        ? 0
+                        : lightboxIndex + 1;
+                    setLightboxCardId(filteredCards[nextIdx].id);
+                  }}
+                  className="absolute right-1 sm:right-3 z-10 w-10 h-10 rounded-full bg-black/50 hover:bg-black/75 border border-white/20 text-white flex items-center justify-center cursor-pointer transition-colors"
+                >
+                  <ChevronRight className="w-5 h-5" />
+                </button>
+              )}
+            </div>
+
+            <div className="shrink-0 pt-2 text-center text-[11px] text-white/55">
+              点击空白处或按 Esc 关闭预览 · 左右方向键切换卡片
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
 };
+
