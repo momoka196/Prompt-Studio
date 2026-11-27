@@ -16,6 +16,7 @@ import {
   DEFAULT_ANIMA_LORAS,
   DEFAULT_COMFY_PROFILES,
   DEFAULT_STUDIO_CONFIG,
+  SHARED_BODY_TYPE_STRING,
 } from './data/presets';
 import {
   CharacterConfig,
@@ -237,9 +238,16 @@ function normalizeStudioConfig(raw: Partial<StudioConfig>): StudioConfig {
       : rawShared.background ?? defaults.shared.background;
 
   const needsAppearanceClean = (raw.appearanceCleanedVersion ?? 0) < 1;
+  const needsBodyTypeInit = (raw.bodyTypeInitializedVersion ?? 0) < 1;
+  const rawBodyTypeText = rawShared.bodyType?.text ?? '';
+  const normalizedBodyType =
+    needsBodyTypeInit && !rawBodyTypeText.trim()
+      ? { text: SHARED_BODY_TYPE_STRING, weight: rawShared.bodyType?.weight ?? 1.0 }
+      : rawShared.bodyType ?? { text: SHARED_BODY_TYPE_STRING, weight: 1.0 };
 
   return {
     appearanceCleanedVersion: 1,
+    bodyTypeInitializedVersion: 1,
     comfyUrl: raw.comfyUrl || defaults.comfyUrl,
     comfyUnetName: raw.comfyUnetName || defaults.comfyUnetName,
     comfyClipName: raw.comfyClipName || defaults.comfyClipName,
@@ -252,7 +260,7 @@ function normalizeStudioConfig(raw: Partial<StudioConfig>): StudioConfig {
       ...rawShared,
       background: normalizedBackground,
       negativeGroups,
-      bodyType: rawShared.bodyType ?? { text: '', weight: 1.0 },
+      bodyType: normalizedBodyType,
     },
     characters:
       Array.isArray(raw.characters) && raw.characters.length > 0

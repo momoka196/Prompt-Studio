@@ -138,6 +138,7 @@ export type ComfyValidationMap = Record<ComfyLoaderKey, LoaderValidationEntry> &
 
 export interface StudioConfig {
   appearanceCleanedVersion?: number;
+  bodyTypeInitializedVersion?: number;
   shared: SharedConfig;
   characters: CharacterConfig[];
   comfyUrl: string;
@@ -171,7 +172,8 @@ export type NegativeGuardRuleId =
   | 'allow-plush-anti-dup'
   | 'anti-pajama-bed'
   | 'anti-bg-override'
-  | 'anti-pose-expr-conflict';
+  | 'anti-pose-expr-conflict'
+  | 'anti-doll-plastic';
 
 export interface NegativeGuardRuleBadge {
   id: NegativeGuardRuleId;
@@ -186,6 +188,7 @@ export interface NegativeGuardMetadata {
   hasBackgroundLock: boolean;
   hasPoseExprGuard: boolean;
   hasHandSleeveConflict: boolean;
+  filteredDollPlasticTags?: string[];
   resolvedAdjustments: string[];
   appendedTags: string[];
   triggeredRuleIds: NegativeGuardRuleId[];

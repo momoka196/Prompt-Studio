@@ -129,36 +129,68 @@ export interface BuildEffectiveNegativeOptions {
 }
 
 const NO_PLUSH_GUARD_TAGS = [
-  '(plush:1.8)',
-  '(plushie:1.8)',
-  '(plush toy:1.8)',
-  '(stuffed toy:1.8)',
-  '(stuffed animal:1.8)',
+  '(plush:1.85)',
+  '(plushie:1.85)',
+  '(plush toy:1.85)',
+  '(stuffed toy:1.85)',
+  '(stuffed animal:1.85)',
   '(doll:1.9)',
   '(holding doll:1.9)',
   '(holding plush:1.9)',
-  '(mascot:1.8)',
+  '(mascot:1.85)',
+  '(1other:1.8)',
+  '(pet:1.8)',
+  '(familiar:1.85)',
+  '(creature:1.85)',
+  '(small creature:1.85)',
+  '(cute creature:1.8)',
+  '(living creature:1.7)',
+  '(animal companion:1.75)',
+  '(companion:1.65)',
+  '(animal:1.6)',
+  '(slime:1.7)',
+  '(toy:1.8)',
+  '(figurine:1.85)',
+  '(mini figure:1.75)',
+  '(nendoroid:1.7)',
+  '(plush on floor:1.8)',
+  '(doll on floor:1.8)',
+  '(object on floor:1.65)',
   'small creature in arms',
   'creature held in arms',
   'holding a small being',
-  '(chibi:1.6)',
-  '(miniature:1.65)',
-  '(mini character:1.6)',
+  '(chibi doll:1.75)',
+  '(miniature doll:1.75)',
+  '(miniature figurine:1.75)',
+  '(mini clone:1.7)',
   '(look-alike:1.6)',
   '(duplicate:1.75)',
   '(clone:1.75)',
+  '(multiple subjects:1.7)',
   'second character',
   'another character',
   'two characters in frame',
 ];
 
 const ANTI_DUPLICATE_ONLY_TAGS = [
-  '(chibi:1.6)',
-  '(miniature:1.65)',
-  '(mini character:1.6)',
+  '(1other:1.7)',
+  '(pet:1.75)',
+  '(familiar:1.8)',
+  '(living creature:1.7)',
+  '(animal companion:1.7)',
+  '(slime:1.65)',
+  '(figurine:1.75)',
+  '(nendoroid:1.65)',
+  '(plush on floor:1.7)',
+  '(doll on floor:1.7)',
+  '(chibi doll:1.7)',
+  '(miniature doll:1.7)',
+  '(miniature figurine:1.7)',
+  '(mini clone:1.65)',
   '(look-alike:1.6)',
   '(duplicate:1.75)',
   '(clone:1.75)',
+  '(multiple subjects:1.65)',
   'second character',
   'another character',
   'two characters in frame',
@@ -182,11 +214,20 @@ const PLUSH_KEYWORD_RE =
 const PAJAMA_KEYWORD_RE =
   /\b(?:pajamas?|pyjamas?|nightwear|sleepwear|loungewear|roomwear|homewear|nightgown)\b|睡衣|居家服|家居服/i;
 
+const DOLL_PLASTIC_TEXTURE_TAG_RE =
+  /\b(?:doll[- ]?like|doll[- ]?skin|doll[- ]?face|doll[- ]?joints?|ball[- ]?jointed\s*doll|bjd|porcelain\s*skin|plastic\s*skin|plastic\s*texture|plastic\s*look|plastic\s*shine|plastic\s*sheen|waxy\s*skin|wax\s*skin|vinyl\s*skin|vinyl\s*texture|rubber(?:y)?\s*skin|latex\s*skin|glossy\s*skin|synthetic\s*skin|artificial\s*skin|fake\s*skin|resin\s*skin|mannequin)\b|^plastic$/i;
+
+export function isDollPlasticTextureTag(raw: string): boolean {
+  const clean = stripWeightSyntax(raw).replace(/\s+/g, ' ').trim();
+  if (!clean) return false;
+  return DOLL_PLASTIC_TEXTURE_TAG_RE.test(clean);
+}
+
 const VISIBLE_FINGER_HAND_ACTION_RE =
-  /\b(?:touching chin|index finger|finger|peace sign|v sign|double peace|finger gun|pointing|salute|holding|hug|hugging|cupping|hand on cheek|one hand near cheek|hands on own thighs|covering lower face|peeking through fingers|fists|waving|reaching one hand|outstretched arms|forming heart with hands|hand on hip)\b/i;
+  /\b(?:touching chin|index fingers?|finger|peace sign|v sign|double peace|finger gun|pointing|salute|holding|hug|hugging|cupping|hand on cheek|one hand near cheek|hands on own thighs|hands resting|hands clasped|fidgeting fingers|touching hair|touching chest ribbon|arms crossed|arms at sides|both arms slightly raised|hands behind back|arms behind head|hand on own|covering lower face|peeking through fingers|fists|waving|reaching one hand|outstretched arms|forming heart with hands|hand on hip)\b/i;
 
 const POSE_HANDS_BUSY_RE =
-  /\b(?:with both hands|both hands|holding|hugging|hug|hands behind back|arms behind head|double peace|forming heart|both fists|hand on hip|one hand touching chin|index finger)\b/i;
+  /\b(?:with both hands|both hands|holding|hugging|hug|hands behind back|arms behind head|arms crossed|hands clasped|double peace|forming heart|both fists|hand on hip|one hand touching chin|index fingers?)\b/i;
 
 const OUTDOOR_BG_RE =
   /\b(?:outdoor|park|meadow|sky|clouds|starry|night sky|sakura|cherry blossom|fireflies|street|beach|poolside|garden|forest)\b/i;
@@ -599,6 +640,11 @@ function resolveAndBuildCharacterSegments(
   const poseOrExprRedirectsGaze =
     GAZE_AWAY_OR_DOWN_RE.test(poseRaw) || GAZE_AWAY_OR_DOWN_RE.test(exprRaw);
 
+  const appearanceHasHairOrnament =
+    /\b(?:hair bow|black bow|red bow|white bow|two hair bows|hair bow on the side|hair ribbon|hairclip|pearl hair ornament)\b/i.test(
+      appRaw
+    );
+
   const cleanTagsForSlot = (key: string, rawText: string): string => {
     const tokens = splitPromptTags(rawText);
     const out: string[] = [];
@@ -606,6 +652,13 @@ function resolveAndBuildCharacterSegments(
     for (const token of tokens) {
       const clean = stripWeightSyntax(token).replace(/\s+/g, ' ').trim();
       if (!clean) continue;
+
+      // 过滤类玩偶/塑料质感词，保持自然皮肤质感
+      if (isDollPlasticTextureTag(clean)) {
+        hasPoseExprGuard = true;
+        resolvedAdjustments.push('已过滤正向中的类玩偶/塑料质感词，提升画面自然度');
+        continue;
+      }
 
       // 背景锁定：非背景槽位不允许自带 * background 覆盖场景
       if (hasBackgroundLock && key !== 'background' && /\bbackground\b/i.test(clean)) {
@@ -615,6 +668,13 @@ function resolveAndBuildCharacterSegments(
 
       // 服装 vs 动作/表情：手藏袖中与手部交互冲突
       if (key === 'outfit' && hasHandSleeveConflict && clean === 'hands hidden in sleeves') {
+        continue;
+      }
+
+      // 服装 vs 发型发饰：已选蝴蝶结/发夹时清理服装中的 hair without hairbow
+      if (key === 'outfit' && appearanceHasHairOrnament && clean === 'hair without hairbow') {
+        hasPoseExprGuard = true;
+        resolvedAdjustments.push('保留当前发型发饰，自动移除服装中的「hair without hairbow」冲突词');
         continue;
       }
 
@@ -644,8 +704,11 @@ function resolveAndBuildCharacterSegments(
 
       // 动作 vs 背景 / 构图 / 表情
       if (key === 'pose') {
-        // 构图要求全身时，清理冲突的上半身裁剪词
-        if (hasFullBodyComp && /^(?:upper body visible|cowboy shot|portrait)$/.test(clean)) {
+        // 构图要求全身时，清理冲突的半身/大腿裁剪词
+        if (
+          hasFullBodyComp &&
+          /^(?:upper body visible|thighs visible|cowboy shot|portrait)$/.test(clean)
+        ) {
           hasBgGuardAdjust = true;
           resolvedAdjustments.push('已锁定「全身构图」，移除动作中冲突的半身裁剪词');
           continue;
@@ -668,10 +731,16 @@ function resolveAndBuildCharacterSegments(
           out.push('sitting');
           continue;
         }
-        // 已有显式表情时，去掉动作自带表情词与冲突眨眼
+        // 已有显式表情时，去掉动作自带表情词与冲突眨眼/困倦状态
         if (exprHasText) {
           if (/^(?:gentle smile|soft smile|smile)$/.test(clean)) {
             hasPoseExprGuard = true;
+            continue;
+          }
+          if (!/\bsleepy\b/i.test(exprRaw) && clean === 'sleepy relaxed posture') {
+            hasPoseExprGuard = true;
+            resolvedAdjustments.push('已按选定表情调和动作中的困倦状态词');
+            out.push('relaxed posture');
             continue;
           }
           if (exprClosedOrWideEyes && /^(?:winking at camera|wink|one eye closed)$/.test(clean)) {
@@ -680,7 +749,10 @@ function resolveAndBuildCharacterSegments(
             continue;
           }
         }
-        if (GAZE_AWAY_OR_DOWN_RE.test(exprRaw) && clean === 'looking at viewer') {
+        if (
+          GAZE_AWAY_OR_DOWN_RE.test(exprRaw) &&
+          /^(?:looking at viewer|looking back at viewer)$/.test(clean)
+        ) {
           hasPoseExprGuard = true;
           continue;
         }
@@ -719,15 +791,15 @@ function resolveAndBuildCharacterSegments(
     slot: WeightedSlot;
   }[] = [
     { key: 'styleAnchor', label: '画风', layer: 'shared', slot: shared.styleAnchor },
-    { key: 'background', label: '场景', layer: 'shared', slot: shared.background },
-    { key: 'composition', label: '构图', layer: 'shared', slot: shared.composition },
+    { key: 'appearance', label: '外貌', layer: 'character', slot: effectiveAppearanceSlot },
     ...(shared.bodyType && shared.bodyType.text.trim()
       ? [{ key: 'bodyType', label: '体型', layer: 'shared' as const, slot: shared.bodyType }]
       : []),
-    { key: 'appearance', label: '外貌', layer: 'character', slot: effectiveAppearanceSlot },
     { key: 'outfit', label: '服装', layer: 'character', slot: character.outfit },
     { key: 'pose', label: '动作', layer: 'character', slot: character.pose },
     { key: 'expression', label: '表情', layer: 'character', slot: character.expression },
+    { key: 'composition', label: '构图', layer: 'shared', slot: shared.composition },
+    { key: 'background', label: '场景', layer: 'shared', slot: shared.background },
   ];
 
   const globalSeenClean = new Set<string>();
@@ -765,7 +837,12 @@ function resolveAndBuildCharacterSegments(
   }
 
   const baseText = segments.map((s) => s.formatted).join(', ');
-  const soloAnchor = /\bsolo\b/i.test(baseText) ? '' : 'solo, 1girl, ';
+  const hasSolo = /\bsolo\b/i.test(baseText);
+  const has1Girl = /\b1girl\b/i.test(baseText);
+  const soloPrefix = [!hasSolo ? '(solo:1.25)' : '', !has1Girl ? '1girl' : '']
+    .filter(Boolean)
+    .join(', ');
+  const soloAnchor = soloPrefix ? `${soloPrefix}, ` : '';
   return {
     segments,
     fullText: soloAnchor + baseText,
@@ -908,24 +985,41 @@ export function buildNegativePromptWithMeta(
   const hasExplicitPlush = PLUSH_KEYWORD_RE.test(combinedPositive);
   const hasPajama = PAJAMA_KEYWORD_RE.test(combinedPositive);
 
-  const baseNegativePrompt = buildSharedNegativePrompt(shared).trim();
+  const rawBaseNegativePrompt = buildSharedNegativePrompt(shared).trim();
+  const filteredDollPlasticTags: string[] = [];
+  const filteredBaseParts: string[] = [];
   const existingCleanSet = new Set<string>();
-  if (baseNegativePrompt) {
-    for (const part of splitPromptTags(baseNegativePrompt)) {
+  if (rawBaseNegativePrompt) {
+    for (const part of splitPromptTags(rawBaseNegativePrompt)) {
       const clean = stripWeightSyntax(part).replace(/\s+/g, ' ').trim();
-      if (clean) existingCleanSet.add(clean);
+      if (!clean) continue;
+      if (isDollPlasticTextureTag(part)) {
+        if (!filteredDollPlasticTags.includes(clean)) {
+          filteredDollPlasticTags.push(clean);
+        }
+        continue;
+      }
+      filteredBaseParts.push(part);
+      existingCleanSet.add(clean);
     }
   }
+  const baseNegativePrompt = filteredBaseParts.join(', ');
 
   const appendedTags: string[] = [];
-  const seenAdded = new Set<string>();
+  const seenAddedClean = new Set<string>();
   const pushUnique = (tag: string) => {
-    const normalized = tag.trim().toLowerCase().replace(/\s+/g, ' ');
-    if (!normalized) return;
+    const cleanKey = stripWeightSyntax(tag).replace(/\s+/g, ' ').trim();
+    if (!cleanKey) return;
+    if (isDollPlasticTextureTag(tag)) {
+      if (!filteredDollPlasticTags.includes(cleanKey)) {
+        filteredDollPlasticTags.push(cleanKey);
+      }
+      return;
+    }
     const hasWeight = /\([^)]*:\s*[\d.]+\)/.test(tag);
-    if (seenAdded.has(normalized)) return;
-    if (!hasWeight && existingCleanSet.has(normalized)) return;
-    seenAdded.add(normalized);
+    if (seenAddedClean.has(cleanKey)) return;
+    if (!hasWeight && existingCleanSet.has(cleanKey)) return;
+    seenAddedClean.add(cleanKey);
     appendedTags.push(tag.trim());
   };
 
@@ -955,7 +1049,7 @@ export function buildNegativePromptWithMeta(
     rules.push({
       id: 'allow-plush-anti-dup',
       label: '已选玩偶 · 仅防同化',
-      detail: '已保留玩偶/毛绒玩具正向词，负向仅追加防重影/防分身同化词',
+      detail: '已保留玩偶/毛绒玩具正向词，负向仅追加防地面宠偶/分身同化词',
       tone: 'plush',
     });
   } else {
@@ -963,7 +1057,7 @@ export function buildNegativePromptWithMeta(
     rules.push({
       id: 'anti-plush',
       label: '未选玩偶 · 防玩偶/同化',
-      detail: '未选玩偶，自动向负向去重追加防凭空刷出玩偶及分身同化词',
+      detail: '未选玩偶，自动向负向去重追加防凭空刷出玩偶/地面小动物/魔宠摆件及分身同化词',
       tone: 'neutral',
     });
   }
@@ -1003,6 +1097,16 @@ export function buildNegativePromptWithMeta(
     });
   }
 
+  if (filteredDollPlasticTags.length > 0) {
+    triggeredRuleIds.push('anti-doll-plastic');
+    rules.push({
+      id: 'anti-doll-plastic',
+      label: '过滤塑料/人偶质感词',
+      detail: `已自动识别并移除类玩偶/塑料质感词（${filteredDollPlasticTags.join(', ')}），提升画面自然度`,
+      tone: 'guard',
+    });
+  }
+
   const suffix = appendedTags.join(', ');
   const negativePrompt = baseNegativePrompt
     ? suffix
@@ -1019,6 +1123,7 @@ export function buildNegativePromptWithMeta(
       hasBackgroundLock,
       hasPoseExprGuard,
       hasHandSleeveConflict,
+      filteredDollPlasticTags,
       resolvedAdjustments,
       appendedTags,
       triggeredRuleIds,
@@ -1140,7 +1245,10 @@ export function detectConflicts(
   // 2. 正向与负向冲突检测
   const seenCollisionKeys = new Set<string>();
   const sharedPositiveEntries = [
-    { source: '共享层', text: `${shared.styleAnchor.text}, ${shared.background.text}, ${shared.composition.text}` },
+    {
+      source: '共享层',
+      text: `${shared.styleAnchor.text}, ${shared.background.text}, ${shared.composition.text}, ${shared.bodyType?.text ?? ''}`,
+    },
     ...characters.map((c) => ({
       source: c.name,
       characterId: c.id,

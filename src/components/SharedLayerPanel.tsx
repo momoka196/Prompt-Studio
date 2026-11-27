@@ -784,25 +784,41 @@ export const SharedLayerPanel: React.FC<SharedLayerPanelProps> = ({
             onToggleExpand={() => toggleSlot('bodyType')}
             onTextChange={(text) => updatePositiveSlot('bodyType', { text })}
             onWeightChange={(weight) => updatePositiveSlot('bodyType', { weight })}
-            emptyHint="默认留空（防止与工作流自带体型双重堆叠）"
+            emptyHint="已留空（仅当外部工作流已内置体型时清空，避免双重堆叠）"
             placeholder="留空或填入共用体型串..."
             extraExpandedContent={
-              <div className="flex items-center justify-between gap-2 pt-1 text-[11px]">
+              <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-[11px]">
                 <span className="text-[#8E94A4]">
-                  铁律 3：如外部工作流已内置体型，请保持为空
+                  铁律 3：如外部工作流已内置体型，请清空本槽避免双重堆叠
                 </span>
-                <button
-                  type="button"
-                  onClick={() =>
-                    updatePositiveSlot('bodyType', {
-                      text: SHARED_BODY_TYPE_STRING,
-                      weight: 1.0,
-                    })
-                  }
-                  className="px-2.5 py-1 rounded-[10px] border border-[#EAEAEF] bg-white text-[#4C5264] hover:border-[#7C5CFC]/40 hover:text-[#7C5CFC] cursor-pointer whitespace-nowrap transition-colors"
-                >
-                  填入文档标准体型串
-                </button>
+                <div className="flex items-center gap-1.5">
+                  {(shared.bodyType?.text ?? '').trim() && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        updatePositiveSlot('bodyType', {
+                          text: '',
+                          weight: 1.0,
+                        })
+                      }
+                      className="px-2.5 py-1 rounded-[10px] border border-[#EAEAEF] bg-white text-[#8E94A4] hover:border-[#E85D75]/40 hover:text-[#E85D75] cursor-pointer whitespace-nowrap transition-colors"
+                    >
+                      清空
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() =>
+                      updatePositiveSlot('bodyType', {
+                        text: SHARED_BODY_TYPE_STRING,
+                        weight: 1.0,
+                      })
+                    }
+                    className="px-2.5 py-1 rounded-[10px] border border-[#EAEAEF] bg-white text-[#4C5264] hover:border-[#7C5CFC]/40 hover:text-[#7C5CFC] cursor-pointer whitespace-nowrap transition-colors"
+                  >
+                    填入文档标准体型串
+                  </button>
+                </div>
               </div>
             }
           />
