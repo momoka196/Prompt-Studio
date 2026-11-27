@@ -5,15 +5,17 @@ import {
   CheckCircle2,
   ChevronRight,
   Copy,
+  Dices,
   FileCode2,
   Loader2,
+  Lock,
   RefreshCw,
   Send,
   Settings,
   ShieldCheck,
   X,
 } from 'lucide-react';
-import { COMFY_ARCH_DEFAULTS } from '../data/presets';
+import { COMFY_ARCH_DEFAULTS, DEFAULT_COMFY_SEED } from '../data/presets';
 import {
   CharacterConfig,
   ComfyProfile,
@@ -37,6 +39,7 @@ export interface ComfySubmissionStatus {
   characterName?: string;
   promptId?: string;
   usedModelSummary?: string;
+  usedSeed?: number;
   message?: string;
   timestamp?: string;
 }
@@ -55,6 +58,7 @@ interface OutputSidebarProps {
   probingLoaders: boolean;
   onProbeLoaders: () => void;
   onOpenSettings: () => void;
+  onUpdateActiveProfile?: (updater: (prev: ComfyProfile) => ComfyProfile) => void;
 }
 
 function splitPillTags(text: string, max = 6): { pills: string[]; remaining: number } {
@@ -79,6 +83,7 @@ export const OutputSidebar: React.FC<OutputSidebarProps> = ({
   probingLoaders,
   onProbeLoaders,
   onOpenSettings,
+  onUpdateActiveProfile,
 }) => {
   const [posExpanded, setPosExpandedState] = useState<boolean>(
     () => loadUiCache().posExpanded
@@ -207,6 +212,7 @@ export const OutputSidebar: React.FC<OutputSidebarProps> = ({
         characterName: activeCharacter.name,
         promptId: res.promptId,
         usedModelSummary: res.usedModelSummary,
+        usedSeed: res.usedSeed,
         timestamp: now,
         message: '已进入本地 ComfyUI 生成队列',
       });
@@ -546,6 +552,93 @@ export const OutputSidebar: React.FC<OutputSidebarProps> = ({
           </span>
         </div>
 
+        {/* Seed 固定/随机控制条 */}
+        {onUpdateActiveProfile && (
+          <div className="flex items-center justify-between gap-1.5 rounded-[9px] border border-[#EAEAEF] bg-[#FAFAFC] px-2.5 py-1.5 text-[11px]">
+            <button
+              type="button"
+              onClick={() =>
+                onUpdateActiveProfile((prev) => ({
+                  ...prev,
+                  sampling: {
+                    ...prev.sampling,
+                    seedMode:
+                      (prev.sampling.seedMode ?? 'fixed') === 'fixed'
+                        ? 'random'
+                        : 'fixed',
+                    seed: prev.sampling.seed ?? DEFAULT_COMFY_SEED,
+                  },
+                }))
+              }
+              title="切换固定 Seed（出图一致）或每次随机 Seed"
+              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-[6px] font-medium border transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                (activeProfile.sampling.seedMode ?? 'fixed') === 'fixed'
+                  ? 'border-[#DDD8FA] bg-[#F4F2FF] text-[#6B48F5]'
+                  : 'border-[#E0E0E6] bg-white text-[#686E7E]'
+              }`}
+            >
+              {(activeProfile.sampling.seedMode ?? 'fixed') === 'fixed' ? (
+                <>
+                  <Lock className="w-3 h-3" />
+                  <span>固定 Seed</span>
+                </>
+              ) : (
+                <>
+                  <Dices className="w-3 h-3" />
+                  <span>每次随机</span>
+                </>
+              )}
+            </button>
+
+            {(activeProfile.sampling.seedMode ?? 'fixed') === 'fixed' ? (
+              <div className="flex items-center gap-1 min-w-0 flex-1 justify-end">
+                <input
+                  type="number"
+                  min={0}
+                  aria-label="固定 Seed 数值"
+                  value={activeProfile.sampling.seed ?? DEFAULT_COMFY_SEED}
+                  onChange={(e) => {
+                    const parsed = parseInt(e.target.value, 10);
+                    const nextSeed =
+                      Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+                    onUpdateActiveProfile((prev) => ({
+                      ...prev,
+                      sampling: {
+                        ...prev.sampling,
+                        seedMode: 'fixed',
+                        seed: nextSeed,
+                      },
+                    }));
+                  }}
+                  className="w-full max-w-[140px] h-6 px-2 rounded-[6px] border border-[#E0E0E6] bg-white text-[11px] font-mono tabular-nums text-[#1E2028] text-right focus:outline-none focus:border-[#7C5CFC]"
+                />
+                <button
+                  type="button"
+                  title="随机换一个固定 Seed"
+                  aria-label="随机换一个固定 Seed"
+                  onClick={() =>
+                    onUpdateActiveProfile((prev) => ({
+                      ...prev,
+                      sampling: {
+                        ...prev.sampling,
+                        seedMode: 'fixed',
+                        seed: Math.floor(Math.random() * 2147483647),
+                      },
+                    }))
+                  }
+                  className="h-6 px-1.5 inline-flex items-center justify-center rounded-[6px] border border-[#E0E0E6] bg-white text-[#686E7E] hover:border-[#7C5CFC]/50 hover:text-[#6B48F5] cursor-pointer shrink-0"
+                >
+                  <Dices className="w-3 h-3" />
+                </button>
+              </div>
+            ) : (
+              <span className="text-[10.5px] text-[#8E94A4] truncate">
+                发送时自动随机
+              </span>
+            )}
+          </div>
+        )}
+
         {comfyStatus.state !== 'idle' && (
           <div
             role="status"
@@ -597,6 +690,9 @@ export const OutputSidebar: React.FC<OutputSidebarProps> = ({
                       </div>
                       <div className="truncate text-emerald-700">
                         模型: {comfyStatus.usedModelSummary}
+                        {comfyStatus.usedSeed !== undefined
+                          ? ` · Seed: ${comfyStatus.usedSeed}`
+                          : ''}
                       </div>
                     </div>
                   ) : (

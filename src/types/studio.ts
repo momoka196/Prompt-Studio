@@ -71,6 +71,8 @@ export interface SharedConfig {
   manualNegativeOverride: string | null;
 }
 
+export type ComfySeedMode = 'fixed' | 'random';
+
 export interface ComfySamplerConfig {
   width: number;
   height: number;
@@ -80,6 +82,8 @@ export interface ComfySamplerConfig {
   scheduler: string;
   denoise: number;
   enableLoraChain: boolean;
+  seedMode?: ComfySeedMode;
+  seed?: number;
 }
 
 export type ComfyArchitecture = 'anima' | 'sdxl' | 'illustrious' | 'sd15' | 'custom';
@@ -114,6 +118,8 @@ export interface ComfySamplingParams {
   sampler: string;
   scheduler: string;
   denoise?: number;
+  seedMode?: ComfySeedMode;
+  seed?: number;
 }
 
 export interface ComfyProfile {
@@ -173,7 +179,8 @@ export type NegativeGuardRuleId =
   | 'anti-pajama-bed'
   | 'anti-bg-override'
   | 'anti-pose-expr-conflict'
-  | 'anti-doll-plastic';
+  | 'anti-doll-plastic'
+  | 'anti-sitting';
 
 export interface NegativeGuardRuleBadge {
   id: NegativeGuardRuleId;
@@ -217,3 +224,50 @@ export interface HistorySnapshot {
   label: string;
   config: StudioConfig;
 }
+
+export type WorkflowJsonFormat = 'api' | 'ui' | 'png-embedded' | 'unknown';
+
+export interface WorkflowPromptNodeCandidate {
+  nodeId: string;
+  nodeType: string;
+  title: string;
+  text: string;
+  roleHint: 'positive' | 'negative' | 'unknown';
+  source: 'api' | 'ui' | 'evaluated';
+  linkedFromNodeId?: string;
+}
+
+export interface WorkflowPromptTagItem {
+  id: string;
+  text: string;
+  weight: number;
+  enabled: boolean;
+}
+
+export interface WorkflowCollectionCard {
+  id: string;
+  title: string;
+  tags: string[];
+  thumbnailDataUrl: string;
+  imageName: string;
+  workflowFileName: string;
+  workflowFormat: WorkflowJsonFormat;
+  rawWorkflowJson: string;
+  apiPromptJson?: string;
+  extractedPositive: string;
+  extractedNegative: string;
+  fineTunedPositive: string;
+  fineTunedNegative: string;
+  positiveNodeId: string | null;
+  negativeNodeId: string | null;
+  nodeCandidates: WorkflowPromptNodeCandidate[];
+  applyFineTuneOnSend: boolean;
+  isPrivate?: boolean;
+  seedMode?: 'workflow' | 'fixed' | 'random';
+  fixedSeed?: number;
+  lastRunAt?: number;
+  lastPromptId?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+

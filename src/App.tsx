@@ -6,6 +6,7 @@ import {
   Copy,
   Download,
   Info,
+  Layers,
   Settings,
   ShieldCheck,
   Wrench,
@@ -15,6 +16,7 @@ import {
   COMFY_ARCH_DEFAULTS,
   DEFAULT_ANIMA_LORAS,
   DEFAULT_COMFY_PROFILES,
+  DEFAULT_COMFY_SEED,
   DEFAULT_STUDIO_CONFIG,
   SHARED_BODY_TYPE_STRING,
 } from './data/presets';
@@ -28,6 +30,7 @@ import {
   HistorySnapshot,
   SharedConfig,
   StudioConfig,
+  WorkflowCollectionCard,
 } from './types/studio';
 import {
   buildCopyAllOutput,
@@ -48,10 +51,14 @@ import { CharacterEditorPanel } from './components/CharacterEditorPanel';
 import { SharedLayerPanel } from './components/SharedLayerPanel';
 import { OutputSidebar } from './components/OutputSidebar';
 import { SettingsModal } from './components/SettingsModal';
+import { WorkflowCollectionModal } from './components/WorkflowCollectionModal';
 import {
   loadUiCache,
+  loadWorkflowCards,
+  normalizeWorkflowCards,
   patchUiCache,
   saveConfigSafely,
+  saveWorkflowCardsSafely,
   STUDIO_CONFIG_KEY,
   STUDIO_HISTORY_KEY,
 } from './utils/storageCache';
@@ -137,6 +144,13 @@ function normalizeProfile(raw: Partial<ComfyProfile>, fallbackIndex = 0): ComfyP
     sampling: {
       ...preset.defaultSampling,
       ...(raw.sampling ?? {}),
+      seedMode: raw.sampling?.seedMode === 'random' ? 'random' : 'fixed',
+      seed:
+        typeof raw.sampling?.seed === 'number' &&
+        Number.isFinite(raw.sampling.seed) &&
+        raw.sampling.seed >= 0
+          ? Math.floor(raw.sampling.seed)
+          : preset.defaultSampling.seed ?? DEFAULT_COMFY_SEED,
     },
     manualSamplingFields: Array.isArray(raw.manualSamplingFields)
       ? raw.manualSamplingFields
@@ -178,6 +192,8 @@ function normalizeStudioConfig(raw: Partial<StudioConfig>): StudioConfig {
           sampler: legacySampler.samplerName,
           scheduler: legacySampler.scheduler,
           denoise: legacySampler.denoise,
+          seedMode: legacySampler.seedMode ?? 'fixed',
+          seed: legacySampler.seed ?? DEFAULT_COMFY_SEED,
         },
       },
     ];
@@ -356,11 +372,26 @@ export default function App() {
   const [copiedSnippet, setCopiedSnippet] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [workbenchOpen, setWorkbenchOpen] = useState(false);
+  const [workflowCards, setWorkflowCards] = useState<WorkflowCollectionCard[]>(() =>
+    loadWorkflowCards()
+  );
   const [conflictsExpanded, setConflictsExpanded] = useState(false);
   const [guardHelpOpen, setGuardHelpOpen] = useState(false);
   const [validation, setValidation] = useState<ComfyValidationMap>(EMPTY_VALIDATION);
   const [probingLoaders, setProbingLoaders] = useState(false);
   const lastAutoSnapshotRef = useRef<string>(JSON.stringify(config));
+
+  const handleChangeWorkflowCards = useCallback(
+    (next: WorkflowCollectionCard[]): { ok: boolean; error?: string } => {
+      const saveRes = saveWorkflowCardsSafely(next);
+      if (saveRes.ok) {
+        setWorkflowCards(next);
+      }
+      return saveRes;
+    },
+    []
+  );
 
   const comfyProfiles = useMemo(
     () =>
@@ -752,7 +783,12 @@ export default function App() {
   };
 
   const handleExportConfig = () => {
-    const blob = new Blob([JSON.stringify(config, null, 2)], {
+    const publicWorkflowCards = workflowCards.filter((c) => !c.isPrivate);
+    const exportPayload =
+      publicWorkflowCards.length > 0
+        ? { ...config, workflowCards: publicWorkflowCards }
+        : config;
+    const blob = new Blob([JSON.stringify(exportPayload, null, 2)], {
       type: 'application/json;charset=utf-8',
     });
     const url = URL.createObjectURL(blob);
@@ -770,7 +806,9 @@ export default function App() {
     const reader = new FileReader();
     reader.onload = () => {
       try {
-        const parsed = JSON.parse(String(reader.result)) as StudioConfig;
+        const parsed = JSON.parse(String(reader.result)) as StudioConfig & {
+          workflowCards?: unknown;
+        };
         if (
           !parsed ||
           !parsed.shared ||
@@ -782,6 +820,14 @@ export default function App() {
         }
         pushHistory('导入配置前', config);
         const normalized = normalizeStudioConfig(parsed);
+        if (Array.isArray(parsed.workflowCards)) {
+          const importedCards = normalizeWorkflowCards(parsed.workflowCards);
+          const importedIds = new Set(importedCards.map((c) => c.id));
+          const preservedPrivate = workflowCards.filter(
+            (c) => Boolean(c.isPrivate) && !importedIds.has(c.id)
+          );
+          handleChangeWorkflowCards([...importedCards, ...preservedPrivate]);
+        }
         patchUiCache({
           selectedPresetByChar: {},
           selectedBackgroundId: normalized.shared.selectedBackgroundId ?? null,
@@ -941,6 +987,21 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2.5 shrink-0">
+            <button
+              type="button"
+              onClick={() => setWorkbenchOpen(true)}
+              title="打开参考图 + 工作流 JSON 收藏与微调工作台（与角色/预设快填完全隔离）"
+              className="h-8 px-3 inline-flex items-center gap-1.5 text-[12px] font-medium rounded-[10px] border border-[#DDD8FA] bg-[#F4F2FF] text-[#6B48F5] hover:bg-[#EBE6FF] transition-colors whitespace-nowrap cursor-pointer"
+            >
+              <Layers className="w-3.5 h-3.5" />
+              <span>收藏工作台</span>
+              {workflowCards.some((c) => !c.isPrivate) && (
+                <span className="text-[11px] font-mono tabular-nums opacity-85">
+                  ({workflowCards.filter((c) => !c.isPrivate).length})
+                </span>
+              )}
+            </button>
+
             <label
               title="关闭后适合粘到已内置角色外貌的工作流"
               className="h-8 px-3 inline-flex items-center gap-1.5 rounded-[10px] border border-[#E0E0E6] bg-white text-[12px] font-medium text-[#4C5264] hover:border-[#7C5CFC]/40 hover:text-[#1E2028] cursor-pointer select-none transition-colors whitespace-nowrap"
@@ -1131,6 +1192,7 @@ export default function App() {
               probingLoaders={probingLoaders}
               onProbeLoaders={() => void probeComfyLoaders()}
               onOpenSettings={() => setSettingsOpen(true)}
+              onUpdateActiveProfile={handleUpdateActiveProfile}
             />
           )}
         </div>
@@ -1259,6 +1321,20 @@ export default function App() {
         history={history}
         onSaveSnapshot={() => pushHistory('手动保存快照', config)}
         onRollbackHistory={handleRollbackHistory}
+      />
+
+      <WorkflowCollectionModal
+        open={workbenchOpen}
+        onClose={() => setWorkbenchOpen(false)}
+        cards={workflowCards}
+        onChangeCards={handleChangeWorkflowCards}
+        comfyUrl={config.comfyUrl}
+        activeProfile={activeProfile}
+        activeCharacterName={activeCharacter?.name ?? '角色'}
+        onOpenSettings={() => {
+          setWorkbenchOpen(false);
+          setSettingsOpen(true);
+        }}
       />
     </div>
   );

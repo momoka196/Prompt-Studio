@@ -24,6 +24,7 @@ import {
   getCharacterHairstyleOptions,
   getPromptStats,
   inferYiHairstyleFromAppearance,
+  isExplicitStandingPoseText,
   normalizeSlotTagsText,
   splitPromptTags,
 } from '../utils/promptBuilder';
@@ -442,9 +443,13 @@ export const CharacterEditorPanel: React.FC<CharacterEditorPanelProps> = ({
     }
     const category: QuickFillCategory = preset.category;
     const currentWeight = character[category].weight;
+    const isStandingPosePreset =
+      category === 'pose' && isExplicitStandingPoseText(preset.tags);
     const nextWeight =
       preset.defaultWeight === 1.0
         ? 1.0
+        : isStandingPosePreset
+        ? Math.max(currentWeight, preset.defaultWeight)
         : Math.abs(currentWeight - 1.0) < 0.001
         ? preset.defaultWeight
         : currentWeight;

@@ -4,8 +4,10 @@ import {
   ArrowDown,
   ArrowUp,
   Check,
+  Dices,
   Download,
   History,
+  Lock,
   Pencil,
   Plus,
   RefreshCw,
@@ -14,7 +16,7 @@ import {
   Upload,
   X,
 } from 'lucide-react';
-import { COMFY_ARCH_DEFAULTS } from '../data/presets';
+import { COMFY_ARCH_DEFAULTS, DEFAULT_COMFY_SEED } from '../data/presets';
 import {
   ComfyArchitecture,
   ComfyLoaderKey,
@@ -130,6 +132,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         denoise: manual.has('denoise')
           ? prev.sampling.denoise ?? 1.0
           : preset.defaultSampling.denoise ?? 1.0,
+        seedMode: manual.has('seedMode')
+          ? prev.sampling.seedMode ?? 'fixed'
+          : preset.defaultSampling.seedMode ?? 'fixed',
+        seed: manual.has('seed')
+          ? prev.sampling.seed ?? DEFAULT_COMFY_SEED
+          : preset.defaultSampling.seed ?? DEFAULT_COMFY_SEED,
       };
       return {
         ...prev,
@@ -882,6 +890,78 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       className="w-full rounded-[8px] border border-[#E2E3EA] bg-[#FAFAFC] px-2 py-1 text-[12px] font-mono text-[#1E2028] focus:bg-white focus:border-[#7C5CFC] focus:outline-none"
                     />
                   </div>
+                </div>
+
+                {/* Seed 固定 / 随机设置 */}
+                <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-[10px] border border-[#E2E3EA] bg-[#FAFAFC] px-3 py-2">
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11.5px] font-medium text-[#4C5264]">
+                      Seed 策略
+                    </span>
+                    <div className="inline-flex rounded-[8px] border border-[#E2E3EA] bg-white p-0.5">
+                      <button
+                        type="button"
+                        onClick={() => handleSamplingFieldChange('seedMode', 'fixed')}
+                        className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-[6px] text-[11px] font-medium transition-colors cursor-pointer ${
+                          (activeProfile.sampling.seedMode ?? 'fixed') === 'fixed'
+                            ? 'bg-[#7C5CFC] text-white'
+                            : 'text-[#686E7E] hover:text-[#1E2028]'
+                        }`}
+                      >
+                        <Lock className="w-3 h-3" />
+                        <span>固定 Seed</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleSamplingFieldChange('seedMode', 'random')}
+                        className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-[6px] text-[11px] font-medium transition-colors cursor-pointer ${
+                          (activeProfile.sampling.seedMode ?? 'fixed') === 'random'
+                            ? 'bg-[#7C5CFC] text-white'
+                            : 'text-[#686E7E] hover:text-[#1E2028]'
+                        }`}
+                      >
+                        <Dices className="w-3 h-3" />
+                        <span>每次随机</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {(activeProfile.sampling.seedMode ?? 'fixed') === 'fixed' ? (
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-[11px] text-[#686E7E]">固定值</span>
+                      <input
+                        type="number"
+                        min={0}
+                        value={activeProfile.sampling.seed ?? DEFAULT_COMFY_SEED}
+                        onChange={(e) => {
+                          const val = parseInt(e.target.value, 10);
+                          handleSamplingFieldChange(
+                            'seed',
+                            Number.isFinite(val) && val >= 0 ? val : 0
+                          );
+                        }}
+                        className="w-[165px] rounded-[8px] border border-[#E2E3EA] bg-white px-2.5 py-1 text-[12px] font-mono tabular-nums text-[#1E2028] focus:border-[#7C5CFC] focus:outline-none"
+                      />
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handleSamplingFieldChange(
+                            'seed',
+                            Math.floor(Math.random() * 2147483647)
+                          )
+                        }
+                        title="随机生成一个新固定 Seed"
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-[8px] border border-[#E2E3EA] bg-white text-[11px] font-medium text-[#4C5264] hover:border-[#7C5CFC]/50 hover:text-[#6B48F5] cursor-pointer"
+                      >
+                        <Dices className="w-3.5 h-3.5" />
+                        <span>换一个</span>
+                      </button>
+                    </div>
+                  ) : (
+                    <span className="text-[11px] text-[#8E94A4]">
+                      每次发送到 ComfyUI 时自动生成随机整数 Seed
+                    </span>
+                  )}
                 </div>
               </div>
             </>

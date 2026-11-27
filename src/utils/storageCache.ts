@@ -1,8 +1,13 @@
-import { QuickFillCategory, StudioConfig } from '../types/studio';
+import {
+  QuickFillCategory,
+  StudioConfig,
+  WorkflowCollectionCard,
+} from '../types/studio';
 
 export const STUDIO_CONFIG_KEY = 'chibiprompt_studio_config_v3';
 export const STUDIO_HISTORY_KEY = 'chibiprompt_studio_history_v3';
 export const STUDIO_UI_CACHE_KEY = 'chibiprompt_studio_ui_cache_v1';
+export const STUDIO_WORKFLOW_CARDS_KEY = 'chibiprompt_studio_workflow_cards_v1';
 
 export type EditorSlotKey = 'appearance' | 'outfit' | 'pose' | 'expression';
 export type RolePresetTab = 'slots' | 'hairstyle';
@@ -170,3 +175,112 @@ export function saveConfigSafely(config: StudioConfig): void {
     }
   }
 }
+
+export function normalizeWorkflowCards(raw: unknown): WorkflowCollectionCard[] {
+  if (!Array.isArray(raw)) return [];
+  const cards: WorkflowCollectionCard[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const rec = item as Partial<WorkflowCollectionCard>;
+    if (!rec.id || typeof rec.id !== 'string') continue;
+    const now = Date.now();
+    cards.push({
+      id: rec.id,
+      title:
+        typeof rec.title === 'string' && rec.title.trim()
+          ? rec.title.trim()
+          : '未命名工作流卡片',
+      tags: Array.isArray(rec.tags)
+        ? rec.tags
+            .filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
+            .map((t) => t.trim())
+        : [],
+      thumbnailDataUrl:
+        typeof rec.thumbnailDataUrl === 'string' ? rec.thumbnailDataUrl : '',
+      imageName: typeof rec.imageName === 'string' ? rec.imageName : '',
+      workflowFileName:
+        typeof rec.workflowFileName === 'string' ? rec.workflowFileName : 'workflow.json',
+      workflowFormat:
+        rec.workflowFormat === 'api' ||
+        rec.workflowFormat === 'ui' ||
+        rec.workflowFormat === 'png-embedded'
+          ? rec.workflowFormat
+          : 'unknown',
+      rawWorkflowJson:
+        typeof rec.rawWorkflowJson === 'string' ? rec.rawWorkflowJson : '{}',
+      apiPromptJson:
+        typeof rec.apiPromptJson === 'string' ? rec.apiPromptJson : undefined,
+      extractedPositive:
+        typeof rec.extractedPositive === 'string' ? rec.extractedPositive : '',
+      extractedNegative:
+        typeof rec.extractedNegative === 'string' ? rec.extractedNegative : '',
+      fineTunedPositive:
+        typeof rec.fineTunedPositive === 'string'
+          ? rec.fineTunedPositive
+          : typeof rec.extractedPositive === 'string'
+          ? rec.extractedPositive
+          : '',
+      fineTunedNegative:
+        typeof rec.fineTunedNegative === 'string'
+          ? rec.fineTunedNegative
+          : typeof rec.extractedNegative === 'string'
+          ? rec.extractedNegative
+          : '',
+      positiveNodeId:
+        typeof rec.positiveNodeId === 'string' ? rec.positiveNodeId : null,
+      negativeNodeId:
+        typeof rec.negativeNodeId === 'string' ? rec.negativeNodeId : null,
+      nodeCandidates: Array.isArray(rec.nodeCandidates)
+        ? rec.nodeCandidates.filter(
+            (n): n is NonNullable<WorkflowCollectionCard['nodeCandidates']>[number] =>
+              Boolean(n && typeof n === 'object' && typeof n.nodeId === 'string')
+          )
+        : [],
+      applyFineTuneOnSend:
+        typeof rec.applyFineTuneOnSend === 'boolean' ? rec.applyFineTuneOnSend : true,
+      isPrivate: Boolean(rec.isPrivate),
+      seedMode:
+        rec.seedMode === 'fixed' || rec.seedMode === 'random' || rec.seedMode === 'workflow'
+          ? rec.seedMode
+          : 'workflow',
+      fixedSeed:
+        typeof rec.fixedSeed === 'number' && Number.isFinite(rec.fixedSeed) && rec.fixedSeed >= 0
+          ? Math.floor(rec.fixedSeed)
+          : undefined,
+      lastRunAt: typeof rec.lastRunAt === 'number' ? rec.lastRunAt : undefined,
+      lastPromptId:
+        typeof rec.lastPromptId === 'string' ? rec.lastPromptId : undefined,
+      createdAt: typeof rec.createdAt === 'number' ? rec.createdAt : now,
+      updatedAt: typeof rec.updatedAt === 'number' ? rec.updatedAt : now,
+    });
+  }
+  return cards;
+}
+
+export function loadWorkflowCards(): WorkflowCollectionCard[] {
+  try {
+    const raw = localStorage.getItem(STUDIO_WORKFLOW_CARDS_KEY);
+    if (!raw) return [];
+    return normalizeWorkflowCards(JSON.parse(raw));
+  } catch {
+    return [];
+  }
+}
+
+export function saveWorkflowCardsSafely(cards: WorkflowCollectionCard[]): {
+  ok: boolean;
+  error?: string;
+} {
+  try {
+    const payload = JSON.stringify(cards);
+    localStorage.setItem(STUDIO_WORKFLOW_CARDS_KEY, payload);
+    return { ok: true };
+  } catch {
+    return {
+      ok: false,
+      error:
+        '本地存储空间已满（QuotaExceeded），本次收藏卡片未能写入缓存。请先导出备份并清理部分旧卡片。',
+    };
+  }
+}
+

@@ -2,6 +2,7 @@ import {
   ANIMA_LORA_CHAIN,
   CHARACTER_FORBIDDEN_FEATURES,
   COMFY_ARCH_DEFAULTS,
+  DEFAULT_COMFY_SEED,
   EXPRESSION_PRESETS,
   HAIR_ACCESSORY_PRESETS,
   HAIR_BANGS_PRESETS,
@@ -250,6 +251,42 @@ const EXPR_BLUSH_RE = /\b(?:blush|blushing|rosy cheeks)\b/i;
 
 const GAZE_AWAY_OR_DOWN_RE =
   /\b(?:looking down at pages|averted gaze|turning head back|looking back at viewer|looking away|looking aside|upturned pleading gaze|dreamy gaze|curious gaze|shy|closed eyes|eyes closed|closed-eye|blank stare)\b/i;
+
+const EXPLICIT_STANDING_TAG_RE =
+  /\b(?:standing(?:\s+(?:firmly|upright|straight|naturally|casually|on\s+tiptoes|on\s+one\s+leg|firmly\s+on\s+(?:one\s+leg|ground)|pose|still|tall|relaxed))?|stand\s+upright|upright\s+posture|feet\s+planted(?:\s+on\s+ground)?|both\s+feet\s+(?:planted\s+)?on\s+(?:the\s+)?ground)\b/i;
+
+const STRONG_STANDING_ANCHOR_RE =
+  /\b(?:standing\s+(?:firmly|upright|straight)|stand\s+upright|upright\s+posture|feet\s+planted\s+on\s+ground|both\s+feet\s+(?:planted\s+)?on\s+(?:the\s+)?ground)\b/i;
+
+const SITTING_OR_CROUCHING_TAG_RE =
+  /\b(?:sitting|seated|sit|kneeling|seiza|squatting|crouching|lying|wariza)\b/i;
+
+const ANTI_SITTING_GUARD_TAGS = [
+  '(sitting:1.7)',
+  '(seated:1.65)',
+  'sitting on chair',
+  'sitting on desk',
+  'sitting on floor',
+];
+
+export function isExplicitStandingPoseText(poseText: string): boolean {
+  const trimmed = poseText.trim();
+  if (!trimmed) return false;
+  return EXPLICIT_STANDING_TAG_RE.test(trimmed) && !SITTING_OR_CROUCHING_TAG_RE.test(trimmed);
+}
+
+export function computeEffectiveSlotWeight(
+  slotKey: string,
+  rawText: string,
+  configuredWeight: number
+): number {
+  const base = clampWeight(configuredWeight);
+  if (slotKey === 'pose' && isExplicitStandingPoseText(rawText)) {
+    const floor = STRONG_STANDING_ANCHOR_RE.test(rawText) ? 1.6 : 1.55;
+    return clampWeight(Math.max(floor, base + 0.15));
+  }
+  return base;
+}
 
 const LEGACY_INITIAL_APPEARANCE_EXPR_TOKENS = new Set<string>([
   'gentle smile',
@@ -781,8 +818,31 @@ function resolveAndBuildCharacterSegments(
       slotSeen.add(clean);
       slotDeduped.push(t);
     }
+
+    if (key === 'pose' && isExplicitStandingPoseText(slotDeduped.join(', '))) {
+      const standingTokens: string[] = [];
+      const detailTokens: string[] = [];
+      for (const tok of slotDeduped) {
+        const cleanTok = stripWeightSyntax(tok).replace(/\s+/g, ' ').trim();
+        if (EXPLICIT_STANDING_TAG_RE.test(cleanTok)) {
+          standingTokens.push(tok);
+        } else {
+          detailTokens.push(tok);
+        }
+      }
+      const hasStrongAnchor = standingTokens.some((tok) =>
+        STRONG_STANDING_ANCHOR_RE.test(stripWeightSyntax(tok))
+      );
+      if (!hasStrongAnchor && !/\bstanding on (?:tiptoes|one leg)\b/i.test(standingTokens.join(', '))) {
+        standingTokens.unshift('standing upright');
+      }
+      return [...standingTokens, ...detailTokens].join(', ');
+    }
+
     return slotDeduped.join(', ');
   };
+
+  const isStandingPosePriority = isExplicitStandingPoseText(poseRaw);
 
   const candidates: {
     key: string;
@@ -795,8 +855,15 @@ function resolveAndBuildCharacterSegments(
     ...(shared.bodyType && shared.bodyType.text.trim()
       ? [{ key: 'bodyType', label: '体型', layer: 'shared' as const, slot: shared.bodyType }]
       : []),
-    { key: 'outfit', label: '服装', layer: 'character', slot: character.outfit },
-    { key: 'pose', label: '动作', layer: 'character', slot: character.pose },
+    ...(isStandingPosePriority
+      ? [
+          { key: 'pose', label: '动作', layer: 'character' as const, slot: character.pose },
+          { key: 'outfit', label: '服装', layer: 'character' as const, slot: character.outfit },
+        ]
+      : [
+          { key: 'outfit', label: '服装', layer: 'character' as const, slot: character.outfit },
+          { key: 'pose', label: '动作', layer: 'character' as const, slot: character.pose },
+        ]),
     { key: 'expression', label: '表情', layer: 'character', slot: character.expression },
     { key: 'composition', label: '构图', layer: 'shared', slot: shared.composition },
     { key: 'background', label: '场景', layer: 'shared', slot: shared.background },
@@ -825,13 +892,18 @@ function resolveAndBuildCharacterSegments(
     const finalRaw = crossDeduped.join(', ');
     if (!finalRaw) continue;
 
-    const formatted = formatWeightedText(finalRaw, item.slot.weight);
+    const effectiveWeight = computeEffectiveSlotWeight(
+      item.key,
+      finalRaw,
+      item.slot.weight
+    );
+    const formatted = formatWeightedText(finalRaw, effectiveWeight);
     segments.push({
       key: item.key,
       label: item.label,
       layer: item.layer,
       rawText: finalRaw,
-      weight: clampWeight(item.slot.weight),
+      weight: effectiveWeight,
       formatted,
     });
   }
@@ -984,6 +1056,9 @@ export function buildNegativePromptWithMeta(
   const combinedPositive = positiveTexts.filter(Boolean).join(' , ');
   const hasExplicitPlush = PLUSH_KEYWORD_RE.test(combinedPositive);
   const hasPajama = PAJAMA_KEYWORD_RE.test(combinedPositive);
+  const hasExplicitStandingPose =
+    charList.some((c) => isExplicitStandingPoseText(c.pose.text)) &&
+    !SITTING_OR_CROUCHING_TAG_RE.test(combinedPositive);
 
   const rawBaseNegativePrompt = buildSharedNegativePrompt(shared).trim();
   const filteredDollPlasticTags: string[] = [];
@@ -1041,6 +1116,10 @@ export function buildNegativePromptWithMeta(
     HAND_SAFETY_GUARD_TAGS.forEach(pushUnique);
   }
 
+  if (hasExplicitStandingPose) {
+    ANTI_SITTING_GUARD_TAGS.forEach(pushUnique);
+  }
+
   const rules: NegativeGuardRuleBadge[] = [];
   const triggeredRuleIds: NegativeGuardRuleId[] = [];
 
@@ -1093,6 +1172,16 @@ export function buildNegativePromptWithMeta(
         resolvedAdjustments.length > 0
           ? resolvedAdjustments.join('；')
           : '已自动调和服装、动作与表情间的冲突词条并完成去重',
+      tone: 'guard',
+    });
+  }
+
+  if (hasExplicitStandingPose) {
+    triggeredRuleIds.push('anti-sitting');
+    rules.push({
+      id: 'anti-sitting',
+      label: '站姿优先 · 防坐姿偏差',
+      detail: '已提升站姿槽位在提示词拼接中的顺位与权重，并在负向抑制坐姿/靠椅坐姿偏差',
       tone: 'guard',
     });
   }
@@ -1627,6 +1716,7 @@ export function buildComfyWorkflowFromProfile(params: {
   workflow: Record<string, WorkflowNode>;
   usedModelSummary: string;
   activeLorasCount: number;
+  usedSeed: number;
 } {
   const { profile } = params;
   const activeKeys = getActiveLoaderKeys(profile);
@@ -1734,7 +1824,17 @@ export function buildComfyWorkflowFromProfile(params: {
   });
 
   const sampling = profile.sampling;
-  const seed = Math.floor(Math.random() * 2147483647);
+  const seedMode = sampling.seedMode ?? 'fixed';
+  const configuredSeed =
+    typeof sampling.seed === 'number' &&
+    Number.isFinite(sampling.seed) &&
+    sampling.seed >= 0
+      ? Math.floor(sampling.seed)
+      : DEFAULT_COMFY_SEED;
+  const seed =
+    seedMode === 'random'
+      ? Math.floor(Math.random() * 2147483647)
+      : configuredSeed;
 
   workflow['10'] = {
     class_type: 'CLIPTextEncode',
@@ -1792,6 +1892,7 @@ export function buildComfyWorkflowFromProfile(params: {
     workflow,
     usedModelSummary: modelLabels.join(' + ') || 'Checkpoint',
     activeLorasCount: activeLoras.length,
+    usedSeed: seed,
   };
 }
 
@@ -1806,13 +1907,14 @@ export async function postProfileToComfyUI(params: {
   promptId: string;
   usedModelSummary: string;
   activeLorasCount: number;
+  usedSeed: number;
 }> {
   const baseUrl = params.comfyUrl.trim().replace(/\/+$/, '');
   if (!baseUrl) {
     throw new Error('请先填写 ComfyUI 服务地址（默认 http://127.0.0.1:8188）');
   }
 
-  const { workflow, usedModelSummary, activeLorasCount } =
+  const { workflow, usedModelSummary, activeLorasCount, usedSeed } =
     buildComfyWorkflowFromProfile({
       profile: params.profile,
       characterName: params.characterName,
@@ -1877,6 +1979,7 @@ export async function postProfileToComfyUI(params: {
     promptId: data.prompt_id ?? 'submitted',
     usedModelSummary,
     activeLorasCount,
+    usedSeed,
   };
 }
 
@@ -1905,6 +2008,8 @@ export function exportComfyProfilePayload(profile: ComfyProfile): {
       sampler: profile.sampling.sampler,
       scheduler: profile.sampling.scheduler,
       denoise: profile.sampling.denoise ?? 1.0,
+      seedMode: profile.sampling.seedMode ?? 'fixed',
+      seed: profile.sampling.seed ?? DEFAULT_COMFY_SEED,
     },
   };
 }
@@ -2010,6 +2115,13 @@ export function parseComfyProfileImport(raw: unknown): ComfyProfile {
         typeof rawSampling.denoise === 'number' && Number.isFinite(rawSampling.denoise)
           ? rawSampling.denoise
           : archPreset.defaultSampling.denoise ?? 1.0,
+      seedMode: rawSampling.seedMode === 'random' ? 'random' : 'fixed',
+      seed:
+        typeof rawSampling.seed === 'number' &&
+        Number.isFinite(rawSampling.seed) &&
+        rawSampling.seed >= 0
+          ? Math.floor(rawSampling.seed)
+          : archPreset.defaultSampling.seed ?? DEFAULT_COMFY_SEED,
     },
     manualSamplingFields: [],
   };
@@ -2073,6 +2185,8 @@ export async function postCharacterToComfyUI(params: {
       sampler: sampler.samplerName,
       scheduler: sampler.scheduler,
       denoise: sampler.denoise,
+      seedMode: sampler.seedMode ?? 'fixed',
+      seed: sampler.seed ?? DEFAULT_COMFY_SEED,
     },
   };
 
