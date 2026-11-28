@@ -1,6 +1,7 @@
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
+  AlertTriangle,
   Check,
   CheckCircle2,
   CheckSquare,
@@ -35,6 +36,7 @@ import {
   Trash2,
   Upload,
   UserCheck,
+  Wrench,
   X,
   ZoomIn,
 } from 'lucide-react';
@@ -46,6 +48,7 @@ import {
   ComfyLoraItem,
   ComfyProfile,
   ComfySamplingParams,
+  ConflictItem,
   ExtractedCardGenerationParams,
   ExtractedCardLoraItem,
   MinimalBackgroundPreset,
@@ -60,6 +63,7 @@ import {
   buildCharacterPrompt,
   buildNegativePromptWithMeta,
   clampLoraWeight,
+  detectConflicts,
   fetchComfyNodeOptions,
   getCharacterHairstyleOptions,
   isLoraActiveForCharacter,
@@ -71,6 +75,7 @@ import {
   sanitizeFilenamePrefix,
   splitPromptTags,
   stripForbiddenAntiTextureFullText,
+  stripTagFromSlotText,
 } from '../utils/promptBuilder';
 import {
   buildCardExportPayloadAsync,
@@ -505,6 +510,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   const [applyStrippedIdentityTags, setApplyStrippedIdentityTags] = useState<string[]>([]);
   const [applyStrippedNegativeTags, setApplyStrippedNegativeTags] = useState<string[]>([]);
   const [applySwitchAndClose, setApplySwitchAndClose] = useState<boolean>(true);
+  const [applyCreateNewChar, setApplyCreateNewChar] = useState<boolean>(true);
   const [applyPersistToChar, setApplyPersistToChar] = useState<boolean>(false);
   const [applyPreviewOpen, setApplyPreviewOpen] = useState<boolean>(false);
   const [showSaveBgPreset, setShowSaveBgPreset] = useState<boolean>(false);
@@ -1082,36 +1088,51 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
     const effectiveChar: CharacterConfig = {
       ...applyTargetCharacter,
-      outfit: {
-        ...applyTargetCharacter.outfit,
-        text: hasOutfit
-          ? mergePromptSlotTexts(
-              applyTargetCharacter.outfit.text,
-              cleanPosSlot(applyOutfitText),
-              applyOutfitMode
-            )
-          : applyTargetCharacter.outfit.text,
-      },
-      pose: {
-        ...applyTargetCharacter.pose,
-        text: hasPose
-          ? mergePromptSlotTexts(
-              applyTargetCharacter.pose.text,
-              cleanPosSlot(applyPoseText),
-              applyPoseMode
-            )
-          : applyTargetCharacter.pose.text,
-      },
-      expression: {
-        ...applyTargetCharacter.expression,
-        text: hasExpr
-          ? mergePromptSlotTexts(
-              applyTargetCharacter.expression.text,
-              cleanPosSlot(applyExpressionText),
-              applyExpressionMode
-            )
-          : applyTargetCharacter.expression.text,
-      },
+      outfit: applyCreateNewChar
+        ? {
+            text: hasOutfit ? cleanPosSlot(applyOutfitText) : '',
+            weight: 1.0,
+          }
+        : {
+            ...applyTargetCharacter.outfit,
+            text: hasOutfit
+              ? mergePromptSlotTexts(
+                  applyTargetCharacter.outfit.text,
+                  cleanPosSlot(applyOutfitText),
+                  applyOutfitMode
+                )
+              : applyTargetCharacter.outfit.text,
+          },
+      pose: applyCreateNewChar
+        ? {
+            text: hasPose ? cleanPosSlot(applyPoseText) : '',
+            weight: 1.0,
+          }
+        : {
+            ...applyTargetCharacter.pose,
+            text: hasPose
+              ? mergePromptSlotTexts(
+                  applyTargetCharacter.pose.text,
+                  cleanPosSlot(applyPoseText),
+                  applyPoseMode
+                )
+              : applyTargetCharacter.pose.text,
+          },
+      expression: applyCreateNewChar
+        ? {
+            text: hasExpr ? cleanPosSlot(applyExpressionText) : '',
+            weight: 1.0,
+          }
+        : {
+            ...applyTargetCharacter.expression,
+            text: hasExpr
+              ? mergePromptSlotTexts(
+                  applyTargetCharacter.expression.text,
+                  cleanPosSlot(applyExpressionText),
+                  applyExpressionMode
+                )
+              : applyTargetCharacter.expression.text,
+          },
     };
 
     let effectiveShared: SharedConfig = {
@@ -1281,6 +1302,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     applyBackground,
     applyBackgroundMode,
     applyBackgroundText,
+    applyCreateNewChar,
     applyExpression,
     applyExpressionMode,
     applyExpressionText,
@@ -1303,6 +1325,64 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     knownCharacterHints,
     shared,
   ]);
+
+  const applyModalConflicts = useMemo(() => {
+    if (!effectiveApplyBuild) return [];
+    return detectConflicts(
+      effectiveApplyBuild.effectiveShared,
+      [effectiveApplyBuild.effectiveChar],
+      {
+        includeAppearance: true,
+        customPresets,
+        customBackgrounds,
+      }
+    );
+  }, [effectiveApplyBuild, customPresets, customBackgrounds]);
+
+  const handleFixModalConflict = useCallback(
+    (conflict: ConflictItem) => {
+      if (!conflict.targetTag && conflict.fixType !== 'remove-solo') return;
+      const tag = conflict.targetTag ?? 'solo';
+
+      if (conflict.fixType === 'remove-solo') {
+        setApplyOutfitText((prev) => stripTagFromSlotText(prev, 'solo'));
+        setApplyPoseText((prev) => stripTagFromSlotText(prev, 'solo'));
+        setApplyExpressionText((prev) => stripTagFromSlotText(prev, 'solo'));
+        setApplyBackgroundText((prev) => stripTagFromSlotText(prev, 'solo'));
+        return;
+      }
+
+      if (conflict.fixType === 'remove-character-tag') {
+        if (!conflict.slot || conflict.slot === 'outfit') {
+          setApplyOutfitText((prev) => stripTagFromSlotText(prev, tag));
+        }
+        if (!conflict.slot || conflict.slot === 'pose') {
+          setApplyPoseText((prev) => stripTagFromSlotText(prev, tag));
+        }
+        if (!conflict.slot || conflict.slot === 'expression') {
+          setApplyExpressionText((prev) => stripTagFromSlotText(prev, tag));
+        }
+        return;
+      }
+
+      if (conflict.fixType === 'remove-shared-tag' && conflict.slot === 'background') {
+        setApplyBackgroundText((prev) => stripTagFromSlotText(prev, tag));
+        return;
+      }
+
+      if (conflict.fixType === 'remove-negative-tag') {
+        if (applyNegative && applyNegativeText.trim()) {
+          setApplyNegativeText((prev) => stripTagFromSlotText(prev, tag));
+        } else {
+          // 若冲突源于全局负向或护栏，提示可在角色拉取槽位中清理对应正向词
+          setApplyOutfitText((prev) => stripTagFromSlotText(prev, tag));
+          setApplyPoseText((prev) => stripTagFromSlotText(prev, tag));
+          setApplyExpressionText((prev) => stripTagFromSlotText(prev, tag));
+        }
+      }
+    },
+    [applyNegative, applyNegativeText]
+  );
 
   const populateApplyPreparedFields = useCallback(
     (
@@ -1414,6 +1494,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       setApplyCustomLoraNotice(null);
       setApplySyncLorasToProfile(false);
       setApplySwitchAndClose(true);
+      setApplyCreateNewChar(true);
       setApplyPreviewOpen(false);
       setShowSaveBgPreset(false);
       setSaveBgPresetName(card.title || '');
@@ -1500,6 +1581,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         samplingParams: hasSampling ? applyExtractedParams : undefined,
         lorasOverride: applySyncLorasToProfile ? syncComposedLoras : effectiveComposedLoras,
         syncLorasToProfile: applySyncLorasToProfile,
+        createNewCharacter: applyCreateNewChar,
         switchAndClose: applySwitchAndClose,
         persistToCharacter: applyPersistToChar,
       });
@@ -1515,7 +1597,9 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
           characters.find((c) => c.id === applyTargetCharId)?.name ?? '目标角色';
         setImportNotice({
           type: 'ok',
-          text: `已使用角色「${targetName}」成功复刻收藏图「${applyingCard.title}」`,
+          text: applyCreateNewChar
+            ? `已基于「${targetName}」新建独立复刻角色并带入收藏图「${applyingCard.title}」`
+            : `已使用角色「${targetName}」成功复刻收藏图「${applyingCard.title}」`,
         });
       }
     },
@@ -1523,6 +1607,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       applyBackground,
       applyBackgroundMode,
       applyBackgroundText,
+      applyCreateNewChar,
       applyExpression,
       applyExpressionMode,
       applyExpressionText,
@@ -2894,6 +2979,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         samplingParams: hasSampling ? applyExtractedParams : undefined,
         lorasOverride: applySyncLorasToProfile ? syncComposedLoras : effectiveComposedLoras,
         syncLorasToProfile: applySyncLorasToProfile,
+        createNewCharacter: applyCreateNewChar,
         switchAndClose: false,
         persistToCharacter: applyPersistToChar,
         runDirectly: true,
@@ -2998,6 +3084,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       applyBackground,
       applyBackgroundMode,
       applyBackgroundText,
+      applyCreateNewChar,
       applyExpression,
       applyExpressionMode,
       applyExpressionText,
@@ -6091,6 +6178,72 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                   )}
 
                   {effectiveApplyBuild && (
+                    <div
+                      className={`rounded-[9px] border px-3 py-2 text-[11px] space-y-1.5 ${
+                        applyModalConflicts.length > 0
+                          ? applyModalConflicts.some((c) => c.severity === 'error')
+                            ? 'border-[#F5B8C4] bg-[#FFF1F3] text-[#B42343]'
+                            : 'border-amber-200 bg-amber-50/95 text-amber-900'
+                          : 'border-emerald-200 bg-emerald-50/85 text-emerald-800'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2 font-semibold">
+                        <span className="inline-flex items-center gap-1.5">
+                          {applyModalConflicts.length > 0 ? (
+                            <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                          ) : (
+                            <CheckCircle2 className="w-3.5 h-3.5 shrink-0 text-emerald-600" />
+                          )}
+                          <span>
+                            {applyModalConflicts.length > 0
+                              ? `拉取提示词冲突检查：发现 ${applyModalConflicts.length} 处潜在冲突`
+                              : '拉取提示词冲突检查通过（未发现正负向、构图、姿势或角色冲突）'}
+                          </span>
+                        </span>
+                      </div>
+                      {applyModalConflicts.length > 0 && (
+                        <div className="space-y-1.5 pt-1 border-t border-black/5">
+                          {applyModalConflicts.map((conflict) => {
+                            const canFixInModal = Boolean(
+                              conflict.fixType === 'remove-solo' ||
+                                conflict.fixType === 'remove-character-tag' ||
+                                (conflict.fixType === 'remove-shared-tag' &&
+                                  conflict.slot === 'background' &&
+                                  applyBackground) ||
+                                conflict.fixType === 'remove-negative-tag'
+                            );
+                            return (
+                              <div
+                                key={conflict.id}
+                                className="flex flex-wrap items-center justify-between gap-2 text-[11px]"
+                              >
+                                <span className="leading-relaxed">
+                                  <strong>{conflict.title}：</strong>
+                                  {conflict.detail}
+                                </span>
+                                {canFixInModal && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleFixModalConflict(conflict)}
+                                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-[6px] border border-black/15 bg-white text-[#1E2028] hover:border-[#7C5CFC]/50 hover:text-[#5B3DF5] cursor-pointer shrink-0"
+                                  >
+                                    <Wrench className="w-3 h-3" />
+                                    <span>
+                                      {conflict.fixType === 'remove-negative-tag' && !applyNegative
+                                        ? `移除冲突词 "${conflict.targetTag}"`
+                                        : `一键移除 "${conflict.targetTag ?? 'solo'}"`}
+                                    </span>
+                                  </button>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {effectiveApplyBuild && (
                     <div className="pt-1">
                       <button
                         type="button"
@@ -6150,16 +6303,22 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                         />
                         <span>服装 / 配饰与补充提示词（outfit）</span>
                       </label>
-                      <select
-                        value={applyOutfitMode}
-                        onChange={(e) =>
-                          setApplyOutfitMode(e.target.value as CardSlotWriteMode)
-                        }
-                        className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-[#FAFAFC] text-[11px] text-[#373C4B]"
-                      >
-                        <option value="replace">替换目标角色服装槽位</option>
-                        <option value="append">追加到目标角色服装后</option>
-                      </select>
+                      {applyCreateNewChar ? (
+                        <span className="h-7 px-2 inline-flex items-center rounded-[7px] border border-[#DDD8FA] bg-[#F5F2FF] text-[11px] font-medium text-[#5B3DF5]">
+                          新角色空白写入（不套用旧预设）
+                        </span>
+                      ) : (
+                        <select
+                          value={applyOutfitMode}
+                          onChange={(e) =>
+                            setApplyOutfitMode(e.target.value as CardSlotWriteMode)
+                          }
+                          className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-[#FAFAFC] text-[11px] text-[#373C4B]"
+                        >
+                          <option value="replace">替换目标角色服装槽位</option>
+                          <option value="append">追加到目标角色服装后</option>
+                        </select>
+                      )}
                     </div>
                     <textarea
                       rows={2}
@@ -6185,16 +6344,22 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                         />
                         <span>动作 / 姿态（pose）</span>
                       </label>
-                      <select
-                        value={applyPoseMode}
-                        onChange={(e) =>
-                          setApplyPoseMode(e.target.value as CardSlotWriteMode)
-                        }
-                        className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-[#FAFAFC] text-[11px] text-[#373C4B]"
-                      >
-                        <option value="replace">替换目标角色动作槽位</option>
-                        <option value="append">追加到目标角色动作后</option>
-                      </select>
+                      {applyCreateNewChar ? (
+                        <span className="h-7 px-2 inline-flex items-center rounded-[7px] border border-[#DDD8FA] bg-[#F5F2FF] text-[11px] font-medium text-[#5B3DF5]">
+                          新角色空白写入（不勾选则留空）
+                        </span>
+                      ) : (
+                        <select
+                          value={applyPoseMode}
+                          onChange={(e) =>
+                            setApplyPoseMode(e.target.value as CardSlotWriteMode)
+                          }
+                          className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-[#FAFAFC] text-[11px] text-[#373C4B]"
+                        >
+                          <option value="replace">替换目标角色动作槽位</option>
+                          <option value="append">追加到目标角色动作后</option>
+                        </select>
+                      )}
                     </div>
                     <textarea
                       rows={2}
@@ -6220,18 +6385,24 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                         />
                         <span>表情 / 眼神（expression）</span>
                       </label>
-                      <select
-                        value={applyExpressionMode}
-                        onChange={(e) =>
-                          setApplyExpressionMode(e.target.value as CardSlotWriteMode)
-                        }
-                        className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-[#FAFAFC] text-[11px] text-[#373C4B]"
-                      >
-                        <option value="replace">使用原图表情替换（清空旧/可爱表情）</option>
-                        <option value="append">追加到角色当前表情后</option>
-                      </select>
+                      {applyCreateNewChar ? (
+                        <span className="h-7 px-2 inline-flex items-center rounded-[7px] border border-[#DDD8FA] bg-[#F5F2FF] text-[11px] font-medium text-[#5B3DF5]">
+                          新角色空白写入（不填入旧可爱表情）
+                        </span>
+                      ) : (
+                        <select
+                          value={applyExpressionMode}
+                          onChange={(e) =>
+                            setApplyExpressionMode(e.target.value as CardSlotWriteMode)
+                          }
+                          className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-[#FAFAFC] text-[11px] text-[#373C4B]"
+                        >
+                          <option value="replace">使用原图表情替换（清空旧/可爱表情）</option>
+                          <option value="append">追加到角色当前表情后</option>
+                        </select>
+                      )}
                     </div>
-                    {applyTargetCharacter?.expression.text.trim() && (
+                    {!applyCreateNewChar && applyTargetCharacter?.expression.text.trim() && (
                       <div
                         className={`text-[10.5px] rounded-[7px] px-2 py-1 ${
                           applyExpression && applyExpressionMode === 'replace'
@@ -7312,15 +7483,31 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                       <span>套用后切换到该角色并返回主编辑区</span>
                     </label>
                     <br />
-                    <label className="inline-flex items-center gap-2 text-[11.5px] text-[#686E7E] cursor-pointer select-none">
+                    <label className="inline-flex items-center gap-2 text-[11.5px] text-[#5B3DF5] font-medium cursor-pointer select-none">
                       <input
                         type="checkbox"
-                        checked={applyPersistToChar}
-                        onChange={(e) => setApplyPersistToChar(e.target.checked)}
+                        checked={applyCreateNewChar}
+                        onChange={(e) => setApplyCreateNewChar(e.target.checked)}
                         className="w-3.5 h-3.5 accent-[#7C5CFC]"
                       />
-                      <span>同时永久保存到角色卡定义（默认仅临时切角生图，保护原角色参数）</span>
+                      <span>
+                        新建独立复刻角色（不修改原列表角色，不填入原角色可爱预设搭配，方便重选 presets）
+                      </span>
                     </label>
+                    {!applyCreateNewChar && (
+                      <>
+                        <br />
+                        <label className="inline-flex items-center gap-2 text-[11.5px] text-[#686E7E] cursor-pointer select-none">
+                          <input
+                            type="checkbox"
+                            checked={applyPersistToChar}
+                            onChange={(e) => setApplyPersistToChar(e.target.checked)}
+                            className="w-3.5 h-3.5 accent-[#7C5CFC]"
+                          />
+                          <span>同时永久保存到原角色卡定义</span>
+                        </label>
+                      </>
+                    )}
                   </div>
 
                   <div className="flex items-center gap-2 shrink-0 pt-1 sm:pt-0">

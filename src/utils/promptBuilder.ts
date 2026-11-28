@@ -536,8 +536,14 @@ const YI_HAIRSTYLE_REMOVABLE_TOKENS = new Set<string>([
   ).filter(Boolean),
 ]);
 
+export function getCanonicalCharacterId(
+  character: Pick<CharacterConfig, 'id' | 'templateId'>
+): string {
+  return character.templateId?.trim() || character.id;
+}
+
 export function canCustomizeCharacterHairstyle(character: CharacterConfig): boolean {
-  return character.id === 'char-yi';
+  return getCanonicalCharacterId(character) === 'char-yi';
 }
 
 function extractDefaultHairstyleTag(appearanceText: string, preferredPatterns: RegExp[], fallback: string): string {
@@ -551,7 +557,8 @@ function extractDefaultHairstyleTag(appearanceText: string, preferredPatterns: R
 
 export function getCharacterDefaultHairstyleOption(character: CharacterConfig): SimplePresetItem {
   const appText = character.appearance.text;
-  if (character.id === 'char-lan') {
+  const canonicalId = getCanonicalCharacterId(character);
+  if (canonicalId === 'char-lan') {
     const tag = extractDefaultHairstyleTag(
       appText,
       [/^low twintails$/i, /\btwintails\b/i, /\b(?:long|short) hair\b/i],
@@ -566,7 +573,7 @@ export function getCharacterDefaultHairstyleOption(character: CharacterConfig): 
       defaultWeight: 1.0,
     };
   }
-  if (character.id === 'char-mari') {
+  if (canonicalId === 'char-mari') {
     const tag = extractDefaultHairstyleTag(
       appText,
       [/\bvery long low twintails\b/i, /\blow twintails\b/i, /\btwintails\b/i],
@@ -581,7 +588,7 @@ export function getCharacterDefaultHairstyleOption(character: CharacterConfig): 
       defaultWeight: 1.0,
     };
   }
-  if (character.id === 'char-hoshino') {
+  if (canonicalId === 'char-hoshino') {
     const tag = extractDefaultHairstyleTag(
       appText,
       [/^long hair$/i, /\b(?:long|short|medium) hair\b/i],
@@ -1393,7 +1400,7 @@ export function buildNegativePromptWithMeta(
   }
 
   const yiChar = includeAppearance
-    ? charList.find((c) => c.id === 'char-yi')
+    ? charList.find((c) => getCanonicalCharacterId(c) === 'char-yi')
     : undefined;
   const yiHairOptions = yiChar ? getCharacterHairstyleOptions(yiChar) : null;
   const yiEffectiveAppText = yiChar
@@ -1417,7 +1424,10 @@ export function buildNegativePromptWithMeta(
       pushUnique('(two hair bows:1.65)');
       pushUnique('(multiple hair bows:1.6)');
     }
-    if (isYiNoAccessory && !charList.some((c) => c.id === 'char-lan')) {
+    if (
+      isYiNoAccessory &&
+      !charList.some((c) => getCanonicalCharacterId(c) === 'char-lan')
+    ) {
       ANTI_NO_HAIR_BOW_GUARD_TAGS.forEach(pushUnique);
     }
   }
@@ -1592,9 +1602,60 @@ function splitCleanTerms(raw: string): string[] {
     .filter((t) => t.length >= 2);
 }
 
+export function stripTagFromSlotText(slotText: string, targetTag: string): string {
+  const cleanTarget = stripWeightSyntax(targetTag).replace(/\s+/g, ' ').trim();
+  if (!cleanTarget || !slotText.trim()) return slotText;
+  const escaped = cleanTarget.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const wordRe = /[\u4e00-\u9fa5]/.test(cleanTarget)
+    ? new RegExp(escaped, 'i')
+    : new RegExp(`^${escaped}$|\\b${escaped}\\b`, 'i');
+
+  return splitPromptTags(slotText)
+    .filter((token) => {
+      const bare = stripWeightSyntax(token).replace(/\s+/g, ' ').trim();
+      if (!bare) return false;
+      if (bare === cleanTarget) return false;
+      return !wordRe.test(bare);
+    })
+    .join(', ');
+}
+
+interface TaggedSlotToken {
+  raw: string;
+  clean: string;
+  slot: NonNullable<ConflictItem['slot']>;
+  scope: 'shared' | 'character';
+  characterId?: string;
+  characterName?: string;
+}
+
+function collectTaggedSlotTokens(
+  text: string,
+  slot: NonNullable<ConflictItem['slot']>,
+  scope: 'shared' | 'character',
+  characterId?: string,
+  characterName?: string
+): TaggedSlotToken[] {
+  const out: TaggedSlotToken[] = [];
+  for (const part of splitPromptTags(text)) {
+    const clean = stripWeightSyntax(part).replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!clean) continue;
+    out.push({
+      raw: part.trim(),
+      clean,
+      slot,
+      scope,
+      characterId,
+      characterName,
+    });
+  }
+  return out;
+}
+
 export function detectConflicts(
   shared: SharedConfig,
-  characters: CharacterConfig[]
+  characters: CharacterConfig[],
+  options: BuildPromptOptions = {}
 ): ConflictItem[] {
   const conflicts: ConflictItem[] = [];
   const negativeString = buildSharedNegativePrompt(shared);
@@ -1645,24 +1706,39 @@ export function detectConflicts(
     });
   }
 
-  // 2. 正向与负向冲突检测
+  // 2. 正向与负向冲突检测（包含共用负向与单角色实际护栏负向）
   const seenCollisionKeys = new Set<string>();
   const sharedPositiveEntries = [
     {
       source: '共享层',
       text: `${shared.styleAnchor.text}, ${shared.background.text}, ${shared.composition.text}, ${shared.bodyType?.text ?? ''}`,
+      negTerms: negativeRawTerms,
     },
-    ...characters.map((c) => ({
-      source: c.name,
-      characterId: c.id,
-      text: `${resolveEffectiveAppearanceSlot(c).text}, ${c.outfit.text}, ${c.pose.text}, ${c.expression.text}`,
-    })),
+    ...characters.map((c) => {
+      const charNegStr = buildNegativePromptWithMeta(shared, c, {
+        ...options,
+        includeAppearance: options.includeAppearance ?? true,
+      }).negativePrompt;
+      const charNegTerms = charNegStr
+        .split(/[,，\n]+/)
+        .map((part) => ({
+          raw: part.trim(),
+          clean: stripWeightSyntax(part),
+        }))
+        .filter((item) => item.clean.length >= 2);
+      return {
+        source: c.name,
+        characterId: c.id,
+        text: `${resolveEffectiveAppearanceSlot(c).text}, ${c.outfit.text}, ${c.pose.text}, ${c.expression.text}`,
+        negTerms: charNegTerms.length > 0 ? charNegTerms : negativeRawTerms,
+      };
+    }),
   ];
 
   for (const entry of sharedPositiveEntries) {
     const posTerms = splitCleanTerms(entry.text);
     for (const posTerm of posTerms) {
-      for (const negItem of negativeRawTerms) {
+      for (const negItem of entry.negTerms) {
         if (!negItem.clean) continue;
         // 完全相等，或正向词包含更短的负向压制词（避免 "standing" 误报撞车 "standing on bed"）
         const isExact = posTerm === negItem.clean;
@@ -1679,7 +1755,7 @@ export function detectConflicts(
             id: `conflict-neg-${dedupeKey}`,
             severity: isExact ? 'error' : 'warning',
             title: `正向与负向存在冲突词 "${negItem.clean}"`,
-            detail: `「${entry.source}」正向包含 "${posTerm}"，但共用负向同时压制了 "${negItem.raw}"。`,
+            detail: `「${entry.source}」正向包含 "${posTerm}"，但负向/护栏同时压制了 "${negItem.raw}"。`,
             characterId: 'characterId' in entry ? entry.characterId : undefined,
             fixType: 'remove-negative-tag',
             targetTag: negItem.clean,
@@ -1711,51 +1787,357 @@ export function detectConflicts(
     }
   }
 
-  // 4. 铁律 1：禁止补充会盖住 LoRA 人脸的通用五官美化词
-  const LORA_FACE_OVERRIDE_TERMS = ['detailed face', 'beautiful eyes', 'intricate eyes', 'anime face'];
-  for (const entry of sharedPositiveEntries) {
-    const posTerms = splitCleanTerms(entry.text);
-    for (const badTerm of LORA_FACE_OVERRIDE_TERMS) {
-      if (posTerms.some((t) => t.includes(badTerm))) {
-        conflicts.push({
-          id: `conflict-iron1-${entry.source}-${badTerm}`,
-          severity: 'warning',
-          title: `不建议添加 "${badTerm}"`,
-          detail: `「${entry.source}」正向包含 "${badTerm}"，容易盖住 Anima LoRA 学到的角色五官。`,
-          characterId: 'characterId' in entry ? entry.characterId : undefined,
-        });
-      }
+  // 4. 铁律 1：禁止补充会盖住 LoRA 人脸的通用五官美化词 + 塑胶/假人词残留
+  const LORA_FACE_OVERRIDE_TERMS = [
+    'detailed face',
+    'beautiful face',
+    'beautiful eyes',
+    'intricate eyes',
+    'anime face',
+  ];
+
+  const sharedSlotTokens: TaggedSlotToken[] = [
+    ...collectTaggedSlotTokens(shared.styleAnchor.text, 'styleAnchor', 'shared'),
+    ...collectTaggedSlotTokens(shared.background.text, 'background', 'shared'),
+    ...collectTaggedSlotTokens(shared.composition.text, 'composition', 'shared'),
+  ];
+
+  for (const tok of sharedSlotTokens) {
+    const matchedIron1 = LORA_FACE_OVERRIDE_TERMS.find((b) => tok.clean.includes(b));
+    if (matchedIron1) {
+      conflicts.push({
+        id: `conflict-iron1-shared-${tok.slot}-${matchedIron1}`,
+        severity: 'warning',
+        title: `不建议在共享层添加 "${matchedIron1}"`,
+        detail: `共享层包含 "${tok.raw}"，容易盖住 Anima LoRA 学到的角色五官。`,
+        slot: tok.slot,
+        fixType: 'remove-shared-tag',
+        targetTag: tok.clean,
+      });
+    }
+    if (isDollPlasticTextureTag(tok.raw)) {
+      conflicts.push({
+        id: `conflict-plastic-shared-${tok.slot}-${tok.clean}`,
+        severity: 'warning',
+        title: `共享层包含塑胶/手办质感词 "${tok.clean}"`,
+        detail: `共享层包含 "${tok.raw}"，可能导致角色面部/材质出现塑胶或手办感。`,
+        slot: tok.slot,
+        fixType: 'remove-shared-tag',
+        targetTag: tok.clean,
+      });
     }
   }
 
-  // 5. 角色专属禁用词（防串特征）检测（自动豁免「伊」当前显式选定的角色预设发型/刘海/发饰词条）
+  // 5. 逐角色检测：铁律 1、塑胶质感词、禁用词、构图/姿势/背景/服装/表情语义互斥冲突
+  const seenSemanticIds = new Set<string>();
+  const pushSemanticConflict = (item: ConflictItem) => {
+    if (seenSemanticIds.has(item.id)) return;
+    seenSemanticIds.add(item.id);
+    conflicts.push(item);
+  };
+
   for (const char of characters) {
-    if (!char.forbiddenTags || !char.forbiddenTags.trim()) continue;
-    const forbiddenList = splitCleanTerms(char.forbiddenTags);
-    const appearanceForForbiddenCheck = canCustomizeCharacterHairstyle(char)
-      ? applyHairstyleToAppearanceText(char.appearance.text, '', {
-          bangsTags: '',
-          accessoryId: 'acc-none',
-        })
-      : char.appearance.text;
-    const charTerms = splitCleanTerms(
-      `${appearanceForForbiddenCheck}, ${char.outfit.text}, ${char.pose.text}, ${char.expression.text}`
-    );
-    for (const fTag of forbiddenList) {
-      const matched = charTerms.find(
-        (ct) => ct === fTag || new RegExp(`\\b${fTag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(ct)
-      );
-      if (matched) {
-        conflicts.push({
-          id: `conflict-char-forbidden-${char.id}-${fTag}`,
+    const charSlotTokens: TaggedSlotToken[] = [
+      ...collectTaggedSlotTokens(
+        resolveEffectiveAppearanceSlot(char).text,
+        'appearance',
+        'character',
+        char.id,
+        char.name
+      ),
+      ...collectTaggedSlotTokens(char.outfit.text, 'outfit', 'character', char.id, char.name),
+      ...collectTaggedSlotTokens(char.pose.text, 'pose', 'character', char.id, char.name),
+      ...collectTaggedSlotTokens(
+        char.expression.text,
+        'expression',
+        'character',
+        char.id,
+        char.name
+      ),
+    ];
+
+    for (const tok of charSlotTokens) {
+      const matchedIron1 = LORA_FACE_OVERRIDE_TERMS.find((b) => tok.clean.includes(b));
+      if (matchedIron1) {
+        pushSemanticConflict({
+          id: `conflict-iron1-${char.id}-${tok.slot}-${matchedIron1}`,
           severity: 'warning',
-          title: `角色「${char.name}」命中禁用词 "${fTag}"`,
-          detail: `「${char.name}」的正向提示词出现了禁用特征 "${matched}"，若为刻意选择的表情/服装可点击右侧忽略。`,
+          title: `不建议添加 "${matchedIron1}"`,
+          detail: `「${char.name}」包含 "${tok.raw}"，容易盖住 LoRA 学到的角色五官。`,
           characterId: char.id,
-          fixType: 'remove-forbidden-tag',
-          targetTag: fTag,
+          slot: tok.slot,
+          fixType: tok.slot === 'appearance' ? undefined : 'remove-character-tag',
+          targetTag: tok.clean,
         });
       }
+      if (isDollPlasticTextureTag(tok.raw)) {
+        pushSemanticConflict({
+          id: `conflict-plastic-${char.id}-${tok.slot}-${tok.clean}`,
+          severity: 'warning',
+          title: `检测到塑胶/手办质感残留词 "${tok.clean}"`,
+          detail: `「${char.name}」包含 "${tok.raw}"，容易让画面偏向塑料/手办质感。`,
+          characterId: char.id,
+          slot: tok.slot,
+          fixType: tok.slot === 'appearance' ? undefined : 'remove-character-tag',
+          targetTag: tok.clean,
+        });
+      }
+    }
+
+    // 5a. 角色专属禁用词（防串特征）检测
+    if (char.forbiddenTags && char.forbiddenTags.trim()) {
+      const forbiddenList = splitCleanTerms(char.forbiddenTags);
+      const appearanceForForbiddenCheck = canCustomizeCharacterHairstyle(char)
+        ? applyHairstyleToAppearanceText(char.appearance.text, '', {
+            bangsTags: '',
+            accessoryId: 'acc-none',
+          })
+        : char.appearance.text;
+      const forbiddenCheckTokens: TaggedSlotToken[] = [
+        ...collectTaggedSlotTokens(
+          appearanceForForbiddenCheck,
+          'appearance',
+          'character',
+          char.id,
+          char.name
+        ),
+        ...collectTaggedSlotTokens(char.outfit.text, 'outfit', 'character', char.id, char.name),
+        ...collectTaggedSlotTokens(char.pose.text, 'pose', 'character', char.id, char.name),
+        ...collectTaggedSlotTokens(
+          char.expression.text,
+          'expression',
+          'character',
+          char.id,
+          char.name
+        ),
+      ];
+      for (const fTag of forbiddenList) {
+        const matched = forbiddenCheckTokens.find(
+          (ct) =>
+            ct.clean === fTag ||
+            new RegExp(`\\b${fTag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(ct.clean)
+        );
+        if (matched) {
+          pushSemanticConflict({
+            id: `conflict-char-forbidden-${char.id}-${fTag}`,
+            severity: 'warning',
+            title: `角色「${char.name}」命中禁用词 "${fTag}"`,
+            detail: `「${char.name}」出现了禁用特征 "${matched.raw}"，可能串角，可移除该词或点击忽略。`,
+            characterId: char.id,
+            slot: matched.slot,
+            fixType:
+              matched.slot !== 'appearance' ? 'remove-character-tag' : 'remove-forbidden-tag',
+            targetTag: matched.slot !== 'appearance' ? matched.clean : fTag,
+          });
+        }
+      }
+    }
+
+    const combinedTokens = [...sharedSlotTokens, ...charSlotTokens];
+
+    // 5b. 景别/构图冲突：共享层有 full body / head to toe，但角色槽位拉取了半身/大头裁切词
+    const hasFullBody = combinedTokens.some((t) =>
+      /\b(?:full body|entire body visible|head to toe)\b/i.test(t.clean)
+    );
+    const partialFramingTok = charSlotTokens.find(
+      (t) =>
+        t.slot !== 'appearance' &&
+        /\b(?:upper body|cowboy shot|half body|bust shot|close-up|portrait|cropped legs|cropped torso|face focus)\b/i.test(
+          t.clean
+        )
+    );
+    if (hasFullBody && partialFramingTok) {
+      pushSemanticConflict({
+        id: `conflict-framing-${char.id}-${partialFramingTok.clean}`,
+        severity: 'warning',
+        title: `构图景别冲突：全身构图 vs "${partialFramingTok.clean}"`,
+        detail: `「${char.name}」包含半身/特写裁切词 "${partialFramingTok.raw}"，与全局构图 "full body / head to toe" 冲突，可能导致截肢或构图混乱。`,
+        characterId: char.id,
+        slot: partialFramingTok.slot,
+        fixType: 'remove-character-tag',
+        targetTag: partialFramingTok.clean,
+      });
+    }
+
+    // 5c. 动作姿态互斥：站姿 vs 坐/躺/跪/蹲
+    const standingTok = combinedTokens.find(
+      (t) =>
+        t.slot !== 'appearance' &&
+        /\b(?:standing|standing upright|standing firmly|tiptoe|tiptoes)\b/i.test(t.clean)
+    );
+    const nonStandingTok = combinedTokens.find(
+      (t) =>
+        t.slot !== 'appearance' &&
+        /\b(?:sitting|seiza|kneeling|squatting|crouching|lying|lying on bed|on back|on stomach)\b/i.test(
+          t.clean
+        )
+    );
+    if (standingTok && nonStandingTok) {
+      const fixTok = nonStandingTok.scope === 'character' ? nonStandingTok : standingTok;
+      pushSemanticConflict({
+        id: `conflict-posture-${char.id}-${standingTok.clean}-${nonStandingTok.clean}`,
+        severity: 'warning',
+        title: `动作姿态冲突："${standingTok.clean}" vs "${nonStandingTok.clean}"`,
+        detail: `「${char.name}」同时存在站立词 "${standingTok.raw}" 与坐/躺/跪姿词 "${nonStandingTok.raw}"，容易导致腿部结构扭曲。`,
+        characterId: char.id,
+        slot: fixTok.slot,
+        fixType: fixTok.scope === 'character' ? 'remove-character-tag' : 'remove-shared-tag',
+        targetTag: fixTok.clean,
+      });
+    }
+
+    // 5d. 背景室内外 / 空白背景互斥
+    const nonAppearanceCombinedTokens = combinedTokens.filter(
+      (t) => t.scope === 'shared' || t.slot !== 'appearance'
+    );
+    const indoorTok = nonAppearanceCombinedTokens.find((t) =>
+      /\b(?:indoors?|classroom|bedroom|living room|kitchen|hallway|tatami)\b/i.test(t.clean)
+    );
+    const outdoorTok = nonAppearanceCombinedTokens.find((t) =>
+      /\b(?:outdoors?|park|street|beach|forest|meadow|rooftop|night sky)\b/i.test(t.clean)
+    );
+    if (indoorTok && outdoorTok) {
+      const fixTok = outdoorTok.scope === 'character' ? outdoorTok : indoorTok;
+      pushSemanticConflict({
+        id: `conflict-bg-inout-${char.id}-${indoorTok.clean}-${outdoorTok.clean}`,
+        severity: 'warning',
+        title: `背景室内外冲突："${indoorTok.clean}" vs "${outdoorTok.clean}"`,
+        detail: `提示词中同时存在室内场景词 "${indoorTok.raw}" 与室外场景词 "${outdoorTok.raw}"，可能造成背景撕裂。`,
+        characterId: fixTok.characterId,
+        slot: fixTok.slot,
+        fixType: fixTok.scope === 'character' ? 'remove-character-tag' : 'remove-shared-tag',
+        targetTag: fixTok.clean,
+      });
+    }
+
+    const simpleBgTok = nonAppearanceCombinedTokens.find((t) =>
+      /\b(?:simple background|white background|plain background|transparent background)\b/i.test(
+        t.clean
+      )
+    );
+    const richBgTok = nonAppearanceCombinedTokens.find((t) =>
+      /\b(?:detailed background|classroom|bedroom|living room|cafe|park|forest|street|beach)\b/i.test(
+        t.clean
+      )
+    );
+    if (simpleBgTok && richBgTok) {
+      const fixTok = simpleBgTok.scope === 'character' ? simpleBgTok : richBgTok;
+      pushSemanticConflict({
+        id: `conflict-bg-detail-${char.id}-${simpleBgTok.clean}-${richBgTok.clean}`,
+        severity: 'warning',
+        title: `纯色背景与精细背景冲突："${simpleBgTok.clean}"`,
+        detail: `提示词中同时出现纯色/简洁背景 "${simpleBgTok.raw}" 与细节场景 "${richBgTok.raw}"。`,
+        characterId: fixTok.characterId,
+        slot: fixTok.slot,
+        fixType: fixTok.scope === 'character' ? 'remove-character-tag' : 'remove-shared-tag',
+        targetTag: fixTok.clean,
+      });
+    }
+
+    // 5e. 表情互斥（双闭眼 vs 直视镜头；闭嘴 vs 张嘴/吐舌）
+    const bothEyesClosedTok = charSlotTokens.find(
+      (t) =>
+        t.slot !== 'appearance' &&
+        /^(?:closed eyes|eyes closed)$/i.test(t.clean)
+    );
+    const gazeOpenEyesTok = charSlotTokens.find(
+      (t) =>
+        t.slot !== 'appearance' &&
+        /\b(?:looking at viewer|eye contact|sparkling eyes|wide eyes|open eyes)\b/i.test(t.clean)
+    );
+    if (bothEyesClosedTok && gazeOpenEyesTok) {
+      pushSemanticConflict({
+        id: `conflict-expr-eyes-${char.id}`,
+        severity: 'warning',
+        title: `表情眼神冲突："${bothEyesClosedTok.clean}" vs "${gazeOpenEyesTok.clean}"`,
+        detail: `「${char.name}」同时包含闭眼词 "${bothEyesClosedTok.raw}" 与睁眼/注视镜头词 "${gazeOpenEyesTok.raw}"。`,
+        characterId: char.id,
+        slot: bothEyesClosedTok.slot,
+        fixType: 'remove-character-tag',
+        targetTag: bothEyesClosedTok.clean,
+      });
+    }
+
+    const closedMouthTok = charSlotTokens.find(
+      (t) => t.slot !== 'appearance' && /^closed mouth$/i.test(t.clean)
+    );
+    const openMouthTok = charSlotTokens.find(
+      (t) =>
+        t.slot !== 'appearance' &&
+        /\b(?:open mouth|parted lips|tongue out|blep)\b/i.test(t.clean)
+    );
+    if (closedMouthTok && openMouthTok) {
+      pushSemanticConflict({
+        id: `conflict-expr-mouth-${char.id}`,
+        severity: 'warning',
+        title: `口型表情冲突："${closedMouthTok.clean}" vs "${openMouthTok.clean}"`,
+        detail: `「${char.name}」同时包含 "${closedMouthTok.raw}" 与 "${openMouthTok.raw}"。`,
+        characterId: char.id,
+        slot: closedMouthTok.slot,
+        fixType: 'remove-character-tag',
+        targetTag: closedMouthTok.clean,
+      });
+    }
+
+    // 5f. 服装穿着/袖长互斥
+    const clothedTok = charSlotTokens.find(
+      (t) => t.slot === 'outfit' && /\bfully clothed\b/i.test(t.clean)
+    );
+    const unclothedTok = charSlotTokens.find(
+      (t) =>
+        (t.slot === 'outfit' || t.slot === 'pose') &&
+        /\b(?:nude|topless|bottomless|swimsuit|bikini|lingerie|underwear)\b/i.test(t.clean)
+    );
+    if (clothedTok && unclothedTok) {
+      pushSemanticConflict({
+        id: `conflict-outfit-clothed-${char.id}`,
+        severity: 'warning',
+        title: `服装互斥冲突："${clothedTok.clean}" vs "${unclothedTok.clean}"`,
+        detail: `「${char.name}」同时包含全包裹服饰词 "${clothedTok.raw}" 与露肤/泳装词 "${unclothedTok.raw}"。`,
+        characterId: char.id,
+        slot: clothedTok.slot,
+        fixType: 'remove-character-tag',
+        targetTag: clothedTok.clean,
+      });
+    }
+
+    const longSleeveTok = charSlotTokens.find(
+      (t) => t.slot === 'outfit' && /\b(?:long sleeves|extra-long sleeves)\b/i.test(t.clean)
+    );
+    const noSleeveTok = charSlotTokens.find(
+      (t) =>
+        t.slot === 'outfit' && /\b(?:sleeveless|bare arms|short sleeves)\b/i.test(t.clean)
+    );
+    if (longSleeveTok && noSleeveTok) {
+      pushSemanticConflict({
+        id: `conflict-outfit-sleeve-${char.id}`,
+        severity: 'warning',
+        title: `袖长描述冲突："${longSleeveTok.clean}" vs "${noSleeveTok.clean}"`,
+        detail: `「${char.name}」服装槽位同时包含 "${longSleeveTok.raw}" 与 "${noSleeveTok.raw}"。`,
+        characterId: char.id,
+        slot: noSleeveTok.slot,
+        fixType: 'remove-character-tag',
+        targetTag: noSleeveTok.clean,
+      });
+    }
+
+    // 5g. 单人/多人数量标签内部冲突
+    const soloInPrompt = combinedTokens.find((t) => /^(?:solo|1girl)$/i.test(t.clean));
+    const multiInPrompt = combinedTokens.find((t) =>
+      /\b(?:2girls|3girls|multiple girls|crowd|1boy)\b/i.test(t.clean)
+    );
+    if (soloInPrompt && multiInPrompt) {
+      const fixTok = multiInPrompt.scope === 'character' ? multiInPrompt : soloInPrompt;
+      pushSemanticConflict({
+        id: `conflict-count-${char.id}-${multiInPrompt.clean}`,
+        severity: 'error',
+        title: `人数标签自相矛盾："${soloInPrompt.clean}" vs "${multiInPrompt.clean}"`,
+        detail: `「${char.name}」与共享层同时包含 "${soloInPrompt.raw}" 和 "${multiInPrompt.raw}"，会导致人数错乱。`,
+        characterId: fixTok.characterId,
+        slot: fixTok.slot,
+        fixType: fixTok.scope === 'character' ? 'remove-character-tag' : 'remove-shared-tag',
+        targetTag: fixTok.clean,
+      });
     }
   }
 

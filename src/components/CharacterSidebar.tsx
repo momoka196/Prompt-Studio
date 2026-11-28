@@ -17,7 +17,11 @@ import {
   SharedConfig,
   SimplePresetItem,
 } from '../types/studio';
-import { buildCharacterPrompt, getCharacterHairstyleOptions } from '../utils/promptBuilder';
+import {
+  buildCharacterPrompt,
+  getCanonicalCharacterId,
+  getCharacterHairstyleOptions,
+} from '../utils/promptBuilder';
 
 interface CharacterSidebarProps {
   shared: SharedConfig;
@@ -36,19 +40,23 @@ interface CharacterSidebarProps {
 
 function getCharacterSubtitle(char: CharacterConfig): string {
   const app = char.appearance.text.toLowerCase();
-  if (char.id === 'char-lan' || (app.includes('black hair') && app.includes('low twintails'))) {
-    return '黑发低双马尾';
+  const canonicalId = getCanonicalCharacterId(char);
+  const replicaSuffix = char.templateId ? ' · 复刻' : '';
+  if (canonicalId === 'char-lan' || (app.includes('black hair') && app.includes('low twintails'))) {
+    return `黑发低双马尾${replicaSuffix}`;
   }
-  if (char.id === 'char-yi' || (app.includes('blonde hair') && app.includes('side ponytail'))) {
+  if (canonicalId === 'char-yi' || (app.includes('blonde hair') && app.includes('side ponytail'))) {
     const activeHair =
-      char.id === 'char-yi' ? getCharacterHairstyleOptions(char).activePreset.zhName : '侧马尾';
-    return `金发${activeHair}六件套`;
+      canonicalId === 'char-yi'
+        ? getCharacterHairstyleOptions(char).activePreset.zhName
+        : '侧马尾';
+    return `金发${activeHair}六件套${replicaSuffix}`;
   }
-  if (char.id === 'char-mari' || (app.includes('orange hair') && app.includes('cat ears'))) {
-    return '橘发低双马尾';
+  if (canonicalId === 'char-mari' || (app.includes('orange hair') && app.includes('cat ears'))) {
+    return `橘发低双马尾${replicaSuffix}`;
   }
-  if (char.id === 'char-hoshino' || (app.includes('pink hair') && app.includes('heterochromia'))) {
-    return '粉发异色瞳';
+  if (canonicalId === 'char-hoshino' || (app.includes('pink hair') && app.includes('heterochromia'))) {
+    return `粉发异色瞳${replicaSuffix}`;
   }
   const outfitFirst = char.outfit.text.trim().split(',')[0]?.replace(/^\(|\)$/g, '').trim();
   if (outfitFirst) return outfitFirst;
@@ -62,17 +70,18 @@ export function getCharacterAvatarColor(char: CharacterConfig): {
 } {
   const app = char.appearance.text.toLowerCase();
   const name = char.name.toLowerCase();
+  const canonicalId = getCanonicalCharacterId(char);
 
-  if (char.id === 'char-lan' || app.includes('black hair') || name.includes('蓝')) {
+  if (canonicalId === 'char-lan' || app.includes('black hair') || name.includes('蓝')) {
     return { bg: '#283B6B', ring: 'rgba(40, 59, 107, 0.22)', label: '深海蓝' };
   }
-  if (char.id === 'char-yi' || app.includes('blonde hair') || name.includes('伊')) {
+  if (canonicalId === 'char-yi' || app.includes('blonde hair') || name.includes('伊')) {
     return { bg: '#F2C96B', ring: 'rgba(242, 201, 107, 0.35)', label: '奶油金' };
   }
-  if (char.id === 'char-mari' || app.includes('orange hair') || name.includes('mari')) {
+  if (canonicalId === 'char-mari' || app.includes('orange hair') || name.includes('mari')) {
     return { bg: '#F28B50', ring: 'rgba(242, 139, 80, 0.28)', label: '暖橘' };
   }
-  if (char.id === 'char-hoshino' || app.includes('pink hair') || name.includes('hoshino')) {
+  if (canonicalId === 'char-hoshino' || app.includes('pink hair') || name.includes('hoshino')) {
     return { bg: '#F48FB1', ring: 'rgba(244, 143, 177, 0.32)', label: '樱花粉' };
   }
   if (app.includes('white hair') || app.includes('silver hair')) {

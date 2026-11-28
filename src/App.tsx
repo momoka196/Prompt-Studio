@@ -46,6 +46,7 @@ import {
   exportComfyProfilePayload,
   fetchComfyNodeOptions,
   getActiveLoaderKeys,
+  getCanonicalCharacterId,
   inferYiHairstyleFromAppearance,
   LOADER_NODE_META,
   MAX_COMFY_LORAS,
@@ -54,6 +55,7 @@ import {
   splitPromptTags,
   stripForbiddenAntiTextureFullText,
   stripLegacyExpressionTokensFromAppearance,
+  stripTagFromSlotText,
 } from './utils/promptBuilder';
 import {
   mergePromptSlotTexts,
@@ -301,13 +303,14 @@ function normalizeStudioConfig(raw: Partial<StudioConfig>): StudioConfig {
     characters:
       Array.isArray(raw.characters) && raw.characters.length > 0
         ? raw.characters.map((c) => {
-            const defaultChar = defaults.characters.find((dc) => dc.id === c.id);
+            const canonicalId = c.templateId?.trim() || c.id;
+            const defaultChar = defaults.characters.find((dc) => dc.id === canonicalId);
             const rawAppearanceText = c.appearance?.text ?? '';
             let cleanedAppearanceText = needsAppearanceClean
-              ? stripLegacyExpressionTokensFromAppearance(c.id, rawAppearanceText)
+              ? stripLegacyExpressionTokensFromAppearance(canonicalId, rawAppearanceText)
               : rawAppearanceText;
             const inferredHairId =
-              c.id === 'char-yi'
+              canonicalId === 'char-yi'
                 ? inferYiHairstyleFromAppearance(cleanedAppearanceText)?.id ??
                   defaultChar?.hairstyleId ??
                   'hair-side-ponytail'
@@ -320,7 +323,7 @@ function normalizeStudioConfig(raw: Partial<StudioConfig>): StudioConfig {
                 : defaultChar?.hairAccessoryId ?? null;
             if (
               needsYiSideBowMigration &&
-              c.id === 'char-yi' &&
+              canonicalId === 'char-yi' &&
               resolvedHairstyleId === 'hair-side-ponytail' &&
               (!resolvedAccessoryId || resolvedAccessoryId === 'acc-preset-bow') &&
               /\bblack(?:\s+hair)?\s+bow\b/i.test(cleanedAppearanceText)
@@ -333,6 +336,7 @@ function normalizeStudioConfig(raw: Partial<StudioConfig>): StudioConfig {
             }
             return {
               ...c,
+              templateId: c.templateId,
               appearance: {
                 text: cleanedAppearanceText,
                 weight: c.appearance?.weight ?? 1.0,
@@ -675,10 +679,17 @@ export default function App() {
         return { ok: false, error: '未找到目标角色，请重新选择' };
       }
 
-      setSelectedCharId(payload.targetCharacterId);
+      const shouldCreateNew =
+        payload.createNewCharacter !== false && !payload.runDirectly;
+      const shouldProtectOriginalInRun =
+        Boolean(payload.runDirectly) &&
+        payload.createNewCharacter !== false &&
+        !payload.persistToCharacter;
 
       pushHistory(
-        `${payload.persistToCharacter ? '永久' : ''}套用卡片「${payload.cardTitle}」到「${targetChar.name}」前`,
+        shouldCreateNew
+          ? `基于「${targetChar.name}」新建复刻角色「${payload.cardTitle}」前`
+          : `${payload.persistToCharacter ? '永久' : ''}套用卡片「${payload.cardTitle}」到「${targetChar.name}」前`,
         config
       );
 
@@ -698,8 +709,67 @@ export default function App() {
           .join(', ');
       };
 
-      updateConfig((prev) => {
-        const nextCharacters = prev.characters.map((ch) => {
+      let nextCharacters = config.characters;
+      let resultCharId = payload.targetCharacterId;
+      let resultCharName = targetChar.name;
+
+      if (shouldCreateNew) {
+        const newCharId = `char-replica-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`;
+        const shortBaseName = targetChar.name.replace(/\s*\([^)]*\)\s*/g, '').trim() || targetChar.name;
+        const shortCardTitle = (payload.cardTitle || '复刻图').trim().slice(0, 18);
+        const baseReplicaName = `${shortBaseName} · ${shortCardTitle}`;
+        const existingNames = new Set(config.characters.map((c) => c.name));
+        let uniqueName = baseReplicaName;
+        let suffix = 2;
+        while (existingNames.has(uniqueName)) {
+          uniqueName = `${baseReplicaName} #${suffix}`;
+          suffix += 1;
+        }
+
+        // 全新角色严格锁定所选角色卡的身份外貌/发型/第4层LoRA/禁用词，
+        // 绝不填回原角色的可爱预设服装/动作/表情，避免覆盖或污染原图提示词
+        const newChar: CharacterConfig = {
+          id: newCharId,
+          templateId: getCanonicalCharacterId(targetChar),
+          name: uniqueName,
+          hairstyleId: targetChar.hairstyleId ?? null,
+          hairBangsId: targetChar.hairBangsId ?? null,
+          hairAccessoryId: targetChar.hairAccessoryId ?? null,
+          appearance: { ...targetChar.appearance },
+          outfit: {
+            text:
+              payload.applyOutfit && payload.outfitText.trim()
+                ? cleanPosSlot(payload.outfitText)
+                : '',
+            weight: 1.0,
+          },
+          pose: {
+            text:
+              payload.applyPose && payload.poseText.trim()
+                ? cleanPosSlot(payload.poseText)
+                : '',
+            weight: 1.0,
+          },
+          expression: {
+            text:
+              payload.applyExpression && payload.expressionText.trim()
+                ? cleanPosSlot(payload.expressionText)
+                : '',
+            weight: 1.0,
+          },
+          enableFourthLora: Boolean(targetChar.enableFourthLora),
+          forbiddenTags: targetChar.forbiddenTags ?? '',
+        };
+
+        nextCharacters = [...config.characters, newChar];
+        resultCharId = newCharId;
+        resultCharName = uniqueName;
+
+        const cache = loadUiCache();
+        const nextPresetMap = { ...cache.selectedPresetByChar, [newCharId]: {} };
+        patchUiCache({ selectedPresetByChar: nextPresetMap });
+      } else if (!shouldProtectOriginalInRun) {
+        nextCharacters = config.characters.map((ch) => {
           if (ch.id !== payload.targetCharacterId) return ch;
           const nextOutfitText =
             payload.applyOutfit && payload.outfitText.trim()
@@ -737,194 +807,216 @@ export default function App() {
             expression: { ...ch.expression, text: nextExprText },
           };
         });
+      }
 
-        let nextShared = prev.shared;
-        if (payload.applyBackground && payload.backgroundText.trim()) {
-          const nextBgText = mergePromptSlotTexts(
-            nextShared.background.text,
-            cleanPosSlot(payload.backgroundText),
-            payload.backgroundMode
-          );
-          const nextBgName =
-            payload.backgroundMode === 'append' && nextShared.selectedBackgroundName?.trim()
-              ? `${nextShared.selectedBackgroundName.trim()} + 来自收藏卡 · ${payload.cardTitle}`
-              : `来自收藏卡 · ${payload.cardTitle}`;
-          nextShared = {
-            ...nextShared,
-            background: { ...nextShared.background, text: nextBgText },
-            selectedBackgroundId: null,
-            selectedBackgroundName: nextBgName,
-          };
-          patchUiCache({
-            selectedBackgroundId: null,
-            selectedBackgroundName: nextBgName,
-          });
-        }
+      if (!payload.runDirectly) {
+        setSelectedCharId(resultCharId);
+      }
 
-        if (payload.applyNegative && payload.negativeText.trim()) {
-          const safeNeg = cleanSafeNegative(payload.negativeText);
-          if (safeNeg) {
-            if (payload.negativeMode === 'replace-override') {
+      let nextShared = config.shared;
+      if (payload.applyBackground && payload.backgroundText.trim()) {
+        const nextBgText = mergePromptSlotTexts(
+          nextShared.background.text,
+          cleanPosSlot(payload.backgroundText),
+          payload.backgroundMode
+        );
+        const nextBgName =
+          payload.backgroundMode === 'append' && nextShared.selectedBackgroundName?.trim()
+            ? `${nextShared.selectedBackgroundName.trim()} + 来自收藏卡 · ${payload.cardTitle}`
+            : `来自收藏卡 · ${payload.cardTitle}`;
+        nextShared = {
+          ...nextShared,
+          background: { ...nextShared.background, text: nextBgText },
+          selectedBackgroundId: null,
+          selectedBackgroundName: nextBgName,
+        };
+        patchUiCache({
+          selectedBackgroundId: null,
+          selectedBackgroundName: nextBgName,
+        });
+      }
+
+      if (payload.applyNegative && payload.negativeText.trim()) {
+        const safeNeg = cleanSafeNegative(payload.negativeText);
+        if (safeNeg) {
+          if (payload.negativeMode === 'replace-override') {
+            nextShared = {
+              ...nextShared,
+              manualNegativeOverride: safeNeg,
+            };
+          } else if (nextShared.manualNegativeOverride !== null) {
+            nextShared = {
+              ...nextShared,
+              manualNegativeOverride: mergePromptSlotTexts(
+                nextShared.manualNegativeOverride,
+                safeNeg,
+                'append'
+              ),
+            };
+          } else {
+            const incomingTags = splitPromptTags(safeNeg);
+            const existingAll = new Set(
+              nextShared.negativeGroups.flatMap((g) =>
+                g.tags.map((t) => t.text.trim().toLowerCase())
+              )
+            );
+            const toAppend = incomingTags.filter(
+              (tag) => !existingAll.has(tag.trim().toLowerCase())
+            );
+            if (toAppend.length > 0) {
+              const targetGroupExists = nextShared.negativeGroups.some(
+                (g) => g.id === 'general-quality'
+              );
               nextShared = {
                 ...nextShared,
-                manualNegativeOverride: safeNeg,
+                negativeGroups: nextShared.negativeGroups.map((g, idx) => {
+                  const isTarget = targetGroupExists
+                    ? g.id === 'general-quality'
+                    : idx === nextShared.negativeGroups.length - 1;
+                  if (!isTarget) return g;
+                  return {
+                    ...g,
+                    enabled: true,
+                    tags: [
+                      ...g.tags,
+                      ...toAppend.map((text, tIdx) => ({
+                        id: `card-neg-${Date.now()}-${tIdx}`,
+                        text,
+                        weight: 1.0,
+                      })),
+                    ],
+                  };
+                }),
               };
-            } else if (nextShared.manualNegativeOverride !== null) {
-              nextShared = {
-                ...nextShared,
-                manualNegativeOverride: mergePromptSlotTexts(
-                  nextShared.manualNegativeOverride,
-                  safeNeg,
-                  'append'
-                ),
-              };
-            } else {
-              const incomingTags = splitPromptTags(safeNeg);
-              const existingAll = new Set(
-                nextShared.negativeGroups.flatMap((g) =>
-                  g.tags.map((t) => t.text.trim().toLowerCase())
-                )
-              );
-              const toAppend = incomingTags.filter(
-                (tag) => !existingAll.has(tag.trim().toLowerCase())
-              );
-              if (toAppend.length > 0) {
-                const targetGroupExists = nextShared.negativeGroups.some(
-                  (g) => g.id === 'general-quality'
-                );
-                nextShared = {
-                  ...nextShared,
-                  negativeGroups: nextShared.negativeGroups.map((g, idx) => {
-                    const isTarget = targetGroupExists
-                      ? g.id === 'general-quality'
-                      : idx === nextShared.negativeGroups.length - 1;
-                    if (!isTarget) return g;
-                    return {
-                      ...g,
-                      enabled: true,
-                      tags: [
-                        ...g.tags,
-                        ...toAppend.map((text, tIdx) => ({
-                          id: `card-neg-${Date.now()}-${tIdx}`,
-                          text,
-                          weight: 1.0,
-                        })),
-                      ],
-                    };
-                  }),
-                };
-              }
             }
           }
         }
+      }
 
-        let nextProfiles = prev.comfyProfiles;
-        if (payload.applySamplingParams && payload.samplingParams) {
-          const sp = payload.samplingParams;
-          const baseList =
-            prev.comfyProfiles && prev.comfyProfiles.length > 0
-              ? prev.comfyProfiles
-              : DEFAULT_COMFY_PROFILES;
-          const activeId = prev.activeComfyProfileId ?? baseList[0].id;
-          nextProfiles = baseList.map((profile) => {
-            if (profile.id !== activeId) return profile;
-            const manualSet = new Set<keyof ComfySamplingParams>(
-              profile.manualSamplingFields ?? []
-            );
-            const nextSampling: ComfySamplingParams = { ...profile.sampling };
-            if (typeof sp.width === 'number' && sp.width >= 64) {
-              nextSampling.width = sp.width;
-              manualSet.add('width');
-            }
-            if (typeof sp.height === 'number' && sp.height >= 64) {
-              nextSampling.height = sp.height;
-              manualSet.add('height');
-            }
-            if (typeof sp.steps === 'number' && sp.steps >= 1) {
-              nextSampling.steps = sp.steps;
-              manualSet.add('steps');
-            }
-            if (typeof sp.cfg === 'number' && sp.cfg > 0) {
-              nextSampling.cfg = sp.cfg;
-              manualSet.add('cfg');
-            }
-            if (typeof sp.sampler === 'string' && sp.sampler.trim()) {
-              nextSampling.sampler = sp.sampler.trim();
-              manualSet.add('sampler');
-            }
-            if (typeof sp.scheduler === 'string' && sp.scheduler.trim()) {
-              nextSampling.scheduler = sp.scheduler.trim();
-              manualSet.add('scheduler');
-            }
-            if (typeof sp.denoise === 'number' && sp.denoise > 0 && sp.denoise <= 1) {
-              nextSampling.denoise = sp.denoise;
-              manualSet.add('denoise');
-            }
-            // 若当前模型方案开启了「每次随机 Seed」，保留随机策略不被覆盖
-            if (
-              (profile.sampling.seedMode ?? 'fixed') !== 'random' &&
-              typeof sp.seed === 'number' &&
-              sp.seed >= 0
-            ) {
-              nextSampling.seedMode = 'fixed';
-              nextSampling.seed = sp.seed;
-              manualSet.add('seedMode');
-              manualSet.add('seed');
-            }
-            return {
-              ...profile,
-              sampling: nextSampling,
-              manualSamplingFields: Array.from(manualSet),
-            };
-          });
-        }
+      let nextProfiles = config.comfyProfiles;
+      if (payload.applySamplingParams && payload.samplingParams) {
+        const sp = payload.samplingParams;
+        const baseList =
+          config.comfyProfiles && config.comfyProfiles.length > 0
+            ? config.comfyProfiles
+            : DEFAULT_COMFY_PROFILES;
+        const activeId = config.activeComfyProfileId ?? baseList[0].id;
+        nextProfiles = baseList.map((profile) => {
+          if (profile.id !== activeId) return profile;
+          const manualSet = new Set<keyof ComfySamplingParams>(
+            profile.manualSamplingFields ?? []
+          );
+          const nextSampling: ComfySamplingParams = { ...profile.sampling };
+          if (typeof sp.width === 'number' && sp.width >= 64) {
+            nextSampling.width = sp.width;
+            manualSet.add('width');
+          }
+          if (typeof sp.height === 'number' && sp.height >= 64) {
+            nextSampling.height = sp.height;
+            manualSet.add('height');
+          }
+          if (typeof sp.steps === 'number' && sp.steps >= 1) {
+            nextSampling.steps = sp.steps;
+            manualSet.add('steps');
+          }
+          if (typeof sp.cfg === 'number' && sp.cfg > 0) {
+            nextSampling.cfg = sp.cfg;
+            manualSet.add('cfg');
+          }
+          if (typeof sp.sampler === 'string' && sp.sampler.trim()) {
+            nextSampling.sampler = sp.sampler.trim();
+            manualSet.add('sampler');
+          }
+          if (typeof sp.scheduler === 'string' && sp.scheduler.trim()) {
+            nextSampling.scheduler = sp.scheduler.trim();
+            manualSet.add('scheduler');
+          }
+          if (typeof sp.denoise === 'number' && sp.denoise > 0 && sp.denoise <= 1) {
+            nextSampling.denoise = sp.denoise;
+            manualSet.add('denoise');
+          }
+          // 若当前模型方案开启了「每次随机 Seed」，保留随机策略不被覆盖
+          if (
+            (profile.sampling.seedMode ?? 'fixed') !== 'random' &&
+            typeof sp.seed === 'number' &&
+            sp.seed >= 0
+          ) {
+            nextSampling.seedMode = 'fixed';
+            nextSampling.seed = sp.seed;
+            manualSet.add('seedMode');
+            manualSet.add('seed');
+          }
+          return {
+            ...profile,
+            sampling: nextSampling,
+            manualSamplingFields: Array.from(manualSet),
+          };
+        });
+      }
 
-        if (payload.syncLorasToProfile && Array.isArray(payload.lorasOverride)) {
-          const baseList =
-            nextProfiles && nextProfiles.length > 0
-              ? nextProfiles
-              : prev.comfyProfiles && prev.comfyProfiles.length > 0
-              ? prev.comfyProfiles
-              : DEFAULT_COMFY_PROFILES;
-          const activeId = prev.activeComfyProfileId ?? baseList[0].id;
-          nextProfiles = baseList.map((profile) => {
-            if (profile.id !== activeId) return profile;
-            return {
-              ...profile,
-              loras: payload.lorasOverride!.slice(0, MAX_COMFY_LORAS).map((l, idx) => ({
-                id: l.id || `lora-sync-${Date.now()}-${idx}`,
-                name: l.name.trim(),
-                model: clampLoraWeight(l.model, 1.0),
-                clip: clampLoraWeight(l.clip, 1.0),
-                condition: l.condition === 'ibuki_only' ? 'ibuki_only' : null,
-                enabled: l.enabled !== false,
-                triggerWords: typeof l.triggerWords === 'string' ? l.triggerWords : '',
-                note: typeof l.note === 'string' ? l.note : '',
-              })),
-            };
-          });
-        }
+      if (payload.syncLorasToProfile && Array.isArray(payload.lorasOverride)) {
+        const baseList =
+          nextProfiles && nextProfiles.length > 0
+            ? nextProfiles
+            : config.comfyProfiles && config.comfyProfiles.length > 0
+            ? config.comfyProfiles
+            : DEFAULT_COMFY_PROFILES;
+        const activeId = config.activeComfyProfileId ?? baseList[0].id;
+        nextProfiles = baseList.map((profile) => {
+          if (profile.id !== activeId) return profile;
+          return {
+            ...profile,
+            loras: payload.lorasOverride!.slice(0, MAX_COMFY_LORAS).map((l, idx) => ({
+              id: l.id || `lora-sync-${Date.now()}-${idx}`,
+              name: l.name.trim(),
+              model: clampLoraWeight(l.model, 1.0),
+              clip: clampLoraWeight(l.clip, 1.0),
+              condition: l.condition === 'ibuki_only' ? 'ibuki_only' : null,
+              enabled: l.enabled !== false,
+              triggerWords: typeof l.triggerWords === 'string' ? l.triggerWords : '',
+              note: typeof l.note === 'string' ? l.note : '',
+            })),
+          };
+        });
+      }
 
-        return {
-          ...prev,
-          shared: nextShared,
-          characters: nextCharacters,
-          comfyProfiles: nextProfiles,
-        };
+      updateConfig((prev) => ({
+        ...prev,
+        shared: nextShared,
+        characters: nextCharacters,
+        comfyProfiles: nextProfiles,
+      }));
+
+      // 拉取返回后立即执行提示词冲突判断
+      const detectedAfterApply = detectConflicts(nextShared, nextCharacters, {
+        includeAppearance: true,
+        customPresets: config.customPresets ?? [],
+        customBackgrounds: config.customBackgrounds ?? [],
       });
+      const relevantConflicts = detectedAfterApply.filter(
+        (c) => !c.characterId || c.characterId === resultCharId
+      );
 
       if (payload.switchAndClose && !payload.runDirectly) {
         setWorkbenchOpen(false);
+        if (relevantConflicts.length > 0) {
+          setConflictsExpanded(true);
+        }
         if (applyCardToastTimerRef.current !== null) {
           window.clearTimeout(applyCardToastTimerRef.current);
         }
-        setApplyCardToast(
-          `已切换至「${targetChar.name}」并同步收藏图「${payload.cardTitle}」内容（身份与发型已锁定）`
-        );
+        const prefixText = shouldCreateNew
+          ? `已创建全新角色「${resultCharName}」并带入收藏图「${payload.cardTitle}」`
+          : `已切换至「${resultCharName}」并同步收藏图「${payload.cardTitle}」`;
+        const conflictSuffix =
+          relevantConflicts.length > 0
+            ? `；检测到 ${relevantConflicts.length} 处提示词冲突，已在上方展开`
+            : '（未填充可爱预设，提示词冲突检查通过）';
+        setApplyCardToast(`${prefixText}${conflictSuffix}`);
         applyCardToastTimerRef.current = window.setTimeout(() => {
           setApplyCardToast(null);
           applyCardToastTimerRef.current = null;
-        }, 4200);
+        }, 5000);
       }
 
       return { ok: true };
@@ -950,8 +1042,13 @@ export default function App() {
   );
 
   const conflicts = useMemo(
-    () => detectConflicts(config.shared, config.characters),
-    [config.shared, config.characters]
+    () =>
+      detectConflicts(config.shared, config.characters, {
+        includeAppearance: true,
+        customPresets: config.customPresets ?? [],
+        customBackgrounds: config.customBackgrounds ?? [],
+      }),
+    [config.shared, config.characters, config.customPresets, config.customBackgrounds]
   );
 
   const activeGuardAnalysis = useMemo(
@@ -1161,6 +1258,67 @@ export default function App() {
               }
             : c
         ),
+      }));
+      return;
+    }
+
+    if (
+      conflict.fixType === 'remove-character-tag' &&
+      conflict.targetTag &&
+      conflict.characterId
+    ) {
+      const targetTag = conflict.targetTag;
+      const targetSlot = conflict.slot;
+      updateConfig((prev) => ({
+        ...prev,
+        characters: prev.characters.map((c) => {
+          if (c.id !== conflict.characterId) return c;
+          const patchSlot = (
+            slotKey: 'outfit' | 'pose' | 'expression'
+          ) =>
+            !targetSlot || targetSlot === slotKey
+              ? { ...c[slotKey], text: stripTagFromSlotText(c[slotKey].text, targetTag) }
+              : c[slotKey];
+          return {
+            ...c,
+            outfit: patchSlot('outfit'),
+            pose: patchSlot('pose'),
+            expression: patchSlot('expression'),
+          };
+        }),
+      }));
+      return;
+    }
+
+    if (conflict.fixType === 'remove-shared-tag' && conflict.targetTag) {
+      const targetTag = conflict.targetTag;
+      const targetSlot = conflict.slot;
+      updateConfig((prev) => ({
+        ...prev,
+        shared: {
+          ...prev.shared,
+          styleAnchor:
+            !targetSlot || targetSlot === 'styleAnchor'
+              ? {
+                  ...prev.shared.styleAnchor,
+                  text: stripTagFromSlotText(prev.shared.styleAnchor.text, targetTag),
+                }
+              : prev.shared.styleAnchor,
+          background:
+            !targetSlot || targetSlot === 'background'
+              ? {
+                  ...prev.shared.background,
+                  text: stripTagFromSlotText(prev.shared.background.text, targetTag),
+                }
+              : prev.shared.background,
+          composition:
+            !targetSlot || targetSlot === 'composition'
+              ? {
+                  ...prev.shared.composition,
+                  text: stripTagFromSlotText(prev.shared.composition.text, targetTag),
+                }
+              : prev.shared.composition,
+        },
       }));
     }
   };
@@ -1543,6 +1701,10 @@ export default function App() {
                             ? '移除 solo'
                             : conflict.fixType === 'remove-forbidden-tag'
                             ? `忽略禁用词 "${conflict.targetTag}"`
+                            : conflict.fixType === 'remove-character-tag'
+                            ? `从角色移除 "${conflict.targetTag}"`
+                            : conflict.fixType === 'remove-shared-tag'
+                            ? `从共享层移除 "${conflict.targetTag}"`
                             : `从负向移除 "${conflict.targetTag}"`}
                         </span>
                       </button>

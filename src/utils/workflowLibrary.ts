@@ -13,6 +13,7 @@ import {
   clampLoraWeight,
   clampWeight,
   formatWeightedText,
+  getCanonicalCharacterId,
   isDollPlasticTextureTag,
   parseComfyErrorResponse,
   postProfileToComfyUI,
@@ -4040,7 +4041,7 @@ function buildTargetForbiddenMatchers(targetCharacter?: CharacterConfig): RegExp
       if (clean) rawTerms.push(clean);
     }
   }
-  if (targetCharacter.id === 'char-lan') {
+  if (getCanonicalCharacterId(targetCharacter) === 'char-lan') {
     rawTerms.push(
       'black hair bow',
       'hair bow',

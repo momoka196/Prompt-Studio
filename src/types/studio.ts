@@ -26,6 +26,7 @@ export interface WeightedSlot {
 
 export interface CharacterConfig {
   id: string;
+  templateId?: string;
   name: string;
   hairstyleId?: string | null;
   hairBangsId?: string | null;
@@ -219,7 +220,13 @@ export interface ConflictItem {
   title: string;
   detail: string;
   characterId?: string;
-  fixType?: 'remove-solo' | 'remove-negative-tag' | 'remove-forbidden-tag';
+  slot?: 'appearance' | 'outfit' | 'pose' | 'expression' | 'background' | 'composition' | 'styleAnchor';
+  fixType?:
+    | 'remove-solo'
+    | 'remove-negative-tag'
+    | 'remove-forbidden-tag'
+    | 'remove-character-tag'
+    | 'remove-shared-tag';
   targetTag?: string;
 }
 
@@ -335,6 +342,7 @@ export interface CardApplyToCharacterPayload {
   samplingParams?: ExtractedCardGenerationParams;
   lorasOverride?: ComfyLoraItem[];
   syncLorasToProfile?: boolean;
+  createNewCharacter?: boolean;
   switchAndClose: boolean;
   persistToCharacter?: boolean;
   runDirectly?: boolean;
