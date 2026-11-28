@@ -108,6 +108,9 @@ export interface ComfyLoraItem {
   model: number;
   clip: number;
   condition: 'ibuki_only' | null;
+  enabled?: boolean;
+  triggerWords?: string;
+  note?: string;
 }
 
 export interface ComfySamplingParams {
@@ -156,6 +159,7 @@ export interface StudioConfig {
   activeComfyProfileId?: string;
   customBackgrounds?: MinimalBackgroundPreset[];
   customPresets?: SimplePresetItem[];
+  customLoras?: ComfyLoraItem[];
 }
 
 export interface PromptSegment {
@@ -299,6 +303,14 @@ export interface ExtractedCardGenerationParams {
 
 export type CardSlotWriteMode = 'replace' | 'append';
 
+export interface ExtractedCardLoraItem {
+  id: string;
+  name: string;
+  model: number;
+  clip: number;
+  source: string;
+}
+
 export interface CardApplyToCharacterPayload {
   cardId: string;
   cardTitle: string;
@@ -321,6 +333,8 @@ export interface CardApplyToCharacterPayload {
   negativeMode: 'append-safe' | 'replace-override';
   applySamplingParams: boolean;
   samplingParams?: ExtractedCardGenerationParams;
+  lorasOverride?: ComfyLoraItem[];
+  syncLorasToProfile?: boolean;
   switchAndClose: boolean;
   persistToCharacter?: boolean;
   runDirectly?: boolean;

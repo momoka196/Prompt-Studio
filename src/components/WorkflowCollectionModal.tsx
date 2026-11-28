@@ -38,19 +38,40 @@ import {
   X,
   ZoomIn,
 } from 'lucide-react';
-import { DEFAULT_COMFY_SEED } from '../data/presets';
+import { CHARACTER_FORBIDDEN_FEATURES, DEFAULT_COMFY_SEED, DEFAULT_STUDIO_CONFIG } from '../data/presets';
 import {
   CardApplyToCharacterPayload,
   CardSlotWriteMode,
   CharacterConfig,
+  ComfyLoraItem,
   ComfyProfile,
+  ComfySamplingParams,
   ExtractedCardGenerationParams,
+  ExtractedCardLoraItem,
+  MinimalBackgroundPreset,
+  SharedConfig,
+  SimplePresetItem,
   WorkflowCollectionCard,
   WorkflowJsonFormat,
   WorkflowPromptNodeCandidate,
   WorkflowPromptTagItem,
 } from '../types/studio';
-import { sanitizeFilenamePrefix } from '../utils/promptBuilder';
+import {
+  buildCharacterPrompt,
+  buildNegativePromptWithMeta,
+  clampLoraWeight,
+  fetchComfyNodeOptions,
+  getCharacterHairstyleOptions,
+  isLoraActiveForCharacter,
+  LORA_WEIGHT_MAX,
+  LORA_WEIGHT_MIN,
+  MAX_COMFY_LORAS,
+  normalizeSlotTagsText,
+  postProfileToComfyUI,
+  sanitizeFilenamePrefix,
+  splitPromptTags,
+  stripForbiddenAntiTextureFullText,
+} from '../utils/promptBuilder';
 import {
   buildCardExportPayloadAsync,
   buildCardFolderPathSegments,
@@ -61,6 +82,7 @@ import {
   deleteCardsFromLocalDirectory,
   ensureDirectoryWritePermission,
   extractCardGenerationParams,
+  extractCardLoras,
   extractComfyMetadataFromPngFile,
   findDuplicateCardForSingleDraft,
   FolderSyncIndexEntry,
@@ -68,12 +90,14 @@ import {
   isFileSystemAccessSupported,
   isInRestrictedIframe,
   loadFolderSyncStateSnapshot,
+  mergePromptSlotTexts,
   parseComfyWorkflowSource,
   parsePromptToTagItems,
   pickLocalWorkflowDirectory,
   prepareCardPromptsForCharacterApply,
   readImageDimensions,
   resolveCardImageBlob,
+  sanitizeSlotTextForTargetCharacter,
   scanLocalDirectoryAndMerge,
   sendWorkflowCardToComfyUI,
   serializeTagItemsToPrompt,
@@ -116,6 +140,14 @@ interface WorkflowCollectionModalProps {
   characters?: CharacterConfig[];
   selectedCharId?: string;
   knownCharacterHints?: string[];
+  shared?: SharedConfig;
+  customPresets?: SimplePresetItem[];
+  customBackgrounds?: MinimalBackgroundPreset[];
+  onUpdateCustomBackgrounds?: (items: MinimalBackgroundPreset[]) => void;
+  availableLoras?: string[];
+  customLoras?: ComfyLoraItem[];
+  onUpdateCustomLoras?: (items: ComfyLoraItem[]) => void;
+  onRefreshAvailableLoras?: () => Promise<void> | void;
   onOpenSettings: () => void;
   onApplyCardToCharacter?: (
     payload: CardApplyToCharacterPayload
@@ -343,6 +375,14 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   characters = [],
   selectedCharId = '',
   knownCharacterHints,
+  shared,
+  customPresets = [],
+  customBackgrounds = [],
+  onUpdateCustomBackgrounds,
+  availableLoras = [],
+  customLoras = [],
+  onUpdateCustomLoras,
+  onRefreshAvailableLoras,
   onOpenSettings,
   onApplyCardToCharacter,
 }) => {
@@ -466,8 +506,26 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   const [applyStrippedNegativeTags, setApplyStrippedNegativeTags] = useState<string[]>([]);
   const [applySwitchAndClose, setApplySwitchAndClose] = useState<boolean>(true);
   const [applyPersistToChar, setApplyPersistToChar] = useState<boolean>(false);
+  const [applyPreviewOpen, setApplyPreviewOpen] = useState<boolean>(false);
+  const [showSaveBgPreset, setShowSaveBgPreset] = useState<boolean>(false);
+  const [saveBgPresetName, setSaveBgPresetName] = useState<string>('');
+  const [saveBgPresetNotice, setSaveBgPresetNotice] = useState<string | null>(null);
   const [applyErrorMsg, setApplyErrorMsg] = useState<string | null>(null);
   const [isApplyingAndRunning, setIsApplyingAndRunning] = useState<boolean>(false);
+  const [applyOriginalLoras, setApplyOriginalLoras] = useState<
+    (ExtractedCardLoraItem & { enabled: boolean })[]
+  >([]);
+  const [applyCharLoras, setApplyCharLoras] = useState<ComfyLoraItem[]>([]);
+  const [applyExtraLoras, setApplyExtraLoras] = useState<ComfyLoraItem[]>([]);
+  const [applyCustomLoraDraftName, setApplyCustomLoraDraftName] = useState<string>('');
+  const [applyCustomLoraDraftModel, setApplyCustomLoraDraftModel] = useState<number>(1.0);
+  const [applyCustomLoraDraftClip, setApplyCustomLoraDraftClip] = useState<number>(1.0);
+  const [applyCustomLoraDraftTrigger, setApplyCustomLoraDraftTrigger] = useState<string>('');
+  const [applyCustomLoraDraftNote, setApplyCustomLoraDraftNote] = useState<string>('');
+  const [applyCustomLoraNotice, setApplyCustomLoraNotice] = useState<string | null>(null);
+  const [applySyncLorasToProfile, setApplySyncLorasToProfile] = useState<boolean>(false);
+  const [fetchedLorasCache, setFetchedLorasCache] = useState<string[]>([]);
+  const [isRefreshingLoras, setIsRefreshingLoras] = useState<boolean>(false);
   const [applyRunToast, setApplyRunToast] = useState<{
     tone: 'sending' | 'success' | 'error';
     text: string;
@@ -877,15 +935,388 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [open, editingCardId, lightboxCardId, applyingCardId]);
 
+  const applyTargetCharacter = useMemo(
+    () => characters.find((c) => c.id === applyTargetCharId) ?? characters[0] ?? null,
+    [characters, applyTargetCharId]
+  );
+
+  const mergedAvailableLoras = useMemo(() => {
+    const seen = new Set<string>();
+    const list: string[] = [];
+    for (const raw of [...availableLoras, ...fetchedLorasCache]) {
+      const trimmed = raw.trim();
+      if (!trimmed || seen.has(trimmed)) continue;
+      seen.add(trimmed);
+      list.push(trimmed);
+    }
+    return list;
+  }, [availableLoras, fetchedLorasCache]);
+
+  const effectiveComposedLoras = useMemo(() => {
+    const out: ComfyLoraItem[] = [];
+    const seenNames = new Set<string>();
+
+    const pushItem = (item: ComfyLoraItem) => {
+      if (out.length >= MAX_COMFY_LORAS) return;
+      const trimmed = item.name.trim();
+      if (!trimmed) return;
+      const key = trimmed.toLowerCase();
+      if (seenNames.has(key)) return;
+      seenNames.add(key);
+      out.push({
+        id: item.id,
+        name: trimmed,
+        model: clampLoraWeight(item.model, 1.0),
+        clip: clampLoraWeight(item.clip, 1.0),
+        condition: null,
+        enabled: true,
+        triggerWords: item.triggerWords?.trim() || '',
+        note: item.note?.trim() || '',
+      });
+    };
+
+    for (const l of applyCharLoras) {
+      if (l.enabled !== false) pushItem(l);
+    }
+    for (const orig of applyOriginalLoras) {
+      if (orig.enabled) {
+        pushItem({
+          id: orig.id,
+          name: orig.name,
+          model: orig.model,
+          clip: orig.clip,
+          condition: null,
+          enabled: true,
+          note: orig.source,
+        });
+      }
+    }
+    for (const extra of applyExtraLoras) {
+      if (extra.enabled !== false) pushItem(extra);
+    }
+
+    return out;
+  }, [applyCharLoras, applyOriginalLoras, applyExtraLoras]);
+
+  const syncComposedLoras = useMemo(() => {
+    const out: ComfyLoraItem[] = [];
+    const seenNames = new Set<string>();
+    const profileMap = new Map(
+      (activeProfile.loras ?? []).map((item) => [item.name.trim().toLowerCase(), item])
+    );
+
+    const pushSyncItem = (item: ComfyLoraItem) => {
+      if (out.length >= MAX_COMFY_LORAS) return;
+      const trimmed = item.name.trim();
+      if (!trimmed) return;
+      const key = trimmed.toLowerCase();
+      if (seenNames.has(key)) return;
+      seenNames.add(key);
+      out.push({
+        id: item.id,
+        name: trimmed,
+        model: clampLoraWeight(item.model, 1.0),
+        clip: clampLoraWeight(item.clip, 1.0),
+        condition: item.condition === 'ibuki_only' ? 'ibuki_only' : null,
+        enabled: item.enabled !== false,
+        triggerWords: item.triggerWords?.trim() || '',
+        note: item.note?.trim() || '',
+      });
+    };
+
+    for (const l of applyCharLoras) {
+      const isIsolatedConditional =
+        l.condition === 'ibuki_only' && !applyTargetCharacter?.enableFourthLora;
+      const originalInProfile = profileMap.get(l.name.trim().toLowerCase());
+      pushSyncItem({
+        ...l,
+        enabled: isIsolatedConditional
+          ? originalInProfile
+            ? originalInProfile.enabled !== false
+            : true
+          : l.enabled !== false,
+      });
+    }
+    for (const orig of applyOriginalLoras) {
+      if (orig.enabled) {
+        pushSyncItem({
+          id: orig.id,
+          name: orig.name,
+          model: orig.model,
+          clip: orig.clip,
+          condition: null,
+          enabled: true,
+          note: orig.source,
+        });
+      }
+    }
+    for (const extra of applyExtraLoras) {
+      if (extra.enabled !== false) pushSyncItem(extra);
+    }
+
+    return out;
+  }, [
+    activeProfile.loras,
+    applyCharLoras,
+    applyExtraLoras,
+    applyOriginalLoras,
+    applyTargetCharacter?.enableFourthLora,
+  ]);
+
+  const effectiveApplyBuild = useMemo(() => {
+    if (!applyingCard || !applyTargetCharacter) return null;
+    const baseShared = shared ?? DEFAULT_STUDIO_CONFIG.shared;
+
+    const hasOutfit = applyOutfit && applyOutfitText.trim().length > 0;
+    const hasPose = applyPose && applyPoseText.trim().length > 0;
+    const hasExpr =
+      applyExpression &&
+      (applyExpressionMode === 'replace' || applyExpressionText.trim().length > 0);
+    const hasBg = applyBackground && applyBackgroundText.trim().length > 0;
+    const hasNeg = applyNegative && applyNegativeText.trim().length > 0;
+
+    const cleanPosSlot = (raw: string) =>
+      sanitizeSlotTextForTargetCharacter(raw, applyTargetCharacter, {
+        knownCharacterHints,
+      });
+
+    const effectiveChar: CharacterConfig = {
+      ...applyTargetCharacter,
+      outfit: {
+        ...applyTargetCharacter.outfit,
+        text: hasOutfit
+          ? mergePromptSlotTexts(
+              applyTargetCharacter.outfit.text,
+              cleanPosSlot(applyOutfitText),
+              applyOutfitMode
+            )
+          : applyTargetCharacter.outfit.text,
+      },
+      pose: {
+        ...applyTargetCharacter.pose,
+        text: hasPose
+          ? mergePromptSlotTexts(
+              applyTargetCharacter.pose.text,
+              cleanPosSlot(applyPoseText),
+              applyPoseMode
+            )
+          : applyTargetCharacter.pose.text,
+      },
+      expression: {
+        ...applyTargetCharacter.expression,
+        text: hasExpr
+          ? mergePromptSlotTexts(
+              applyTargetCharacter.expression.text,
+              cleanPosSlot(applyExpressionText),
+              applyExpressionMode
+            )
+          : applyTargetCharacter.expression.text,
+      },
+    };
+
+    let effectiveShared: SharedConfig = {
+      ...baseShared,
+      background: {
+        ...baseShared.background,
+        text: hasBg
+          ? mergePromptSlotTexts(
+              baseShared.background.text,
+              cleanPosSlot(applyBackgroundText),
+              applyBackgroundMode
+            )
+          : baseShared.background.text,
+      },
+    };
+
+    if (hasNeg) {
+      const strippedAntiTex = stripForbiddenAntiTextureFullText(applyNegativeText).cleanedText;
+      const forbiddenMatchers = CHARACTER_FORBIDDEN_FEATURES.map((feat) => {
+        const escaped = feat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        return new RegExp(`\\b${escaped}\\b`, 'i');
+      });
+      const safeNeg = splitPromptTags(strippedAntiTex)
+        .filter((token) => !forbiddenMatchers.some((re) => re.test(token)))
+        .join(', ');
+
+      if (safeNeg) {
+        if (applyNegativeMode === 'replace-override') {
+          effectiveShared = {
+            ...effectiveShared,
+            manualNegativeOverride: safeNeg,
+          };
+        } else if (effectiveShared.manualNegativeOverride !== null) {
+          effectiveShared = {
+            ...effectiveShared,
+            manualNegativeOverride: mergePromptSlotTexts(
+              effectiveShared.manualNegativeOverride,
+              safeNeg,
+              'append'
+            ),
+          };
+        } else {
+          const incomingTags = splitPromptTags(safeNeg);
+          const existingAll = new Set(
+            effectiveShared.negativeGroups.flatMap((g) =>
+              g.tags.map((t) => t.text.trim().toLowerCase())
+            )
+          );
+          const toAppend = incomingTags.filter(
+            (tag) => !existingAll.has(tag.trim().toLowerCase())
+          );
+          if (toAppend.length > 0) {
+            const targetGroupExists = effectiveShared.negativeGroups.some(
+              (g) => g.id === 'general-quality'
+            );
+            effectiveShared = {
+              ...effectiveShared,
+              negativeGroups: effectiveShared.negativeGroups.map((g, idx) => {
+                const isTarget = targetGroupExists
+                  ? g.id === 'general-quality'
+                  : idx === effectiveShared.negativeGroups.length - 1;
+                if (!isTarget) return g;
+                return {
+                  ...g,
+                  enabled: true,
+                  tags: [
+                    ...g.tags,
+                    ...toAppend.map((text, tIdx) => ({
+                      id: `preview-neg-${tIdx}`,
+                      text,
+                      weight: 1.0,
+                    })),
+                  ],
+                };
+              }),
+            };
+          }
+        }
+      }
+    }
+
+    let effectiveProfile: ComfyProfile = {
+      ...activeProfile,
+      loras: effectiveComposedLoras,
+    };
+    const hasSampling =
+      applySamplingParams &&
+      Boolean(
+        applyExtractedParams.width ||
+          applyExtractedParams.height ||
+          applyExtractedParams.steps ||
+          applyExtractedParams.cfg ||
+          applyExtractedParams.sampler ||
+          applyExtractedParams.scheduler ||
+          applyExtractedParams.denoise !== undefined ||
+          applyExtractedParams.seed !== undefined
+      );
+
+    if (hasSampling) {
+      const nextSampling: ComfySamplingParams = { ...activeProfile.sampling };
+      if (typeof applyExtractedParams.width === 'number' && applyExtractedParams.width >= 64) {
+        nextSampling.width = applyExtractedParams.width;
+      }
+      if (typeof applyExtractedParams.height === 'number' && applyExtractedParams.height >= 64) {
+        nextSampling.height = applyExtractedParams.height;
+      }
+      if (typeof applyExtractedParams.steps === 'number' && applyExtractedParams.steps >= 1) {
+        nextSampling.steps = applyExtractedParams.steps;
+      }
+      if (typeof applyExtractedParams.cfg === 'number' && applyExtractedParams.cfg > 0) {
+        nextSampling.cfg = applyExtractedParams.cfg;
+      }
+      if (typeof applyExtractedParams.sampler === 'string' && applyExtractedParams.sampler.trim()) {
+        nextSampling.sampler = applyExtractedParams.sampler.trim();
+      }
+      if (
+        typeof applyExtractedParams.scheduler === 'string' &&
+        applyExtractedParams.scheduler.trim()
+      ) {
+        nextSampling.scheduler = applyExtractedParams.scheduler.trim();
+      }
+      if (
+        typeof applyExtractedParams.denoise === 'number' &&
+        applyExtractedParams.denoise > 0 &&
+        applyExtractedParams.denoise <= 1
+      ) {
+        nextSampling.denoise = applyExtractedParams.denoise;
+      }
+      // 尊重用户当前「每次随机 Seed」设置，仅在固定 Seed 模式下同步卡片 Seed
+      if (
+        (activeProfile.sampling.seedMode ?? 'fixed') !== 'random' &&
+        typeof applyExtractedParams.seed === 'number' &&
+        applyExtractedParams.seed >= 0
+      ) {
+        nextSampling.seedMode = 'fixed';
+        nextSampling.seed = applyExtractedParams.seed;
+      }
+      effectiveProfile = {
+        ...effectiveProfile,
+        sampling: nextSampling,
+      };
+    }
+
+    const builtPositive = buildCharacterPrompt(effectiveShared, effectiveChar, {
+      includeAppearance: true,
+      customPresets,
+      customBackgrounds,
+      activeProfile: effectiveProfile,
+    });
+    const builtNegative = buildNegativePromptWithMeta(effectiveShared, effectiveChar, {
+      includeAppearance: true,
+      customPresets,
+      customBackgrounds,
+    });
+    const activeLoraCount = effectiveComposedLoras.length;
+
+    return {
+      effectiveChar,
+      effectiveShared,
+      effectiveProfile,
+      builtPositive,
+      builtNegative,
+      activeLoraCount,
+    };
+  }, [
+    activeProfile,
+    applyBackground,
+    applyBackgroundMode,
+    applyBackgroundText,
+    applyExpression,
+    applyExpressionMode,
+    applyExpressionText,
+    applyExtractedParams,
+    applyNegative,
+    applyNegativeMode,
+    applyNegativeText,
+    applyOutfit,
+    applyOutfitMode,
+    applyOutfitText,
+    applyPose,
+    applyPoseMode,
+    applyPoseText,
+    applySamplingParams,
+    applyTargetCharacter,
+    applyingCard,
+    customBackgrounds,
+    customPresets,
+    effectiveComposedLoras,
+    knownCharacterHints,
+    shared,
+  ]);
+
   const populateApplyPreparedFields = useCallback(
     (
       card: WorkflowCollectionCard,
-      sourceScope: 'effective' | 'extracted'
+      sourceScope: 'effective' | 'extracted',
+      targetCharIdOverride?: string
     ) => {
+      const targetCharId = targetCharIdOverride ?? applyTargetCharId;
+      const targetCharacter = characters.find((c) => c.id === targetCharId);
       const prepared = prepareCardPromptsForCharacterApply(card, {
         knownCharacterHints,
         preserveIdentityAndHair: true,
         sourceScope,
+        targetCharacter,
       });
       setApplyOutfitText(prepared.outfitText);
       setApplyPoseText(prepared.poseText);
@@ -896,8 +1327,45 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       setApplyStrippedNegativeTags(prepared.strippedNegativeTags);
       return prepared;
     },
-    [knownCharacterHints]
+    [applyTargetCharId, characters, knownCharacterHints]
   );
+
+  const buildCharLorasForTarget = useCallback(
+    (charId: string): ComfyLoraItem[] => {
+      const targetChar = characters.find((c) => c.id === charId);
+      const enableFourth = Boolean(targetChar?.enableFourthLora);
+      return (activeProfile.loras ?? []).map((lora, idx) => ({
+        ...lora,
+        id: lora.id || `char-lora-${idx}`,
+        enabled: isLoraActiveForCharacter(lora, enableFourth),
+      }));
+    },
+    [activeProfile.loras, characters]
+  );
+
+  const handleRefreshLorasInApplyModal = useCallback(async () => {
+    if (isRefreshingLoras) return;
+    setIsRefreshingLoras(true);
+    setApplyCustomLoraNotice(null);
+    try {
+      await onRefreshAvailableLoras?.();
+      if (comfyUrl.trim()) {
+        const list = await fetchComfyNodeOptions(comfyUrl, 'LoraLoader', 'lora_name');
+        if (list.length > 0) {
+          setFetchedLorasCache(list);
+          setApplyCustomLoraNotice(`已同步本地 ComfyUI LoRA 列表（共 ${list.length} 个）`);
+        } else {
+          setApplyCustomLoraNotice('已连接 ComfyUI，但未读取到 LoRA 文件');
+        }
+      }
+    } catch (err) {
+      setApplyCustomLoraNotice(
+        err instanceof Error ? `读取 LoRA 列表失败：${err.message}` : '无法连接本地 ComfyUI 读取 LoRA'
+      );
+    } finally {
+      setIsRefreshingLoras(false);
+    }
+  }, [comfyUrl, isRefreshingLoras, onRefreshAvailableLoras]);
 
   const openApplyToCharacter = useCallback(
     (card: WorkflowCollectionCard, e?: React.SyntheticEvent) => {
@@ -917,14 +1385,16 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
           extractedParams.seed !== undefined
       );
 
-      setApplyTargetCharId(selectedCharId || characters[0]?.id || '');
+      const initialCharId = selectedCharId || characters[0]?.id || '';
+      setApplyTargetCharId(initialCharId);
       setApplyPromptSource('effective');
-      const prepared = populateApplyPreparedFields(card, 'effective');
+      const prepared = populateApplyPreparedFields(card, 'effective', initialCharId);
       setApplyOutfit(Boolean(prepared.outfitText.trim()));
       setApplyOutfitMode('replace');
       setApplyPose(Boolean(prepared.poseText.trim()));
       setApplyPoseMode('replace');
-      setApplyExpression(Boolean(prepared.expressionText.trim()));
+      // 复刻收藏图时默认始终以原图表情覆盖角色旧/可爱表情，避免残留上一次或默认可爱预设表情
+      setApplyExpression(true);
       setApplyExpressionMode('replace');
       setApplyBackground(false);
       setApplyBackgroundMode('replace');
@@ -932,13 +1402,34 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       setApplyNegativeMode('append-safe');
       setApplyExtractedParams(extractedParams);
       setApplySamplingParams(hasAnyParams);
+      const extractedLoras = extractCardLoras(card);
+      setApplyOriginalLoras(extractedLoras.map((l) => ({ ...l, enabled: false })));
+      setApplyCharLoras(buildCharLorasForTarget(initialCharId));
+      setApplyExtraLoras([]);
+      setApplyCustomLoraDraftName('');
+      setApplyCustomLoraDraftModel(1.0);
+      setApplyCustomLoraDraftClip(1.0);
+      setApplyCustomLoraDraftTrigger('');
+      setApplyCustomLoraDraftNote('');
+      setApplyCustomLoraNotice(null);
+      setApplySyncLorasToProfile(false);
       setApplySwitchAndClose(true);
+      setApplyPreviewOpen(false);
+      setShowSaveBgPreset(false);
+      setSaveBgPresetName(card.title || '');
+      setSaveBgPresetNotice(null);
       setApplyErrorMsg(null);
       setIsApplyingAndRunning(false);
       showApplyRunToast(null);
       setApplyingCardId(card.id);
     },
-    [characters, populateApplyPreparedFields, selectedCharId, showApplyRunToast]
+    [
+      buildCharLorasForTarget,
+      characters,
+      populateApplyPreparedFields,
+      selectedCharId,
+      showApplyRunToast,
+    ]
   );
 
   const handleConfirmApplyToCharacter = useCallback(
@@ -955,7 +1446,9 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
 
       const hasOutfit = applyOutfit && applyOutfitText.trim().length > 0;
       const hasPose = applyPose && applyPoseText.trim().length > 0;
-      const hasExpr = applyExpression && applyExpressionText.trim().length > 0;
+      const hasExpr =
+        applyExpression &&
+        (applyExpressionMode === 'replace' || applyExpressionText.trim().length > 0);
       const hasBg = applyBackground && applyBackgroundText.trim().length > 0;
       const hasNeg = applyNegative && applyNegativeText.trim().length > 0;
       const hasSampling =
@@ -971,8 +1464,16 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
             applyExtractedParams.seed !== undefined
         );
 
-      if (!hasOutfit && !hasPose && !hasExpr && !hasBg && !hasNeg && !hasSampling) {
-        setApplyErrorMsg('请至少勾选一项要带入的内容（服装 / 动作 / 表情 / 背景 / 负向 / 生成参数）');
+      if (
+        !hasOutfit &&
+        !hasPose &&
+        !hasExpr &&
+        !hasBg &&
+        !hasNeg &&
+        !hasSampling &&
+        !applySyncLorasToProfile
+      ) {
+        setApplyErrorMsg('请至少勾选一项要带入的内容（服装 / 动作 / 表情 / 背景 / 负向 / 生成参数 / LoRA）');
         return;
       }
 
@@ -997,6 +1498,8 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         negativeMode: applyNegativeMode,
         applySamplingParams: hasSampling,
         samplingParams: hasSampling ? applyExtractedParams : undefined,
+        lorasOverride: applySyncLorasToProfile ? syncComposedLoras : effectiveComposedLoras,
+        syncLorasToProfile: applySyncLorasToProfile,
         switchAndClose: applySwitchAndClose,
         persistToCharacter: applyPersistToChar,
       });
@@ -1036,10 +1539,13 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       applyPoseText,
       applySamplingParams,
       applySwitchAndClose,
+      applySyncLorasToProfile,
       applyTargetCharId,
       applyingCard,
       characters,
+      effectiveComposedLoras,
       onApplyCardToCharacter,
+      syncComposedLoras,
     ]
   );
 
@@ -2268,12 +2774,14 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
     });
 
     try {
+      const currentChar = characters.find((c) => c.id === selectedCharId);
       const res = await sendWorkflowCardToComfyUI({
         comfyUrl,
         card,
         fallbackProfile: activeProfile,
         characterName: activeCharacterName,
         preferStudioProfile: forceStudioProfile || preferStudioProfile,
+        enableFourthLora: Boolean(currentChar?.enableFourthLora),
         seedModeOverride:
           workbenchSeedOverride === 'card' ? undefined : workbenchSeedOverride,
         fixedSeedOverride:
@@ -2338,14 +2846,16 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         e.stopPropagation();
       }
       if (!applyingCard || !onApplyCardToCharacter || isApplyingAndRunning) return;
-      if (!applyTargetCharId) {
+      if (!applyTargetCharId || !effectiveApplyBuild) {
         setApplyErrorMsg('请先选择要套用的目标角色');
         return;
       }
 
       const hasOutfit = applyOutfit && applyOutfitText.trim().length > 0;
       const hasPose = applyPose && applyPoseText.trim().length > 0;
-      const hasExpr = applyExpression && applyExpressionText.trim().length > 0;
+      const hasExpr =
+        applyExpression &&
+        (applyExpressionMode === 'replace' || applyExpressionText.trim().length > 0);
       const hasBg = applyBackground && applyBackgroundText.trim().length > 0;
       const hasNeg = applyNegative && applyNegativeText.trim().length > 0;
       const hasSampling =
@@ -2382,6 +2892,8 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         negativeMode: applyNegativeMode,
         applySamplingParams: hasSampling,
         samplingParams: hasSampling ? applyExtractedParams : undefined,
+        lorasOverride: applySyncLorasToProfile ? syncComposedLoras : effectiveComposedLoras,
+        syncLorasToProfile: applySyncLorasToProfile,
         switchAndClose: false,
         persistToCharacter: applyPersistToChar,
         runDirectly: true,
@@ -2392,55 +2904,92 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
         return;
       }
 
+      const { effectiveChar, effectiveProfile, builtPositive, builtNegative, activeLoraCount } =
+        effectiveApplyBuild;
+
       setApplyErrorMsg(null);
       setIsApplyingAndRunning(true);
       showApplyRunToast({
         tone: 'sending',
         text: '正在发起请求...',
-        detail: `正在向 ComfyUI 发送「${applyingCard.title}」生图任务`,
+        detail: `正在向 ComfyUI 发送「${effectiveChar.name}」复刻任务`,
+      });
+      setRunStatus({
+        state: 'sending',
+        cardId: applyingCard.id,
+        cardTitle: applyingCard.title,
+        message: `正在用角色「${effectiveChar.name}」发送复刻任务到 ComfyUI...`,
       });
 
-      const targetChar = characters.find((c) => c.id === applyTargetCharId);
-      const charAppearance = targetChar?.appearance.text.trim() ?? '';
-      const combinedPos = [
-        charAppearance,
-        hasOutfit ? applyOutfitText.trim() : '',
-        hasPose ? applyPoseText.trim() : '',
-        hasExpr ? applyExpressionText.trim() : '',
-        applyingCard.extractedPositive,
-      ].filter(Boolean).join(', ');
-
-      const runCard: WorkflowCollectionCard = {
-        ...applyingCard,
-        fineTunedPositive: combinedPos,
-        applyFineTuneOnSend: true,
-      };
-
       try {
-        const runRes = await handleRunCard(runCard);
-        if (runRes.ok) {
-          showApplyRunToast(
-            {
-              tone: 'success',
-              text: '已经发起请求',
-              detail: runRes.promptId
-                ? `已加入 ComfyUI 队列 · ID: ${runRes.promptId.slice(0, 10)}`
-                : '已加入 ComfyUI 生图队列',
-            },
-            4500
-          );
-        } else {
-          const errText = runRes.error ?? '推送到 ComfyUI 失败';
-          setApplyErrorMsg(errText);
-          showApplyRunToast(
-            {
-              tone: 'error',
-              text: '发起请求失败',
-              detail: errText,
-            },
-            6000
+        const sendRes = await postProfileToComfyUI({
+          comfyUrl,
+          profile: effectiveProfile,
+          characterName: effectiveChar.name,
+          positivePrompt: builtPositive.fullText,
+          negativePrompt: builtNegative.negativePrompt,
+          enableFourthLora: Boolean(effectiveChar.enableFourthLora),
+        });
+
+        const nowTime = new Date().toLocaleTimeString('zh-CN', {
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false,
+        });
+
+        if (!deletedIdsSessionRef.current.has(applyingCard.id)) {
+          commitCards(
+            cardsRef.current.map((c) =>
+              c.id === applyingCard.id
+                ? { ...c, lastRunAt: Date.now(), lastPromptId: sendRes.promptId }
+                : c
+            )
           );
         }
+
+        const summary = `${effectiveProfile.name} · ${activeLoraCount}层 LoRA · ${effectiveChar.name}`;
+        setRunStatus({
+          state: 'success',
+          cardId: applyingCard.id,
+          cardTitle: applyingCard.title,
+          promptId: sendRes.promptId,
+          usedSeed: sendRes.usedSeed,
+          summary,
+          timestamp: nowTime,
+          message: `已进入本地 ComfyUI 队列 (${summary})`,
+        });
+
+        showApplyRunToast(
+          {
+            tone: 'success',
+            text: '已经发起请求',
+            detail: `角色：${effectiveChar.name} · ID: ${sendRes.promptId.slice(0, 10)}`,
+          },
+          4500
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : '推送到 ComfyUI 失败';
+        const isNetworkErr =
+          /failed to fetch|networkerror|err_connection/i.test(msg);
+        const errText = isNetworkErr
+          ? `${msg}（请确认已启动 ComfyUI 并开启 --enable-cors-header）`
+          : msg;
+        setApplyErrorMsg(errText);
+        setRunStatus({
+          state: 'error',
+          cardId: applyingCard.id,
+          cardTitle: applyingCard.title,
+          message: errText,
+        });
+        showApplyRunToast(
+          {
+            tone: 'error',
+            text: '发起请求失败',
+            detail: errText,
+          },
+          6000
+        );
       } finally {
         setIsApplyingAndRunning(false);
       }
@@ -2464,13 +3013,17 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       applyPoseMode,
       applyPoseText,
       applySamplingParams,
+      applySyncLorasToProfile,
       applyTargetCharId,
       applyingCard,
-      characters,
-      handleRunCard,
+      comfyUrl,
+      commitCards,
+      effectiveApplyBuild,
+      effectiveComposedLoras,
       isApplyingAndRunning,
       onApplyCardToCharacter,
       showApplyRunToast,
+      syncComposedLoras,
     ]
   );
 
@@ -5394,6 +5947,18 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                             e.stopPropagation();
                             setApplyTargetCharId(ch.id);
                             setApplyErrorMsg(null);
+                            setApplyCharLoras(buildCharLorasForTarget(ch.id));
+                            if (applyingCard) {
+                              const prepared = populateApplyPreparedFields(
+                                applyingCard,
+                                applyPromptSource,
+                                ch.id
+                              );
+                              setApplyOutfit(Boolean(prepared.outfitText.trim()));
+                              setApplyPose(Boolean(prepared.poseText.trim()));
+                              setApplyExpression(true);
+                              setApplyExpressionMode('replace');
+                            }
                           }}
                           className={`px-3 py-2.5 rounded-[11px] border text-left transition-all cursor-pointer flex items-center justify-between gap-2 ${
                             isTarget
@@ -5433,15 +5998,138 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                   </div>
                 </section>
 
-                {/* 2. 核心提示说明 */}
+                {/* 2. 目标角色锁定与串词隔离状态 */}
                 <section className="rounded-[12px] border border-[#DDD8FA] bg-[#FAF9FF] p-3.5 space-y-2">
-                  <div className="flex items-center gap-2 text-[12px] font-semibold text-[#5B3DF5]">
-                    <ShieldCheck className="w-4 h-4 text-[#7C5CFC]" />
-                    <span>“用角色卡复刻收藏图”运行机制</span>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 text-[12px] font-semibold text-[#5B3DF5]">
+                      <ShieldCheck className="w-4 h-4 text-[#7C5CFC]" />
+                      <span>角色身份与发型强制锁定 · {applyTargetCharacter?.name ?? '未选择'}</span>
+                    </div>
+                    {applyingCard.fineTunedPositive.trim() !==
+                      applyingCard.extractedPositive.trim() && (
+                      <div className="inline-flex rounded-[7px] border border-[#DDD8FA] bg-white p-0.5 text-[10.5px]">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setApplyPromptSource('effective');
+                            const prepared = populateApplyPreparedFields(
+                              applyingCard,
+                              'effective',
+                              applyTargetCharId
+                            );
+                            setApplyOutfit(Boolean(prepared.outfitText.trim()));
+                            setApplyPose(Boolean(prepared.poseText.trim()));
+                            setApplyExpression(true);
+                            setApplyExpressionMode('replace');
+                          }}
+                          className={`px-2 py-0.5 rounded-[5px] cursor-pointer ${
+                            applyPromptSource === 'effective'
+                              ? 'bg-[#7C5CFC] text-white font-medium'
+                              : 'text-[#5A6072]'
+                          }`}
+                        >
+                          当前生效词
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setApplyPromptSource('extracted');
+                            const prepared = populateApplyPreparedFields(
+                              applyingCard,
+                              'extracted',
+                              applyTargetCharId
+                            );
+                            setApplyOutfit(Boolean(prepared.outfitText.trim()));
+                            setApplyPose(Boolean(prepared.poseText.trim()));
+                            setApplyExpression(true);
+                            setApplyExpressionMode('replace');
+                          }}
+                          className={`px-2 py-0.5 rounded-[5px] cursor-pointer ${
+                            applyPromptSource === 'extracted'
+                              ? 'bg-[#7C5CFC] text-white font-medium'
+                              : 'text-[#5A6072]'
+                          }`}
+                        >
+                          原始提取词
+                        </button>
+                      </div>
+                    )}
                   </div>
-                  <p className="text-[11.5px] text-[#4C5264] leading-relaxed">
-                    选择上方角色卡后，系统将<strong>完美保留该角色的身份特征（外貌、发型、发饰与专属设定）</strong>，同时智能过滤原图中的串角色词，并将收藏图的服装、动作、表情、背景及生成参数带入到该角色中，一键切换至该角色并可直接发往 ComfyUI 复刻！
-                  </p>
+
+                  {applyTargetCharacter && (
+                    <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                      <span className="px-2 py-0.5 rounded-[6px] bg-white border border-[#DDD8FA] text-[#4C5264]">
+                        锁定发型：
+                        <strong className="text-[#1E2028] font-mono">
+                          {getCharacterHairstyleOptions(applyTargetCharacter).activePreset.tags}
+                        </strong>
+                      </span>
+                      <span className="px-2 py-0.5 rounded-[6px] bg-white border border-[#DDD8FA] text-[#4C5264]">
+                        LoRA：
+                        <strong className="text-[#1E2028]">
+                          {applyTargetCharacter.enableFourthLora
+                            ? '含第 4 层角色专属 LoRA'
+                            : '仅公共 LoRA（已隔离伊专属 LoRA）'}
+                        </strong>
+                      </span>
+                      {effectiveApplyBuild && (
+                        <span className="px-2 py-0.5 rounded-[6px] bg-white border border-[#DDD8FA] text-[#5B3DF5]">
+                          当前启用 {effectiveApplyBuild.activeLoraCount} 层 LoRA
+                        </span>
+                      )}
+                    </div>
+                  )}
+
+                  {applyStrippedIdentityTags.length > 0 && (
+                    <p className="text-[11px] text-[#5A6072] leading-relaxed">
+                      已自动剔除 {applyStrippedIdentityTags.length} 个原图角色/五官冲突词：
+                      <span className="font-mono text-[#373C4B]">
+                        {' '}
+                        {applyStrippedIdentityTags.join(', ')}
+                      </span>
+                    </p>
+                  )}
+
+                  {effectiveApplyBuild && (
+                    <div className="pt-1">
+                      <button
+                        type="button"
+                        onClick={() => setApplyPreviewOpen((v) => !v)}
+                        className="inline-flex items-center gap-1 text-[11px] font-medium text-[#5B3DF5] hover:underline cursor-pointer"
+                      >
+                        <ChevronRight
+                          className={`w-3.5 h-3.5 transition-transform ${
+                            applyPreviewOpen ? 'rotate-90' : ''
+                          }`}
+                        />
+                        <span>
+                          {applyPreviewOpen
+                            ? '收起最终发往 ComfyUI 的完整提示词预览'
+                            : '展开预览最终发往 ComfyUI 的完整提示词（已锁定角色与全局层）'}
+                        </span>
+                      </button>
+                      {applyPreviewOpen && (
+                        <div className="mt-2 rounded-[9px] border border-[#DDD8FA] bg-white p-2.5 space-y-2 text-[11px] font-mono">
+                          <div>
+                            <div className="text-[10.5px] font-sans font-semibold text-[#5B3DF5] mb-0.5">
+                              最终正向（Positive · 已锁定 {effectiveApplyBuild.effectiveChar.name}）：
+                            </div>
+                            <div className="text-[#1E2028] break-words leading-relaxed select-all">
+                              {effectiveApplyBuild.builtPositive.fullText}
+                            </div>
+                          </div>
+                          <div className="pt-1.5 border-t border-[#EAEAEF]">
+                            <div className="text-[10.5px] font-sans font-semibold text-[#C93B58] mb-0.5">
+                              最终负向（Negative · 含安全护栏）：
+                            </div>
+                            <div className="text-[#4C5264] break-words leading-relaxed select-all">
+                              {effectiveApplyBuild.builtNegative.negativePrompt}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </section>
 
                 {/* 3. 选择带入的内容 */}
@@ -5539,10 +6227,57 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                         }
                         className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-[#FAFAFC] text-[11px] text-[#373C4B]"
                       >
-                        <option value="replace">替换目标角色表情槽位</option>
-                        <option value="append">追加到目标角色表情后</option>
+                        <option value="replace">使用原图表情替换（清空旧/可爱表情）</option>
+                        <option value="append">追加到角色当前表情后</option>
                       </select>
                     </div>
+                    {applyTargetCharacter?.expression.text.trim() && (
+                      <div
+                        className={`text-[10.5px] rounded-[7px] px-2 py-1 ${
+                          applyExpression && applyExpressionMode === 'replace'
+                            ? 'bg-[#F5F2FF] text-[#5B3DF5] border border-[#E4DFFE]'
+                            : !applyExpression
+                            ? 'bg-amber-50 text-amber-800 border border-amber-200'
+                            : 'bg-[#FAFAFC] text-[#5A6072] border border-[#EAEAEF]'
+                        }`}
+                      >
+                        {applyExpression && applyExpressionMode === 'replace' ? (
+                          applyExpressionText.trim() ? (
+                            <span>
+                              将使用上方原图表情覆盖角色当前表情（
+                              <span className="font-mono">
+                                {applyTargetCharacter.expression.text.trim()}
+                              </span>
+                              ），避免被旧表情或可爱预设污染
+                            </span>
+                          ) : (
+                            <span>
+                              原图未提取到额外表情词；套用时将清空角色当前表情（
+                              <span className="font-mono">
+                                {applyTargetCharacter.expression.text.trim()}
+                              </span>
+                              ），保持原图自然神态
+                            </span>
+                          )
+                        ) : !applyExpression ? (
+                          <span>
+                            未勾选原图表情：将沿用角色当前表情（
+                            <span className="font-mono">
+                              {applyTargetCharacter.expression.text.trim()}
+                            </span>
+                            ）
+                          </span>
+                        ) : (
+                          <span>
+                            将在角色当前表情（
+                            <span className="font-mono">
+                              {applyTargetCharacter.expression.text.trim()}
+                            </span>
+                            ）后追加上方表情词
+                          </span>
+                        )}
+                      </div>
+                    )}
                     <textarea
                       rows={2}
                       value={applyExpressionText}
@@ -5550,7 +6285,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                         setApplyExpressionText(e.target.value);
                         if (e.target.value.trim() && !applyExpression) setApplyExpression(true);
                       }}
-                      placeholder="未识别到明显表情词，可保持不勾选或手动输入..."
+                      placeholder="原图未含明显表情词（勾选替换将清空角色旧表情，保持原图自然神态；也可手动补充）..."
                       className="w-full rounded-[8px] border border-[#E0E0E6] bg-[#FAFAFC] px-2.5 py-1.5 text-[11.5px] font-mono text-[#1E2028] focus:outline-none focus:border-[#7C5CFC] resize-y"
                     />
                   </div>
@@ -5565,19 +6300,46 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                           onChange={(e) => setApplyBackground(e.target.checked)}
                           className="w-3.5 h-3.5 accent-[#7C5CFC]"
                         />
-                        <span>共用场景 / 背景（shared.background，默认不覆盖）</span>
+                        <span>共用场景 / 背景（shared.background，默认保留当前全局背景）</span>
                       </label>
-                      <select
-                        value={applyBackgroundMode}
-                        onChange={(e) =>
-                          setApplyBackgroundMode(e.target.value as CardSlotWriteMode)
-                        }
-                        className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-[#FAFAFC] text-[11px] text-[#373C4B]"
-                      >
-                        <option value="replace">替换当前全局背景</option>
-                        <option value="append">追加到当前全局背景</option>
-                      </select>
+                      <div className="flex items-center gap-1.5">
+                        {onUpdateCustomBackgrounds && applyBackgroundText.trim() && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setShowSaveBgPreset((v) => !v);
+                              setSaveBgPresetNotice(null);
+                              if (!saveBgPresetName.trim() && applyingCard) {
+                                setSaveBgPresetName(applyingCard.title);
+                              }
+                            }}
+                            className="h-7 px-2 inline-flex items-center gap-1 rounded-[7px] border border-[#DDD8FA] bg-[#F5F2FF] text-[11px] font-medium text-[#5B3DF5] hover:bg-[#EDE9FE] cursor-pointer"
+                          >
+                            <Plus className="w-3 h-3" />
+                            <span>存为常用背景预设</span>
+                          </button>
+                        )}
+                        <select
+                          value={applyBackgroundMode}
+                          onChange={(e) =>
+                            setApplyBackgroundMode(e.target.value as CardSlotWriteMode)
+                          }
+                          className="h-7 px-2 rounded-[7px] border border-[#E0E0E6] bg-[#FAFAFC] text-[11px] text-[#373C4B]"
+                        >
+                          <option value="replace">替换当前全局背景</option>
+                          <option value="append">追加到当前全局背景</option>
+                        </select>
+                      </div>
                     </div>
+
+                    {shared?.background.text.trim() && (
+                      <div className="text-[10.5px] text-[#686E7E] truncate">
+                        当前全局背景：
+                        {shared.selectedBackgroundName ? `${shared.selectedBackgroundName} · ` : ''}
+                        <span className="font-mono">{shared.background.text.trim()}</span>
+                      </div>
+                    )}
+
                     <textarea
                       rows={2}
                       value={applyBackgroundText}
@@ -5588,6 +6350,47 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                       placeholder="未识别到背景词（可选）..."
                       className="w-full rounded-[8px] border border-[#E0E0E6] bg-[#FAFAFC] px-2.5 py-1.5 text-[11.5px] font-mono text-[#1E2028] focus:outline-none focus:border-[#7C5CFC] resize-y"
                     />
+
+                    {showSaveBgPreset && onUpdateCustomBackgrounds && (
+                      <div className="flex flex-wrap items-center gap-1.5 rounded-[8px] border border-[#DDD8FA] bg-[#FAF9FF] p-2">
+                        <input
+                          type="text"
+                          value={saveBgPresetName}
+                          onChange={(e) => setSaveBgPresetName(e.target.value)}
+                          placeholder="输入背景预设名称（如：柔和粉蓝卧室）"
+                          className="flex-1 min-w-[160px] rounded-[7px] border border-[#E0E0E6] bg-white px-2.5 py-1 text-[11.5px] text-[#1E2028] focus:outline-none focus:border-[#7C5CFC]"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const name = saveBgPresetName.trim();
+                            const tags =
+                              normalizeSlotTagsText(applyBackgroundText) ||
+                              applyBackgroundText.trim();
+                            if (!name || !tags) return;
+                            const newPreset: MinimalBackgroundPreset = {
+                              id: `custom-bg-${Date.now()}`,
+                              zhName: name,
+                              note: `来自收藏卡「${applyingCard.title}」`,
+                              tags,
+                              isCustom: true,
+                            };
+                            onUpdateCustomBackgrounds([newPreset, ...customBackgrounds]);
+                            setShowSaveBgPreset(false);
+                            setSaveBgPresetNotice(`已保存「${name}」到共享层背景预设`);
+                          }}
+                          className="h-7 px-2.5 rounded-[7px] bg-[#7C5CFC] text-white text-[11px] font-medium hover:brightness-105 cursor-pointer"
+                        >
+                          保存预设
+                        </button>
+                      </div>
+                    )}
+
+                    {saveBgPresetNotice && (
+                      <p className="text-[11px] text-emerald-700 font-medium">
+                        {saveBgPresetNotice}
+                      </p>
+                    )}
                   </div>
 
                   {/* 负向提示词 */}
@@ -5714,6 +6517,778 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
                         该卡片暂未解析出可同步的采样/分辨率参数（仅套用上方已勾选的提示词）。
                       </p>
                     )}
+                  </div>
+                </section>
+
+                {/* 3. LoRA 管理（原图 LoRA · 角色卡 LoRA · 额外自定义选择） */}
+                <section className="space-y-2.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[12px] font-semibold text-[#1E2028]">
+                        3. LoRA 链路配置（原图 LoRA · 角色卡 LoRA · 额外自定义选择）
+                      </span>
+                      <span className="px-2 py-0.5 rounded-[6px] bg-[#F4F2FF] border border-[#DDD8FA] text-[11px] font-medium text-[#5B3DF5] tabular-nums">
+                        本次将启用 {effectiveComposedLoras.length}/{MAX_COMFY_LORAS} 层 LoRA
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={isRefreshingLoras}
+                      onClick={() => void handleRefreshLorasInApplyModal()}
+                      className="h-7 px-2.5 inline-flex items-center gap-1 rounded-[7px] border border-[#E0E0E6] bg-white text-[11px] font-medium text-[#4C5264] hover:border-[#7C5CFC]/50 hover:text-[#5B3DF5] disabled:opacity-50 cursor-pointer"
+                    >
+                      <RefreshCw className={`w-3 h-3 ${isRefreshingLoras ? 'animate-spin' : ''}`} />
+                      <span>
+                        {isRefreshingLoras
+                          ? '读取中...'
+                          : mergedAvailableLoras.length > 0
+                          ? `刷新本地 LoRA (${mergedAvailableLoras.length})`
+                          : '读取本地 ComfyUI LoRA'}
+                      </span>
+                    </button>
+                  </div>
+
+                  {effectiveComposedLoras.length > 6 && (
+                    <div className="flex items-center gap-1.5 rounded-[8px] border border-amber-200 bg-amber-50 px-3 py-1.5 text-[11px] text-amber-800">
+                      <AlertCircle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                      <span>
+                        当前已启用 {effectiveComposedLoras.length} 层 LoRA（超过 6 层会增大显存压力并可能互相稀释特征），建议仅保留需要叠加的层。
+                      </span>
+                    </div>
+                  )}
+
+                  {mergedAvailableLoras.length > 0 && (
+                    <datalist id="apply-modal-lora-options">
+                      {mergedAvailableLoras.map((opt) => (
+                        <option key={opt} value={opt} />
+                      ))}
+                    </datalist>
+                  )}
+
+                  {/* A. 原图 LoRA */}
+                  <div className="rounded-[11px] border border-[#E0E0E6] bg-white p-3 space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <span className="text-[12px] font-semibold text-[#1E2028]">
+                          原图 LoRA（来自收藏卡）
+                        </span>
+                        <span className="text-[10.5px] text-[#686E7E] tabular-nums">
+                          {applyOriginalLoras.length > 0
+                            ? `识别到 ${applyOriginalLoras.length} 个`
+                            : '未检测到独立 LoRA'}
+                        </span>
+                      </div>
+                      {applyOriginalLoras.length > 0 && (
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setApplyOriginalLoras((prev) =>
+                                prev.map((item) => ({ ...item, enabled: true }))
+                              )
+                            }
+                            className="px-2 py-0.5 rounded-[6px] border border-[#DDD8FA] bg-[#F5F2FF] text-[10.5px] font-medium text-[#5B3DF5] hover:bg-[#EDE9FE] cursor-pointer"
+                          >
+                            全选原图
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setApplyOriginalLoras((prev) =>
+                                prev.map((item) => ({ ...item, enabled: false }))
+                              )
+                            }
+                            className="px-2 py-0.5 rounded-[6px] border border-[#E0E0E6] bg-[#FAFAFC] text-[10.5px] text-[#5A6072] hover:text-[#1E2028] cursor-pointer"
+                          >
+                            清空勾选
+                          </button>
+                        </div>
+                      )}
+                    </div>
+
+                    {applyOriginalLoras.length === 0 ? (
+                      <p className="text-[11px] text-[#8E94A4]">
+                        该收藏图的工作流节点、PNG 元数据及提示词中未检测到 &lt;lora:...&gt; 或独立 LoraLoader 节点。
+                      </p>
+                    ) : (
+                      <div className="space-y-1.5">
+                        <p className="text-[10.5px] text-[#686E7E]">
+                          默认不自动启用原图 LoRA，避免原图角色模型污染当前角色；如需复刻原图画风/服装/动作 LoRA，请勾选并调整权重：
+                        </p>
+                        {applyOriginalLoras.map((orig, idx) => {
+                          const alreadyInChar = applyCharLoras.some(
+                            (cl) =>
+                              cl.enabled !== false &&
+                              cl.name.trim().toLowerCase() === orig.name.trim().toLowerCase()
+                          );
+                          const alreadySavedCustom = customLoras.some(
+                            (cl) => cl.name.trim().toLowerCase() === orig.name.trim().toLowerCase()
+                          );
+                          return (
+                            <div
+                              key={orig.id}
+                              className={`flex flex-wrap sm:flex-nowrap items-center gap-1.5 rounded-[8px] border px-2.5 py-1.5 text-[11px] ${
+                                orig.enabled
+                                  ? 'border-[#7C5CFC]/45 bg-[#FAF8FF]'
+                                  : 'border-[#EAEAEF] bg-[#FAFAFC]'
+                              }`}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={orig.enabled}
+                                onChange={(e) =>
+                                  setApplyOriginalLoras((prev) =>
+                                    prev.map((item, i) =>
+                                      i === idx ? { ...item, enabled: e.target.checked } : item
+                                    )
+                                  )
+                                }
+                                className="w-3.5 h-3.5 accent-[#7C5CFC] shrink-0 cursor-pointer"
+                              />
+                              <span className="flex-1 min-w-[140px] font-mono text-[#1E2028] truncate" title={orig.name}>
+                                {orig.name}
+                              </span>
+                              <span className="px-1.5 py-0.5 rounded-[5px] bg-white border border-[#E0E0E6] text-[10px] text-[#686E7E] shrink-0">
+                                {orig.source}
+                              </span>
+                              {alreadyInChar && (
+                                <span className="px-1.5 py-0.5 rounded-[5px] bg-emerald-50 border border-emerald-200 text-[10px] text-emerald-700 shrink-0">
+                                  角色方案已启用
+                                </span>
+                              )}
+                              <div className="flex items-center gap-1 shrink-0 tabular-nums">
+                                <input
+                                  type="number"
+                                  min={LORA_WEIGHT_MIN}
+                                  max={LORA_WEIGHT_MAX}
+                                  step={0.05}
+                                  value={orig.model}
+                                  title="Model 权重"
+                                  onChange={(e) => {
+                                    const parsed = parseFloat(e.target.value);
+                                    setApplyOriginalLoras((prev) =>
+                                      prev.map((item, i) =>
+                                        i === idx
+                                          ? {
+                                              ...item,
+                                              model: Number.isFinite(parsed)
+                                                ? clampLoraWeight(parsed, 0)
+                                                : 0,
+                                            }
+                                          : item
+                                      )
+                                    );
+                                  }}
+                                  className="w-13 rounded-[6px] border border-[#E0E0E6] bg-white px-1 py-0.5 text-center font-mono text-[#1E2028]"
+                                />
+                                <span className="text-[#949AA8]">/</span>
+                                <input
+                                  type="number"
+                                  min={LORA_WEIGHT_MIN}
+                                  max={LORA_WEIGHT_MAX}
+                                  step={0.05}
+                                  value={orig.clip}
+                                  title="Clip 权重"
+                                  onChange={(e) => {
+                                    const parsed = parseFloat(e.target.value);
+                                    setApplyOriginalLoras((prev) =>
+                                      prev.map((item, i) =>
+                                        i === idx
+                                          ? {
+                                              ...item,
+                                              clip: Number.isFinite(parsed)
+                                                ? clampLoraWeight(parsed, 0)
+                                                : 0,
+                                            }
+                                          : item
+                                      )
+                                    );
+                                  }}
+                                  className="w-13 rounded-[6px] border border-[#E0E0E6] bg-white px-1 py-0.5 text-center font-mono text-[#1E2028]"
+                                />
+                              </div>
+                              {onUpdateCustomLoras && !alreadySavedCustom && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const savedItem: ComfyLoraItem = {
+                                      id: `custom-lora-${Date.now()}-${idx}`,
+                                      name: orig.name.trim(),
+                                      model: clampLoraWeight(orig.model, 1.0),
+                                      clip: clampLoraWeight(orig.clip, 1.0),
+                                      condition: null,
+                                      enabled: true,
+                                      note: `来自收藏卡「${applyingCard.title}」`,
+                                    };
+                                    onUpdateCustomLoras([savedItem, ...customLoras]);
+                                    setApplyCustomLoraNotice(`已收藏原图 LoRA「${orig.name}」到常用库`);
+                                  }}
+                                  className="px-2 py-0.5 rounded-[6px] border border-[#DDD8FA] bg-white text-[10.5px] font-medium text-[#5B3DF5] hover:bg-[#F5F2FF] cursor-pointer shrink-0"
+                                >
+                                  存为常用
+                                </button>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* B. 角色卡 LoRA */}
+                  <div className="rounded-[11px] border border-[#E0E0E6] bg-white p-3 space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <span className="text-[12px] font-semibold text-[#1E2028]">
+                          角色卡 LoRA（当前方案「{activeProfile.name}」）
+                        </span>
+                        <span className="text-[10.5px] text-[#686E7E] tabular-nums">
+                          已启用 {applyCharLoras.filter((l) => l.enabled !== false).length}/{applyCharLoras.length} 层
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setApplyCharLoras(buildCharLorasForTarget(applyTargetCharId))}
+                        className="text-[10.5px] text-[#5B3DF5] hover:underline cursor-pointer"
+                      >
+                        恢复角色默认勾选
+                      </button>
+                    </div>
+
+                    {applyCharLoras.length === 0 ? (
+                      <p className="text-[11px] text-[#8E94A4]">
+                        当前模型方案未配置默认 LoRA（可直接在下方选择额外 LoRA）。
+                      </p>
+                    ) : (
+                      <div className="space-y-1.5">
+                        {applyCharLoras.map((lora, idx) => {
+                          const isEnabled = lora.enabled !== false;
+                          const isIbukiOnly = lora.condition === 'ibuki_only';
+                          const isIsolatedForCurrent =
+                            isIbukiOnly && !applyTargetCharacter?.enableFourthLora;
+                          return (
+                            <div
+                              key={lora.id || `apply-char-lora-${idx}`}
+                              className={`flex flex-wrap sm:flex-nowrap items-center gap-1.5 rounded-[8px] border px-2.5 py-1.5 text-[11px] transition-opacity ${
+                                isEnabled
+                                  ? 'border-[#EAEAEF] bg-[#FAFAFC]'
+                                  : 'border-[#E6E7EE] bg-[#F4F4F7] opacity-65'
+                              }`}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={isEnabled}
+                                onChange={(e) =>
+                                  setApplyCharLoras((prev) =>
+                                    prev.map((item, i) =>
+                                      i === idx ? { ...item, enabled: e.target.checked } : item
+                                    )
+                                  )
+                                }
+                                className="w-3.5 h-3.5 accent-[#7C5CFC] shrink-0 cursor-pointer"
+                              />
+                              <span className="font-mono text-[#8E94A4] w-5 shrink-0 tabular-nums">
+                                [{idx + 1}]
+                              </span>
+                              <span className="flex-1 min-w-[140px] font-mono text-[#1E2028] truncate" title={lora.name}>
+                                {lora.name || '（未命名 LoRA）'}
+                              </span>
+                              {isIbukiOnly && (
+                                <span
+                                  className={`px-1.5 py-0.5 rounded-[5px] text-[10px] font-medium shrink-0 ${
+                                    isIsolatedForCurrent
+                                      ? 'bg-amber-50 border border-amber-200 text-amber-800'
+                                      : 'bg-[#F5F2FF] border border-[#DDD8FA] text-[#5B3DF5]'
+                                  }`}
+                                >
+                                  {isIsolatedForCurrent ? '仅伊专属 · 已隔离' : '伊专属 · 已启用'}
+                                </span>
+                              )}
+                              {lora.triggerWords?.trim() && (
+                                <span
+                                  className="max-w-[140px] truncate px-1.5 py-0.5 rounded-[5px] bg-white border border-[#E0E0E6] text-[10px] font-mono text-[#5A6072]"
+                                  title={`触发词：${lora.triggerWords}`}
+                                >
+                                  词:{lora.triggerWords}
+                                </span>
+                              )}
+                              <div className="flex items-center gap-1 shrink-0 tabular-nums">
+                                <input
+                                  type="number"
+                                  min={LORA_WEIGHT_MIN}
+                                  max={LORA_WEIGHT_MAX}
+                                  step={0.05}
+                                  value={lora.model}
+                                  title="Model 权重"
+                                  onChange={(e) => {
+                                    const parsed = parseFloat(e.target.value);
+                                    setApplyCharLoras((prev) =>
+                                      prev.map((item, i) =>
+                                        i === idx
+                                          ? {
+                                              ...item,
+                                              model: Number.isFinite(parsed)
+                                                ? clampLoraWeight(parsed, 0)
+                                                : 0,
+                                            }
+                                          : item
+                                      )
+                                    );
+                                  }}
+                                  className="w-13 rounded-[6px] border border-[#E0E0E6] bg-white px-1 py-0.5 text-center font-mono text-[#1E2028]"
+                                />
+                                <span className="text-[#949AA8]">/</span>
+                                <input
+                                  type="number"
+                                  min={LORA_WEIGHT_MIN}
+                                  max={LORA_WEIGHT_MAX}
+                                  step={0.05}
+                                  value={lora.clip}
+                                  title="Clip 权重"
+                                  onChange={(e) => {
+                                    const parsed = parseFloat(e.target.value);
+                                    setApplyCharLoras((prev) =>
+                                      prev.map((item, i) =>
+                                        i === idx
+                                          ? {
+                                              ...item,
+                                              clip: Number.isFinite(parsed)
+                                                ? clampLoraWeight(parsed, 0)
+                                                : 0,
+                                            }
+                                          : item
+                                      )
+                                    );
+                                  }}
+                                  className="w-13 rounded-[6px] border border-[#E0E0E6] bg-white px-1 py-0.5 text-center font-mono text-[#1E2028]"
+                                />
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* C. 额外 LoRA / 自定义添加选择 */}
+                  <div className="rounded-[11px] border border-[#E0E0E6] bg-white p-3 space-y-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="text-[12px] font-semibold text-[#1E2028]">
+                        额外 LoRA 与自定义添加选择
+                      </span>
+                      <span className="text-[10.5px] text-[#686E7E]">
+                        可从本地列表/常用库快速勾选，或手动输入自定义 LoRA（权重范围 {LORA_WEIGHT_MIN}~{LORA_WEIGHT_MAX}）
+                      </span>
+                    </div>
+
+                    {/* 常用自定义 LoRA 快捷库 */}
+                    {customLoras.length > 0 && (
+                      <div className="space-y-1">
+                        <div className="text-[10.5px] font-medium text-[#5A6072]">
+                          常用自定义 LoRA 库（点击添加到本次复刻）：
+                        </div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {customLoras.map((saved, sIdx) => {
+                            const isAdded = applyExtraLoras.some(
+                              (ex) =>
+                                ex.enabled !== false &&
+                                ex.name.trim().toLowerCase() === saved.name.trim().toLowerCase()
+                            );
+                            return (
+                              <div
+                                key={saved.id || `saved-lora-${sIdx}`}
+                                className={`inline-flex items-center rounded-[7px] border text-[11px] ${
+                                  isAdded
+                                    ? 'border-[#7C5CFC] bg-[#F5F2FF] text-[#5B3DF5]'
+                                    : 'border-[#E0E0E6] bg-[#FAFAFC] text-[#373C4B]'
+                                }`}
+                              >
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setApplyExtraLoras((prev) => {
+                                      const existsIdx = prev.findIndex(
+                                        (x) =>
+                                          x.name.trim().toLowerCase() ===
+                                          saved.name.trim().toLowerCase()
+                                      );
+                                      if (existsIdx >= 0) {
+                                        return prev.map((x, i) =>
+                                          i === existsIdx
+                                            ? { ...x, enabled: !(x.enabled !== false) }
+                                            : x
+                                        );
+                                      }
+                                      return [
+                                        ...prev,
+                                        {
+                                          ...saved,
+                                          id: `extra-lora-${Date.now()}-${sIdx}`,
+                                          enabled: true,
+                                          condition: null,
+                                        },
+                                      ];
+                                    });
+                                  }}
+                                  className="px-2 py-1 inline-flex items-center gap-1 font-mono cursor-pointer hover:text-[#5B3DF5]"
+                                >
+                                  <span>{isAdded ? '✓' : '+'}</span>
+                                  <span className="max-w-[180px] truncate">{saved.name}</span>
+                                  <span className="text-[10px] opacity-75">
+                                    ({saved.model}/{saved.clip})
+                                  </span>
+                                  {saved.note && (
+                                    <span className="font-sans text-[10px] text-[#686E7E]">
+                                      · {saved.note}
+                                    </span>
+                                  )}
+                                </button>
+                                {onUpdateCustomLoras && (
+                                  <button
+                                    type="button"
+                                    title="从常用库删除"
+                                    onClick={() =>
+                                      onUpdateCustomLoras(
+                                        customLoras.filter((_, i) => i !== sIdx)
+                                      )
+                                    }
+                                    className="px-1.5 py-1 text-[#949AA8] hover:text-[#E85D75] cursor-pointer border-l border-black/5"
+                                  >
+                                    <X className="w-3 h-3" />
+                                  </button>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* 手动输入或从 ComfyUI 列表添加 */}
+                    <div className="rounded-[9px] border border-[#EAEAEF] bg-[#FAF9FF] p-2.5 space-y-2">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <input
+                          type="text"
+                          list={
+                            mergedAvailableLoras.length > 0
+                              ? 'apply-modal-lora-options'
+                              : undefined
+                          }
+                          value={applyCustomLoraDraftName}
+                          onChange={(e) => setApplyCustomLoraDraftName(e.target.value)}
+                          placeholder="输入或选择额外 LoRA 文件名（如 style_v1.safetensors）"
+                          className="flex-1 min-w-[180px] rounded-[7px] border border-[#E0E0E6] bg-white px-2.5 py-1 text-[11.5px] font-mono text-[#1E2028] focus:outline-none focus:border-[#7C5CFC]"
+                        />
+                        {mergedAvailableLoras.length > 0 && (
+                          <select
+                            aria-label="从 ComfyUI LoRA 列表选择"
+                            value={
+                              mergedAvailableLoras.includes(applyCustomLoraDraftName)
+                                ? applyCustomLoraDraftName
+                                : ''
+                            }
+                            onChange={(e) => {
+                              if (e.target.value) {
+                                setApplyCustomLoraDraftName(e.target.value);
+                              }
+                            }}
+                            className="max-w-[165px] h-7 rounded-[7px] border border-[#E0E0E6] bg-white px-2 text-[11px] font-mono text-[#373C4B] focus:outline-none focus:border-[#7C5CFC]"
+                          >
+                            <option value="">本地列表 ({mergedAvailableLoras.length})</option>
+                            {mergedAvailableLoras.map((opt) => (
+                              <option key={opt} value={opt}>
+                                {opt}
+                              </option>
+                            ))}
+                          </select>
+                        )}
+                        <div className="flex items-center gap-1 tabular-nums text-[11px]">
+                          <span className="text-[#686E7E]">M/C:</span>
+                          <input
+                            type="number"
+                            min={LORA_WEIGHT_MIN}
+                            max={LORA_WEIGHT_MAX}
+                            step={0.05}
+                            value={applyCustomLoraDraftModel}
+                            onChange={(e) => {
+                              const parsed = parseFloat(e.target.value);
+                              setApplyCustomLoraDraftModel(
+                                Number.isFinite(parsed) ? clampLoraWeight(parsed, 0) : 0
+                              );
+                            }}
+                            className="w-13 rounded-[7px] border border-[#E0E0E6] bg-white px-1 py-1 text-center font-mono text-[#1E2028]"
+                          />
+                          <span className="text-[#949AA8]">/</span>
+                          <input
+                            type="number"
+                            min={LORA_WEIGHT_MIN}
+                            max={LORA_WEIGHT_MAX}
+                            step={0.05}
+                            value={applyCustomLoraDraftClip}
+                            onChange={(e) => {
+                              const parsed = parseFloat(e.target.value);
+                              setApplyCustomLoraDraftClip(
+                                Number.isFinite(parsed) ? clampLoraWeight(parsed, 0) : 0
+                              );
+                            }}
+                            className="w-13 rounded-[7px] border border-[#E0E0E6] bg-white px-1 py-1 text-center font-mono text-[#1E2028]"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <input
+                          type="text"
+                          value={applyCustomLoraDraftTrigger}
+                          onChange={(e) => setApplyCustomLoraDraftTrigger(e.target.value)}
+                          placeholder="可选触发词（启用时自动拼入正向提示词）"
+                          className="flex-1 min-w-[160px] rounded-[7px] border border-[#E0E0E6] bg-white px-2.5 py-1 text-[11px] font-mono text-[#373C4B] focus:outline-none focus:border-[#7C5CFC]"
+                        />
+                        <input
+                          type="text"
+                          value={applyCustomLoraDraftNote}
+                          onChange={(e) => setApplyCustomLoraDraftNote(e.target.value)}
+                          placeholder="备注（如画风/光影）"
+                          className="w-full sm:w-[140px] rounded-[7px] border border-[#E0E0E6] bg-white px-2 py-1 text-[11px] text-[#4C5264] focus:outline-none focus:border-[#7C5CFC]"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const name = applyCustomLoraDraftName.trim();
+                            if (!name) {
+                              setApplyCustomLoraNotice('请先输入或选择 LoRA 文件名');
+                              return;
+                            }
+                            if (effectiveComposedLoras.length >= MAX_COMFY_LORAS) {
+                              setApplyCustomLoraNotice(`最多支持同时启用 ${MAX_COMFY_LORAS} 层 LoRA`);
+                              return;
+                            }
+                            const newItem: ComfyLoraItem = {
+                              id: `extra-lora-${Date.now()}`,
+                              name,
+                              model: clampLoraWeight(applyCustomLoraDraftModel, 1.0),
+                              clip: clampLoraWeight(applyCustomLoraDraftClip, 1.0),
+                              condition: null,
+                              enabled: true,
+                              triggerWords: applyCustomLoraDraftTrigger.trim(),
+                              note: applyCustomLoraDraftNote.trim(),
+                            };
+                            setApplyExtraLoras((prev) => [...prev, newItem]);
+                            setApplyCustomLoraDraftName('');
+                            setApplyCustomLoraDraftTrigger('');
+                            setApplyCustomLoraDraftNote('');
+                            setApplyCustomLoraNotice(`已添加到本次复刻：${name}`);
+                          }}
+                          className="h-7 px-2.5 inline-flex items-center gap-1 rounded-[7px] bg-[#7C5CFC] text-white text-[11px] font-medium hover:brightness-105 cursor-pointer"
+                        >
+                          <Plus className="w-3 h-3" />
+                          <span>添加到本次</span>
+                        </button>
+                        {onUpdateCustomLoras && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const name = applyCustomLoraDraftName.trim();
+                              if (!name) {
+                                setApplyCustomLoraNotice('请先输入或选择 LoRA 文件名');
+                                return;
+                              }
+                              const savedItem: ComfyLoraItem = {
+                                id: `custom-lora-${Date.now()}`,
+                                name,
+                                model: clampLoraWeight(applyCustomLoraDraftModel, 1.0),
+                                clip: clampLoraWeight(applyCustomLoraDraftClip, 1.0),
+                                condition: null,
+                                enabled: true,
+                                triggerWords: applyCustomLoraDraftTrigger.trim(),
+                                note: applyCustomLoraDraftNote.trim(),
+                              };
+                              const filtered = customLoras.filter(
+                                (c) => c.name.trim().toLowerCase() !== name.toLowerCase()
+                              );
+                              onUpdateCustomLoras([savedItem, ...filtered]);
+                              setApplyExtraLoras((prev) => {
+                                if (
+                                  prev.some(
+                                    (x) => x.name.trim().toLowerCase() === name.toLowerCase()
+                                  )
+                                ) {
+                                  return prev;
+                                }
+                                return [...prev, { ...savedItem, id: `extra-lora-${Date.now()}` }];
+                              });
+                              setApplyCustomLoraDraftName('');
+                              setApplyCustomLoraDraftTrigger('');
+                              setApplyCustomLoraDraftNote('');
+                              setApplyCustomLoraNotice(`已添加到本次并存为常用：${name}`);
+                            }}
+                            className="h-7 px-2.5 inline-flex items-center gap-1 rounded-[7px] border border-[#DDD8FA] bg-white text-[#5B3DF5] text-[11px] font-medium hover:bg-[#F5F2FF] cursor-pointer"
+                          >
+                            <Save className="w-3 h-3" />
+                            <span>添加并存为常用</span>
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {applyCustomLoraNotice && (
+                      <p className="text-[11px] text-[#5B3DF5] font-medium">
+                        {applyCustomLoraNotice}
+                      </p>
+                    )}
+
+                    {/* 已添加的额外自定义 LoRA 列表 */}
+                    {applyExtraLoras.length > 0 && (
+                      <div className="space-y-1.5">
+                        <div className="text-[10.5px] font-medium text-[#5A6072]">
+                          已选择的额外 LoRA（{applyExtraLoras.filter((e) => e.enabled !== false).length} 个启用）：
+                        </div>
+                        {applyExtraLoras.map((extra, idx) => {
+                          const isEnabled = extra.enabled !== false;
+                          return (
+                            <div
+                              key={extra.id || `extra-row-${idx}`}
+                              className={`rounded-[8px] border px-2.5 py-1.5 space-y-1 text-[11px] ${
+                                isEnabled
+                                  ? 'border-[#7C5CFC]/45 bg-[#FAF8FF]'
+                                  : 'border-[#E6E7EE] bg-[#F4F4F7] opacity-65'
+                              }`}
+                            >
+                              <div className="flex flex-wrap sm:flex-nowrap items-center gap-1.5">
+                                <input
+                                  type="checkbox"
+                                  checked={isEnabled}
+                                  onChange={(e) =>
+                                    setApplyExtraLoras((prev) =>
+                                      prev.map((item, i) =>
+                                        i === idx ? { ...item, enabled: e.target.checked } : item
+                                      )
+                                    )
+                                  }
+                                  className="w-3.5 h-3.5 accent-[#7C5CFC] shrink-0 cursor-pointer"
+                                />
+                                <input
+                                  type="text"
+                                  list={
+                                    mergedAvailableLoras.length > 0
+                                      ? 'apply-modal-lora-options'
+                                      : undefined
+                                  }
+                                  value={extra.name}
+                                  onChange={(e) =>
+                                    setApplyExtraLoras((prev) =>
+                                      prev.map((item, i) =>
+                                        i === idx ? { ...item, name: e.target.value } : item
+                                      )
+                                    )
+                                  }
+                                  className="flex-1 min-w-[140px] rounded-[6px] border border-[#E0E0E6] bg-white px-2 py-0.5 font-mono text-[#1E2028]"
+                                />
+                                <div className="flex items-center gap-1 shrink-0 tabular-nums">
+                                  <input
+                                    type="number"
+                                    min={LORA_WEIGHT_MIN}
+                                    max={LORA_WEIGHT_MAX}
+                                    step={0.05}
+                                    value={extra.model}
+                                    onChange={(e) => {
+                                      const parsed = parseFloat(e.target.value);
+                                      setApplyExtraLoras((prev) =>
+                                        prev.map((item, i) =>
+                                          i === idx
+                                            ? {
+                                                ...item,
+                                                model: Number.isFinite(parsed)
+                                                  ? clampLoraWeight(parsed, 0)
+                                                  : 0,
+                                              }
+                                            : item
+                                        )
+                                      );
+                                    }}
+                                    className="w-13 rounded-[6px] border border-[#E0E0E6] bg-white px-1 py-0.5 text-center font-mono text-[#1E2028]"
+                                  />
+                                  <span className="text-[#949AA8]">/</span>
+                                  <input
+                                    type="number"
+                                    min={LORA_WEIGHT_MIN}
+                                    max={LORA_WEIGHT_MAX}
+                                    step={0.05}
+                                    value={extra.clip}
+                                    onChange={(e) => {
+                                      const parsed = parseFloat(e.target.value);
+                                      setApplyExtraLoras((prev) =>
+                                        prev.map((item, i) =>
+                                          i === idx
+                                            ? {
+                                                ...item,
+                                                clip: Number.isFinite(parsed)
+                                                  ? clampLoraWeight(parsed, 0)
+                                                  : 0,
+                                              }
+                                            : item
+                                        )
+                                      );
+                                    }}
+                                    className="w-13 rounded-[6px] border border-[#E0E0E6] bg-white px-1 py-0.5 text-center font-mono text-[#1E2028]"
+                                  />
+                                </div>
+                                <button
+                                  type="button"
+                                  title="移除此额外 LoRA"
+                                  onClick={() =>
+                                    setApplyExtraLoras((prev) => prev.filter((_, i) => i !== idx))
+                                  }
+                                  className="p-1 rounded-[6px] text-[#686E7E] hover:bg-[#FFF1F3] hover:text-[#E85D75] cursor-pointer"
+                                >
+                                  <X className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                              <div className="flex flex-wrap items-center gap-1.5 pl-5">
+                                <input
+                                  type="text"
+                                  value={extra.triggerWords ?? ''}
+                                  onChange={(e) =>
+                                    setApplyExtraLoras((prev) =>
+                                      prev.map((item, i) =>
+                                        i === idx ? { ...item, triggerWords: e.target.value } : item
+                                      )
+                                    )
+                                  }
+                                  placeholder="触发词（可选）"
+                                  className="flex-1 min-w-[140px] rounded-[6px] border border-[#EAEAEF] bg-white px-2 py-0.5 text-[10.5px] font-mono text-[#373C4B]"
+                                />
+                                <input
+                                  type="text"
+                                  value={extra.note ?? ''}
+                                  onChange={(e) =>
+                                    setApplyExtraLoras((prev) =>
+                                      prev.map((item, i) =>
+                                        i === idx ? { ...item, note: e.target.value } : item
+                                      )
+                                    )
+                                  }
+                                  placeholder="备注（可选）"
+                                  className="w-full sm:w-[130px] rounded-[6px] border border-[#EAEAEF] bg-white px-2 py-0.5 text-[10.5px] text-[#4C5264]"
+                                />
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    <label className="pt-1 border-t border-[#EAEAEF] flex items-center gap-2 text-[11px] text-[#4C5264] cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={applySyncLorasToProfile}
+                        onChange={(e) => setApplySyncLorasToProfile(e.target.checked)}
+                        className="w-3.5 h-3.5 accent-[#7C5CFC]"
+                      />
+                      <span>
+                        套用时同步当前已选 LoRA 组合到模型方案「{activeProfile.name}」（默认仅对本次生图生效，不污染全局方案）
+                      </span>
+                    </label>
                   </div>
                 </section>
               </div>

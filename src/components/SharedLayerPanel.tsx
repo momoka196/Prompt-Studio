@@ -3,6 +3,7 @@ import {
   Check,
   ChevronRight,
   Download,
+  Pencil,
   Plus,
   RotateCcw,
   Sparkles,
@@ -98,6 +99,17 @@ export const SharedLayerPanel: React.FC<SharedLayerPanelProps> = ({
   const [newTagWeights, setNewTagWeights] = useState<Record<string, number>>({});
   const [showBgSave, setShowBgSave] = useState(false);
   const [bgSaveName, setBgSaveName] = useState('');
+  const [showBgCreate, setShowBgCreate] = useState(false);
+  const [newBgName, setNewBgName] = useState('');
+  const [newBgNote, setNewBgNote] = useState('');
+  const [newBgTags, setNewBgTags] = useState('');
+  const [newBgApplyImmediately, setNewBgApplyImmediately] = useState(true);
+  const [newBgError, setNewBgError] = useState<string | null>(null);
+  const [editingBgId, setEditingBgId] = useState<string | null>(null);
+  const [editBgName, setEditBgName] = useState('');
+  const [editBgNote, setEditBgNote] = useState('');
+  const [editBgTags, setEditBgTags] = useState('');
+  const [editBgError, setEditBgError] = useState<string | null>(null);
   const [showBgImport, setShowBgImport] = useState(false);
   const [bgImportText, setBgImportText] = useState('');
   const [bgImportError, setBgImportError] = useState<string | null>(null);
@@ -116,26 +128,36 @@ export const SharedLayerPanel: React.FC<SharedLayerPanelProps> = ({
   );
 
   const currentBgTrimmed = shared.background.text.trim();
+  const currentBgNormalized = normalizeSlotTagsText(currentBgTrimmed) || currentBgTrimmed;
   const defaultBgTrimmed = DEFAULT_STUDIO_CONFIG.shared.background.text.trim();
+
+  const isBgPresetMatch = (bg: MinimalBackgroundPreset, text: string): boolean => {
+    const trimmed = text.trim();
+    if (!trimmed) return false;
+    if (bg.tags.trim() === trimmed) return true;
+    const normBg = normalizeSlotTagsText(bg.tags) || bg.tags.trim();
+    const normText = normalizeSlotTagsText(trimmed) || trimmed;
+    return Boolean(normBg && normText && normBg === normText);
+  };
 
   const activeBgPreset = useMemo(() => {
     if (!currentBgTrimmed) return null;
     const preferredId = shared.selectedBackgroundId ?? cachedBgSelection.id;
     if (preferredId) {
       const byId = allBackgrounds.find(
-        (bg) => bg.id === preferredId && bg.tags.trim() === currentBgTrimmed
+        (bg) => bg.id === preferredId && isBgPresetMatch(bg, currentBgTrimmed)
       );
       if (byId) return byId;
     }
-    return (
-      allBackgrounds.find((bg) => bg.tags.trim() === currentBgTrimmed) ?? null
-    );
+    return allBackgrounds.find((bg) => isBgPresetMatch(bg, currentBgTrimmed)) ?? null;
   }, [allBackgrounds, currentBgTrimmed, shared.selectedBackgroundId, cachedBgSelection.id]);
 
   const activeBgLabel = activeBgPreset
     ? activeBgPreset.zhName
     : !currentBgTrimmed
     ? '未设置场景'
+    : shared.selectedBackgroundName?.trim()
+    ? shared.selectedBackgroundName.trim()
     : currentBgTrimmed === defaultBgTrimmed
     ? '默认午后窗边教室'
     : '自定义场景';
@@ -176,7 +198,7 @@ export const SharedLayerPanel: React.FC<SharedLayerPanelProps> = ({
     if (key === 'background' && patch.text !== undefined) {
       const nextTrimmed = patch.text.trim();
       const matched = nextTrimmed
-        ? allBackgrounds.find((bg) => bg.tags.trim() === nextTrimmed) ?? null
+        ? allBackgrounds.find((bg) => isBgPresetMatch(bg, nextTrimmed)) ?? null
         : null;
       const nextId = matched?.id ?? null;
       const nextName = matched?.zhName ?? null;
@@ -342,8 +364,9 @@ export const SharedLayerPanel: React.FC<SharedLayerPanelProps> = ({
   };
 
   const handleSaveCurrentBackground = () => {
-    const tags = shared.background.text.trim();
-    if (!tags) return;
+    const rawTags = shared.background.text.trim();
+    if (!rawTags) return;
+    const tags = normalizeSlotTagsText(rawTags) || rawTags;
     const zhName = bgSaveName.trim() || `自定义背景 #${customBackgrounds.length + 1}`;
     const newItem: MinimalBackgroundPreset = {
       id: `custom-bg-${Date.now()}`,
@@ -358,9 +381,97 @@ export const SharedLayerPanel: React.FC<SharedLayerPanelProps> = ({
       ...shared,
       selectedBackgroundId: newItem.id,
       selectedBackgroundName: newItem.zhName,
+      background: {
+        ...shared.background,
+        text: tags,
+      },
     });
     setBgSaveName('');
     setShowBgSave(false);
+  };
+
+  const handleCreateCustomBackground = () => {
+    const cleanTags = normalizeSlotTagsText(newBgTags) || newBgTags.trim();
+    if (!cleanTags) {
+      setNewBgError('请填写英文背景提示词（tags）');
+      return;
+    }
+    const zhName = newBgName.trim() || `自定义背景 #${customBackgrounds.length + 1}`;
+    const note = newBgNote.trim() || '自定义背景预设';
+    const newItem: MinimalBackgroundPreset = {
+      id: `custom-bg-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+      zhName,
+      note,
+      tags: cleanTags,
+      isCustom: true,
+    };
+    onUpdateCustomBackgrounds([newItem, ...customBackgrounds]);
+    if (newBgApplyImmediately) {
+      persistBgSelection(newItem.id, newItem.zhName);
+      onUpdateShared({
+        ...shared,
+        selectedBackgroundId: newItem.id,
+        selectedBackgroundName: newItem.zhName,
+        background: {
+          ...shared.background,
+          text: cleanTags,
+        },
+      });
+    }
+    setNewBgName('');
+    setNewBgNote('');
+    setNewBgTags('');
+    setNewBgError(null);
+    setShowBgCreate(false);
+  };
+
+  const handleStartEditCustomBackground = (bg: MinimalBackgroundPreset) => {
+    setEditingBgId(bg.id);
+    setEditBgName(bg.zhName);
+    setEditBgNote(bg.note);
+    setEditBgTags(bg.tags);
+    setEditBgError(null);
+    setShowBgCreate(false);
+    setShowBgSave(false);
+    setShowBgImport(false);
+  };
+
+  const handleSaveEditCustomBackground = () => {
+    if (!editingBgId) return;
+    const cleanTags = normalizeSlotTagsText(editBgTags) || editBgTags.trim();
+    if (!cleanTags) {
+      setEditBgError('英文背景提示词不能为空');
+      return;
+    }
+    const existing = customBackgrounds.find((b) => b.id === editingBgId);
+    const zhName = editBgName.trim() || existing?.zhName || '自定义背景';
+    const note = editBgNote.trim() || '自定义背景预设';
+    const wasActive =
+      activeBgPreset?.id === editingBgId ||
+      shared.selectedBackgroundId === editingBgId ||
+      (existing ? isBgPresetMatch(existing, currentBgTrimmed) : false);
+
+    onUpdateCustomBackgrounds(
+      customBackgrounds.map((item) =>
+        item.id === editingBgId
+          ? { ...item, zhName, note, tags: cleanTags, isCustom: true }
+          : item
+      )
+    );
+    if (wasActive) {
+      persistBgSelection(editingBgId, zhName);
+      onUpdateShared({
+        ...shared,
+        selectedBackgroundId: editingBgId,
+        selectedBackgroundName: zhName,
+        background: {
+          ...shared.background,
+          text: cleanTags,
+        },
+      });
+    }
+    setEditingBgId(null);
+    setEditBgError(null);
   };
 
   const handleImportBackgrounds = (raw: string) => {
@@ -551,8 +662,24 @@ export const SharedLayerPanel: React.FC<SharedLayerPanelProps> = ({
                     <button
                       type="button"
                       onClick={() => {
-                        setShowBgSave((v) => !v);
+                        setShowBgCreate((v) => !v);
+                        setShowBgSave(false);
                         setShowBgImport(false);
+                        setEditingBgId(null);
+                        setNewBgError(null);
+                      }}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium rounded-[10px] bg-[#7C5CFC] text-white hover:brightness-105 cursor-pointer transition-all"
+                    >
+                      <Plus className="w-3 h-3" />
+                      <span>新增背景</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowBgSave((v) => !v);
+                        setShowBgCreate(false);
+                        setShowBgImport(false);
+                        setEditingBgId(null);
                       }}
                       disabled={!shared.background.text.trim()}
                       className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium rounded-[10px] bg-[#F4F2FF] text-[#6B48F5] hover:bg-[#EBE6FF] cursor-pointer disabled:opacity-40 transition-colors"
@@ -564,7 +691,9 @@ export const SharedLayerPanel: React.FC<SharedLayerPanelProps> = ({
                       type="button"
                       onClick={() => {
                         setShowBgImport((v) => !v);
+                        setShowBgCreate(false);
                         setShowBgSave(false);
+                        setEditingBgId(null);
                         setBgImportError(null);
                         setBgImportNotice(null);
                       }}
@@ -585,6 +714,133 @@ export const SharedLayerPanel: React.FC<SharedLayerPanelProps> = ({
                     )}
                   </div>
                 </div>
+
+                {showBgCreate && (
+                  <div className="rounded-[10px] border border-[#DDD8FA] bg-[#FAF9FF] p-3 space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[11.5px] font-semibold text-[#5B3DF5]">
+                        新增自定义背景预设（持久化保存）
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowBgCreate(false);
+                          setNewBgError(null);
+                        }}
+                        className="text-[11px] text-[#686E7E] hover:text-[#1E2028] cursor-pointer"
+                      >
+                        取消
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      <input
+                        type="text"
+                        value={newBgName}
+                        onChange={(e) => setNewBgName(e.target.value)}
+                        placeholder="背景名称（如：甜美粉色卧室）"
+                        className="rounded-[8px] border border-[#E2E3EA] bg-white px-2.5 py-1.5 text-[12px] text-[#1E2028] focus:border-[#7C5CFC] focus:outline-none"
+                      />
+                      <input
+                        type="text"
+                        value={newBgNote}
+                        onChange={(e) => setNewBgNote(e.target.value)}
+                        placeholder="备注说明（可选，如：柔和晨光）"
+                        className="rounded-[8px] border border-[#E2E3EA] bg-white px-2.5 py-1.5 text-[12px] text-[#1E2028] focus:border-[#7C5CFC] focus:outline-none"
+                      />
+                    </div>
+                    <textarea
+                      rows={2}
+                      value={newBgTags}
+                      onChange={(e) => {
+                        setNewBgTags(e.target.value);
+                        if (newBgError) setNewBgError(null);
+                      }}
+                      spellCheck={false}
+                      placeholder="英文提示词（例：detailed background, pastel bedroom, fluffy pillows, soft sunlight）"
+                      className="w-full rounded-[8px] border border-[#E2E3EA] bg-white px-2.5 py-1.5 text-[11.5px] font-mono text-[#1E2028] focus:border-[#7C5CFC] focus:outline-none"
+                    />
+                    {newBgError && (
+                      <p className="text-[11px] text-[#E85D75]">{newBgError}</p>
+                    )}
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <label className="inline-flex items-center gap-1.5 text-[11px] text-[#4C5264] cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={newBgApplyImmediately}
+                          onChange={(e) => setNewBgApplyImmediately(e.target.checked)}
+                          className="w-3.5 h-3.5 accent-[#7C5CFC]"
+                        />
+                        <span>保存后立即设为当前全局背景</span>
+                      </label>
+                      <button
+                        type="button"
+                        onClick={handleCreateCustomBackground}
+                        className="px-3 py-1 text-[11px] font-medium rounded-[9px] bg-gradient-to-b from-[#8A6CFF] to-[#7C5CFC] text-white cursor-pointer"
+                      >
+                        保存自定义背景
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {editingBgId && (
+                  <div className="rounded-[10px] border border-[#F5B8C4] bg-[#FFF8F9] p-3 space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[11.5px] font-semibold text-[#B42343]">
+                        编辑自定义背景预设
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditingBgId(null);
+                          setEditBgError(null);
+                        }}
+                        className="text-[11px] text-[#686E7E] hover:text-[#1E2028] cursor-pointer"
+                      >
+                        取消
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      <input
+                        type="text"
+                        value={editBgName}
+                        onChange={(e) => setEditBgName(e.target.value)}
+                        placeholder="背景名称"
+                        className="rounded-[8px] border border-[#E2E3EA] bg-white px-2.5 py-1.5 text-[12px] text-[#1E2028] focus:border-[#7C5CFC] focus:outline-none"
+                      />
+                      <input
+                        type="text"
+                        value={editBgNote}
+                        onChange={(e) => setEditBgNote(e.target.value)}
+                        placeholder="备注说明"
+                        className="rounded-[8px] border border-[#E2E3EA] bg-white px-2.5 py-1.5 text-[12px] text-[#1E2028] focus:border-[#7C5CFC] focus:outline-none"
+                      />
+                    </div>
+                    <textarea
+                      rows={2}
+                      value={editBgTags}
+                      onChange={(e) => {
+                        setEditBgTags(e.target.value);
+                        if (editBgError) setEditBgError(null);
+                      }}
+                      spellCheck={false}
+                      placeholder="英文提示词（tags）"
+                      className="w-full rounded-[8px] border border-[#E2E3EA] bg-white px-2.5 py-1.5 text-[11.5px] font-mono text-[#1E2028] focus:border-[#7C5CFC] focus:outline-none"
+                    />
+                    {editBgError && (
+                      <p className="text-[11px] text-[#E85D75]">{editBgError}</p>
+                    )}
+                    <div className="flex justify-end">
+                      <button
+                        type="button"
+                        onClick={handleSaveEditCustomBackground}
+                        className="px-3 py-1 text-[11px] font-medium rounded-[9px] bg-[#E85D75] text-white hover:brightness-105 cursor-pointer"
+                      >
+                        保存修改
+                      </button>
+                    </div>
+                  </div>
+                )}
 
                 {showBgSave && (
                   <div className="flex items-center gap-2">
@@ -682,7 +938,7 @@ export const SharedLayerPanel: React.FC<SharedLayerPanelProps> = ({
                   {allBackgrounds.map((bg) => {
                     const active =
                       activeBgPreset?.id === bg.id ||
-                      currentBgTrimmed === bg.tags.trim();
+                      isBgPresetMatch(bg, currentBgNormalized);
                     const bgTagPreview = getPromptStats(bg.tags, 3).preview;
                     return (
                       <div
@@ -737,27 +993,45 @@ export const SharedLayerPanel: React.FC<SharedLayerPanelProps> = ({
                               </span>
                             )}
                             {bg.isCustom && (
-                              <button
-                                type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  onUpdateCustomBackgrounds(
-                                    customBackgrounds.filter((i) => i.id !== bg.id)
-                                  );
-                                  if (active) {
-                                    persistBgSelection(null, null);
-                                    onUpdateShared({
-                                      ...shared,
-                                      selectedBackgroundId: null,
-                                      selectedBackgroundName: null,
-                                    });
-                                  }
-                                }}
-                                aria-label={`删除 ${bg.zhName}`}
-                                className="p-0.5 text-[#949AA8] hover:text-[#E85D75] cursor-pointer"
-                              >
-                                <X className="w-3 h-3" />
-                              </button>
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleStartEditCustomBackground(bg);
+                                  }}
+                                  aria-label={`编辑 ${bg.zhName}`}
+                                  title="编辑自定义背景"
+                                  className="p-0.5 text-[#949AA8] hover:text-[#7C5CFC] cursor-pointer"
+                                >
+                                  <Pencil className="w-3 h-3" />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    if (editingBgId === bg.id) {
+                                      setEditingBgId(null);
+                                    }
+                                    onUpdateCustomBackgrounds(
+                                      customBackgrounds.filter((i) => i.id !== bg.id)
+                                    );
+                                    if (active) {
+                                      persistBgSelection(null, null);
+                                      onUpdateShared({
+                                        ...shared,
+                                        selectedBackgroundId: null,
+                                        selectedBackgroundName: null,
+                                      });
+                                    }
+                                  }}
+                                  aria-label={`删除 ${bg.zhName}`}
+                                  title="删除自定义背景"
+                                  className="p-0.5 text-[#949AA8] hover:text-[#E85D75] cursor-pointer"
+                                >
+                                  <X className="w-3 h-3" />
+                                </button>
+                              </>
                             )}
                           </div>
                         </div>

@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import {
   CharacterConfig,
+  ComfyProfile,
   MinimalBackgroundPreset,
   SharedConfig,
   SimplePresetItem,
@@ -23,6 +24,7 @@ interface CharacterSidebarProps {
   characters: CharacterConfig[];
   selectedCharId: string;
   includeAppearance: boolean;
+  activeProfile?: ComfyProfile;
   customPresets?: SimplePresetItem[];
   customBackgrounds?: MinimalBackgroundPreset[];
   onSelectCharacter: (id: string) => void;
@@ -87,6 +89,7 @@ export const CharacterSidebar: React.FC<CharacterSidebarProps> = ({
   characters,
   selectedCharId,
   includeAppearance,
+  activeProfile,
   customPresets = [],
   customBackgrounds = [],
   onSelectCharacter,
@@ -106,6 +109,7 @@ export const CharacterSidebar: React.FC<CharacterSidebarProps> = ({
       includeAppearance,
       customPresets,
       customBackgrounds,
+      activeProfile,
     });
     try {
       await navigator.clipboard.writeText(built.fullText);

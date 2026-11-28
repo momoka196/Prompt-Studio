@@ -28,6 +28,7 @@ import {
   buildCharacterPrompt,
   buildNegativePromptWithMeta,
   getActiveLoaderKeys,
+  getActiveLorasForCharacter,
   getPromptStats,
   postProfileToComfyUI,
   splitPromptTags,
@@ -115,6 +116,7 @@ export const OutputSidebar: React.FC<OutputSidebarProps> = ({
     includeAppearance,
     customPresets,
     customBackgrounds,
+    activeProfile,
   });
   const negativeResult = buildNegativePromptWithMeta(shared, activeCharacter, {
     includeAppearance,
@@ -176,10 +178,9 @@ export const OutputSidebar: React.FC<OutputSidebarProps> = ({
         : '模型尚未绿灯校验，请先点击「校验」'
       : null;
 
-  const effectiveLoraCount = (activeProfile.loras ?? []).filter(
-    (l) =>
-      l.name.trim() &&
-      (l.condition !== 'ibuki_only' || Boolean(activeCharacter.enableFourthLora))
+  const effectiveLoraCount = getActiveLorasForCharacter(
+    activeProfile,
+    Boolean(activeCharacter.enableFourthLora)
   ).length;
 
   const handleSendToComfy = async () => {

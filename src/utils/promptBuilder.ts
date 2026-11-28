@@ -32,6 +32,76 @@ import {
   WeightedSlot,
 } from '../types/studio';
 
+export const MAX_COMFY_LORAS = 16;
+export const LORA_WEIGHT_MIN = -2.0;
+export const LORA_WEIGHT_MAX = 2.0;
+
+export function clampLoraWeight(w: number, fallback = 1.0): number {
+  if (!Number.isFinite(w)) return fallback;
+  return Math.min(LORA_WEIGHT_MAX, Math.max(LORA_WEIGHT_MIN, Math.round(w * 100) / 100));
+}
+
+export function isLoraActiveForCharacter(
+  lora: ComfyLoraItem,
+  enableFourthLora?: boolean
+): boolean {
+  if (lora.enabled === false) return false;
+  if (!lora.name || !lora.name.trim()) return false;
+  if (lora.condition === 'ibuki_only' && !enableFourthLora) return false;
+  return true;
+}
+
+export function getActiveLorasForCharacter(
+  profile: ComfyProfile | undefined,
+  enableFourthLora?: boolean
+): ComfyLoraItem[] {
+  if (!profile?.loras) return [];
+  return profile.loras
+    .filter((lora) => isLoraActiveForCharacter(lora, enableFourthLora))
+    .slice(0, MAX_COMFY_LORAS);
+}
+
+export function collectActiveLoraTriggerWords(
+  profile: ComfyProfile | undefined,
+  enableFourthLora?: boolean
+): string[] {
+  const activeLoras = getActiveLorasForCharacter(profile, enableFourthLora);
+  const seen = new Set<string>();
+  const triggers: string[] = [];
+  for (const lora of activeLoras) {
+    if (!lora.triggerWords || !lora.triggerWords.trim()) continue;
+    for (const token of splitPromptTags(lora.triggerWords)) {
+      const clean = stripWeightSyntax(token).replace(/\s+/g, ' ').trim();
+      if (!clean || seen.has(clean)) continue;
+      seen.add(clean);
+      triggers.push(token);
+    }
+  }
+  return triggers;
+}
+
+export function appendLoraTriggerWordsToPrompt(
+  positivePrompt: string,
+  triggerWords: string[]
+): string {
+  if (!triggerWords || triggerWords.length === 0) return positivePrompt;
+  const existingClean = new Set(
+    splitPromptTags(positivePrompt)
+      .map((t) => stripWeightSyntax(t).replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+  );
+  const extra: string[] = [];
+  for (const token of triggerWords) {
+    const clean = stripWeightSyntax(token).replace(/\s+/g, ' ').trim();
+    if (!clean || existingClean.has(clean)) continue;
+    existingClean.add(clean);
+    extra.push(token);
+  }
+  if (extra.length === 0) return positivePrompt;
+  const trimmed = positivePrompt.trim();
+  return trimmed ? `${trimmed}, ${extra.join(', ')}` : extra.join(', ');
+}
+
 export function clampWeight(w: number): number {
   if (!Number.isFinite(w)) return 1.0;
   return Math.min(2.0, Math.max(0.5, Math.round(w * 100) / 100));
@@ -117,6 +187,8 @@ export interface BuildPromptOptions {
   customPresets?: SimplePresetItem[];
   customBackgrounds?: MinimalBackgroundPreset[];
   selectedPresetTitles?: string[];
+  activeProfile?: ComfyProfile;
+  loraTriggerWords?: string[];
 }
 
 export type NegativeAutoGuardAnalysis = NegativeGuardMetadata;
@@ -344,7 +416,7 @@ const EXPR_CLOSED_OR_HALF_EYES_RE =
 const EXPR_BLUSH_RE = /\b(?:blush|blushing|rosy cheeks)\b/i;
 
 const GAZE_AWAY_OR_DOWN_RE =
-  /\b(?:looking down at pages|averted gaze|turning head back|looking back at viewer|looking away|looking aside|upturned pleading gaze|dreamy gaze|curious gaze|shy|closed eyes|eyes closed|closed-eye|blank stare)\b/i;
+  /\b(?:looking down at pages|averted gaze|turning head back|looking back at viewer|looking away|looking aside|looking to the side|sideways glance|glancing away|upturned pleading gaze|dreamy gaze|curious gaze|shy|closed eyes|eyes closed|closed-eye|blank stare)\b/i;
 
 const EXPLICIT_STANDING_TAG_RE =
   /\b(?:standing(?:\s+(?:firmly|upright|straight|naturally|casually|on\s+tiptoes|on\s+one\s+leg|firmly\s+on\s+(?:one\s+leg|ground)|pose|still|tall|relaxed))?|stand\s+upright|upright\s+posture|feet\s+planted(?:\s+on\s+ground)?|both\s+feet\s+(?:planted\s+)?on\s+(?:the\s+)?ground)\b/i;
@@ -1074,9 +1146,60 @@ export function buildCharacterPrompt(
   const includeAppearance = options.includeAppearance ?? true;
   const resolved = resolveAndBuildCharacterSegments(shared, character, includeAppearance);
 
+  const rawTriggerWords = [
+    ...(options.activeProfile
+      ? collectActiveLoraTriggerWords(options.activeProfile, Boolean(character.enableFourthLora))
+      : []),
+    ...(options.loraTriggerWords ?? []),
+  ];
+
+  if (rawTriggerWords.length === 0) {
+    return {
+      fullText: resolved.fullText,
+      segments: resolved.segments,
+      resolvedAdjustments: resolved.resolvedAdjustments,
+    };
+  }
+
+  const existingClean = new Set(
+    splitPromptTags(resolved.fullText)
+      .map((t) => stripWeightSyntax(t).replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+  );
+  const dedupedTriggers: string[] = [];
+  for (const token of rawTriggerWords) {
+    const preScrubbed = stripForbiddenAntiTextureFullText(token).cleanedText;
+    for (const part of splitPromptTags(preScrubbed)) {
+      const clean = stripWeightSyntax(part).replace(/\s+/g, ' ').trim();
+      if (!clean || existingClean.has(clean) || isDollPlasticTextureTag(part)) continue;
+      existingClean.add(clean);
+      dedupedTriggers.push(part);
+    }
+  }
+
+  if (dedupedTriggers.length === 0) {
+    return {
+      fullText: resolved.fullText,
+      segments: resolved.segments,
+      resolvedAdjustments: resolved.resolvedAdjustments,
+    };
+  }
+
+  const triggerText = dedupedTriggers.join(', ');
+  const nextFullText = resolved.fullText ? `${resolved.fullText}, ${triggerText}` : triggerText;
   return {
-    fullText: resolved.fullText,
-    segments: resolved.segments,
+    fullText: nextFullText,
+    segments: [
+      ...resolved.segments,
+      {
+        key: 'loraTriggers',
+        label: 'LoRA词',
+        layer: 'shared',
+        rawText: triggerText,
+        weight: 1.0,
+        formatted: triggerText,
+      },
+    ],
     resolvedAdjustments: resolved.resolvedAdjustments,
   };
 }
@@ -1458,7 +1581,7 @@ function stripWeightSyntax(raw: string): string {
     .trim()
     .replace(/^\((.+):[0-9.]+\)$/g, '$1')
     .replace(/[()[\]]/g, '')
-    .replace(/:[0-9.]+/g, '')
+    .replace(/(?<=[^\s:;]):[0-9]+(?:\.[0-9]+)?/g, '')
     .trim()
     .toLowerCase();
 }
@@ -1992,11 +2115,7 @@ export function buildComfyWorkflowFromProfile(params: {
     throw new Error('缺少 VAE 来源，请启用 Checkpoint 或 VAELoader');
   }
 
-  const activeLoras = (profile.loras ?? []).filter((lora: ComfyLoraItem) => {
-    if (!lora.name || !lora.name.trim()) return false;
-    if (lora.condition === 'ibuki_only' && !params.enableFourthLora) return false;
-    return true;
-  });
+  const activeLoras = getActiveLorasForCharacter(profile, params.enableFourthLora);
 
   activeLoras.forEach((lora, idx) => {
     const nodeId = String(20 + idx);
@@ -2004,8 +2123,8 @@ export function buildComfyWorkflowFromProfile(params: {
       class_type: 'LoraLoader',
       inputs: {
         lora_name: lora.name.trim(),
-        strength_model: Number.isFinite(lora.model) ? lora.model : 1.0,
-        strength_clip: Number.isFinite(lora.clip) ? lora.clip : 1.0,
+        strength_model: clampLoraWeight(lora.model, 1.0),
+        strength_clip: clampLoraWeight(lora.clip, 1.0),
         model: modelSource!,
         clip: clipSource!,
       },
@@ -2105,11 +2224,17 @@ export async function postProfileToComfyUI(params: {
     throw new Error('请先填写 ComfyUI 服务地址（默认 http://127.0.0.1:8188）');
   }
 
+  const triggerWords = collectActiveLoraTriggerWords(params.profile, params.enableFourthLora);
+  const effectivePositivePrompt = appendLoraTriggerWordsToPrompt(
+    params.positivePrompt,
+    triggerWords
+  );
+
   const { workflow, usedModelSummary, activeLorasCount, usedSeed } =
     buildComfyWorkflowFromProfile({
       profile: params.profile,
       characterName: params.characterName,
-      positivePrompt: params.positivePrompt,
+      positivePrompt: effectivePositivePrompt,
       negativePrompt: params.negativePrompt,
       enableFourthLora: params.enableFourthLora,
     });
@@ -2146,7 +2271,7 @@ export async function postProfileToComfyUI(params: {
             scheduler: samplerInputs.scheduler,
             width: (workflow['12']?.inputs as Record<string, unknown>)?.width,
             height: (workflow['12']?.inputs as Record<string, unknown>)?.height,
-            positive: params.positivePrompt,
+            positive: effectivePositivePrompt,
             negative: params.negativePrompt,
           },
         },
@@ -2187,9 +2312,12 @@ export function exportComfyProfilePayload(profile: ComfyProfile): {
     loaders: { ...profile.loaders },
     loras: (profile.loras ?? []).map((l) => ({
       name: l.name,
-      model: l.model,
-      clip: l.clip,
+      model: clampLoraWeight(l.model, 1.0),
+      clip: clampLoraWeight(l.clip, 1.0),
       condition: l.condition ?? null,
+      enabled: l.enabled !== false,
+      ...(l.triggerWords?.trim() ? { triggerWords: l.triggerWords.trim() } : {}),
+      ...(l.note?.trim() ? { note: l.note.trim() } : {}),
     })),
     sampling: {
       width: profile.sampling.width,
@@ -2238,13 +2366,16 @@ export function parseComfyProfileImport(raw: unknown): ComfyProfile {
 
   const loras: ComfyLoraItem[] = rawLoras
     .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
-    .slice(0, 8)
+    .slice(0, MAX_COMFY_LORAS)
     .map((item, idx) => ({
       id: `lora-${Date.now()}-${idx}`,
       name: typeof item.name === 'string' ? item.name : '',
-      model: typeof item.model === 'number' && Number.isFinite(item.model) ? item.model : 1.0,
-      clip: typeof item.clip === 'number' && Number.isFinite(item.clip) ? item.clip : 1.0,
+      model: clampLoraWeight(typeof item.model === 'number' ? item.model : 1.0, 1.0),
+      clip: clampLoraWeight(typeof item.clip === 'number' ? item.clip : 1.0, 1.0),
       condition: item.condition === 'ibuki_only' ? 'ibuki_only' : null,
+      enabled: item.enabled !== false,
+      triggerWords: typeof item.triggerWords === 'string' ? item.triggerWords : '',
+      note: typeof item.note === 'string' ? item.note : '',
     }));
 
   const name =

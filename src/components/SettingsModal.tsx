@@ -26,7 +26,14 @@ import {
   ComfyValidationMap,
   HistorySnapshot,
 } from '../types/studio';
-import { getActiveLoaderKeys, LOADER_NODE_META } from '../utils/promptBuilder';
+import {
+  clampLoraWeight,
+  getActiveLoaderKeys,
+  LOADER_NODE_META,
+  LORA_WEIGHT_MAX,
+  LORA_WEIGHT_MIN,
+  MAX_COMFY_LORAS,
+} from '../utils/promptBuilder';
 
 interface SettingsModalProps {
   open: boolean;
@@ -203,13 +210,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   const handleAddLora = () => {
     onUpdateActiveProfile((prev) => {
-      if ((prev.loras ?? []).length >= 8) return prev;
+      if ((prev.loras ?? []).length >= MAX_COMFY_LORAS) return prev;
       const nextItem: ComfyLoraItem = {
         id: `lora-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
         name: validation.loraAvailable[0] ?? '',
         model: 0.8,
         clip: 0.8,
         condition: null,
+        enabled: true,
+        triggerWords: '',
+        note: '',
       };
       return {
         ...prev,
@@ -219,10 +229,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   };
 
   const handleUpdateLora = (index: number, patch: Partial<ComfyLoraItem>) => {
+    const sanitizedPatch: Partial<ComfyLoraItem> = { ...patch };
+    if (typeof sanitizedPatch.model === 'number') {
+      sanitizedPatch.model = clampLoraWeight(sanitizedPatch.model, 0.8);
+    }
+    if (typeof sanitizedPatch.clip === 'number') {
+      sanitizedPatch.clip = clampLoraWeight(sanitizedPatch.clip, 0.8);
+    }
     onUpdateActiveProfile((prev) => ({
       ...prev,
       loras: prev.loras.map((item, idx) =>
-        idx === index ? { ...item, ...patch } : item
+        idx === index ? { ...item, ...sanitizedPatch } : item
       ),
     }));
   };
@@ -657,142 +674,231 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </div>
 
               {/* 改动 3：动态 LoRA 链 */}
-              <div className="pt-3 border-t border-[#EAEAEF] space-y-2.5">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-[11.5px] font-semibold text-[#1E2028]">
-                    LoRA 链 ({activeProfile.loras.length}/8)
-                  </span>
-                  <button
-                    type="button"
-                    disabled={activeProfile.loras.length >= 8}
-                    onClick={handleAddLora}
-                    className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium rounded-[8px] bg-[#F4F2FF] text-[#6B48F5] hover:bg-[#EBE6FF] disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer transition-colors"
-                  >
-                    <Plus className="w-3 h-3" />
-                    <span>添加 LoRA</span>
-                  </button>
-                </div>
-
-                {activeProfile.loras.length > 6 && (
-                  <div className="flex items-center gap-1.5 rounded-[8px] border border-amber-200 bg-amber-50 px-3 py-1.5 text-[11.5px] text-amber-800">
-                    <AlertTriangle className="w-3.5 h-3.5 text-amber-500 shrink-0" />
-                    <span>LoRA 超过 6 层容易掉细节</span>
-                  </div>
-                )}
-
-                {validation.loraAvailable.length > 0 && (
-                  <datalist id="comfy-lora-options">
-                    {validation.loraAvailable.map((opt) => (
-                      <option key={opt} value={opt} />
-                    ))}
-                  </datalist>
-                )}
-
-                {activeProfile.loras.length === 0 ? (
-                  <p className="text-[11.5px] text-[#8E94A4] py-2 text-center rounded-[10px] border border-dashed border-[#E2E3EA]">
-                    当前未挂载 LoRA，将直接使用底模出图
-                  </p>
-                ) : (
-                  <div className="space-y-1.5">
-                    {activeProfile.loras.map((lora, idx) => (
-                      <div
-                        key={lora.id || `lora-row-${idx}`}
-                        className="flex flex-wrap sm:flex-nowrap items-center gap-1.5 rounded-[10px] border border-[#EAEAEF] bg-[#FAFAFC] px-2.5 py-1.5"
-                      >
-                        <span className="text-[11px] font-mono text-[#8E94A4] w-5 shrink-0 tabular-nums">
-                          [{idx + 1}]
+              {(() => {
+                const enabledLoraCount = activeProfile.loras.filter(
+                  (l) => l.enabled !== false && l.name.trim().length > 0
+                ).length;
+                return (
+                  <div className="pt-3 border-t border-[#EAEAEF] space-y-2.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <span className="text-[11.5px] font-semibold text-[#1E2028]">
+                          LoRA 链（已启用 {enabledLoraCount} 层 · 共 {activeProfile.loras.length}/{MAX_COMFY_LORAS}）
                         </span>
-
-                        <input
-                          type="text"
-                          list={
-                            validation.loraAvailable.length > 0
-                              ? 'comfy-lora-options'
-                              : undefined
-                          }
-                          value={lora.name}
-                          onChange={(e) =>
-                            handleUpdateLora(idx, { name: e.target.value })
-                          }
-                          placeholder="输入或选择 LoRA 文件名"
-                          className="flex-1 min-w-[140px] rounded-[7px] border border-[#E2E3EA] bg-white px-2 py-1 text-[11.5px] font-mono text-[#1E2028] focus:border-[#7C5CFC] focus:outline-none"
-                        />
-
-                        <div className="flex items-center gap-1 shrink-0 tabular-nums">
-                          <input
-                            type="number"
-                            step={0.05}
-                            value={lora.model}
-                            title="model 权重"
-                            onChange={(e) =>
-                              handleUpdateLora(idx, {
-                                model: parseFloat(e.target.value) || 0,
-                              })
-                            }
-                            className="w-14 rounded-[7px] border border-[#E2E3EA] bg-white px-1.5 py-1 text-[11px] font-mono text-center text-[#1E2028] focus:border-[#7C5CFC] focus:outline-none"
-                          />
-                          <span className="text-[11px] text-[#949AA8]">/</span>
-                          <input
-                            type="number"
-                            step={0.05}
-                            value={lora.clip}
-                            title="clip 权重"
-                            onChange={(e) =>
-                              handleUpdateLora(idx, {
-                                clip: parseFloat(e.target.value) || 0,
-                              })
-                            }
-                            className="w-14 rounded-[7px] border border-[#E2E3EA] bg-white px-1.5 py-1 text-[11px] font-mono text-center text-[#1E2028] focus:border-[#7C5CFC] focus:outline-none"
-                          />
-                        </div>
-
-                        <label className="inline-flex items-center gap-1 text-[11px] text-[#5A6072] shrink-0 cursor-pointer select-none px-1">
-                          <input
-                            type="checkbox"
-                            checked={lora.condition === 'ibuki_only'}
-                            onChange={(e) =>
-                              handleUpdateLora(idx, {
-                                condition: e.target.checked ? 'ibuki_only' : null,
-                              })
-                            }
-                            className="w-3 h-3 accent-[#7C5CFC] rounded"
-                          />
-                          <span>仅伊启用</span>
-                        </label>
-
-                        <div className="flex items-center gap-0.5 shrink-0">
-                          <button
-                            type="button"
-                            disabled={idx === 0}
-                            onClick={() => handleMoveLora(idx, 'up')}
-                            title="上移"
-                            className="p-1 rounded-[6px] text-[#686E7E] hover:bg-white hover:text-[#7C5CFC] disabled:opacity-30 cursor-pointer"
-                          >
-                            <ArrowUp className="w-3 h-3" />
-                          </button>
-                          <button
-                            type="button"
-                            disabled={idx === activeProfile.loras.length - 1}
-                            onClick={() => handleMoveLora(idx, 'down')}
-                            title="下移"
-                            className="p-1 rounded-[6px] text-[#686E7E] hover:bg-white hover:text-[#7C5CFC] disabled:opacity-30 cursor-pointer"
-                          >
-                            <ArrowDown className="w-3 h-3" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleRemoveLora(idx)}
-                            title="移除此 LoRA"
-                            className="p-1 rounded-[6px] text-[#686E7E] hover:bg-[#FFF1F3] hover:text-[#E85D75] cursor-pointer"
-                          >
-                            <X className="w-3 h-3" />
-                          </button>
-                        </div>
+                        <span className="text-[10.5px] text-[#8E94A4]">
+                          权重范围 {LORA_WEIGHT_MIN}~{LORA_WEIGHT_MAX}
+                        </span>
                       </div>
-                    ))}
+                      <button
+                        type="button"
+                        disabled={activeProfile.loras.length >= MAX_COMFY_LORAS}
+                        onClick={handleAddLora}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium rounded-[8px] bg-[#F4F2FF] text-[#6B48F5] hover:bg-[#EBE6FF] disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer transition-colors"
+                      >
+                        <Plus className="w-3 h-3" />
+                        <span>添加 LoRA</span>
+                      </button>
+                    </div>
+
+                    {enabledLoraCount > 6 && (
+                      <div className="flex items-center gap-1.5 rounded-[8px] border border-amber-200 bg-amber-50 px-3 py-1.5 text-[11.5px] text-amber-800">
+                        <AlertTriangle className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                        <span>
+                          当前已启用 {enabledLoraCount} 层 LoRA，超过 6 层容易增加显存占用并导致细节流失，建议按需取消勾选暂不使用的层
+                        </span>
+                      </div>
+                    )}
+
+                    {validation.loraAvailable.length > 0 && (
+                      <datalist id="comfy-lora-options">
+                        {validation.loraAvailable.map((opt) => (
+                          <option key={opt} value={opt} />
+                        ))}
+                      </datalist>
+                    )}
+
+                    {activeProfile.loras.length === 0 ? (
+                      <p className="text-[11.5px] text-[#8E94A4] py-2 text-center rounded-[10px] border border-dashed border-[#E2E3EA]">
+                        当前未挂载 LoRA，将直接使用底模出图
+                      </p>
+                    ) : (
+                      <div className="space-y-2">
+                        {activeProfile.loras.map((lora, idx) => {
+                          const isEnabled = lora.enabled !== false;
+                          return (
+                            <div
+                              key={lora.id || `lora-row-${idx}`}
+                              className={`rounded-[10px] border px-2.5 py-2 space-y-1.5 transition-opacity ${
+                                isEnabled
+                                  ? 'border-[#EAEAEF] bg-[#FAFAFC]'
+                                  : 'border-[#E6E7EE] bg-[#F4F4F7] opacity-60'
+                              }`}
+                            >
+                              <div className="flex flex-wrap sm:flex-nowrap items-center gap-1.5">
+                                <input
+                                  type="checkbox"
+                                  checked={isEnabled}
+                                  title={isEnabled ? '已启用（点击禁用）' : '已禁用（点击启用）'}
+                                  aria-label={`启用第 ${idx + 1} 层 LoRA`}
+                                  onChange={(e) =>
+                                    handleUpdateLora(idx, { enabled: e.target.checked })
+                                  }
+                                  className="w-3.5 h-3.5 accent-[#7C5CFC] rounded cursor-pointer shrink-0"
+                                />
+
+                                <span className="text-[11px] font-mono text-[#8E94A4] w-5 shrink-0 tabular-nums">
+                                  [{idx + 1}]
+                                </span>
+
+                                <input
+                                  type="text"
+                                  list={
+                                    validation.loraAvailable.length > 0
+                                      ? 'comfy-lora-options'
+                                      : undefined
+                                  }
+                                  value={lora.name}
+                                  onChange={(e) =>
+                                    handleUpdateLora(idx, { name: e.target.value })
+                                  }
+                                  placeholder="输入或选择 LoRA 文件名"
+                                  className="flex-1 min-w-[130px] rounded-[7px] border border-[#E2E3EA] bg-white px-2 py-1 text-[11.5px] font-mono text-[#1E2028] focus:border-[#7C5CFC] focus:outline-none"
+                                />
+
+                                {validation.loraAvailable.length > 0 && (
+                                  <select
+                                    aria-label={`快速选择第 ${idx + 1} 层 LoRA`}
+                                    value={
+                                      validation.loraAvailable.includes(lora.name)
+                                        ? lora.name
+                                        : ''
+                                    }
+                                    onChange={(e) => {
+                                      if (e.target.value) {
+                                        handleUpdateLora(idx, { name: e.target.value });
+                                      }
+                                    }}
+                                    className="max-w-[115px] rounded-[7px] border border-[#E2E3EA] bg-white px-1.5 py-1 text-[11px] font-mono text-[#4C5264] focus:border-[#7C5CFC] focus:outline-none"
+                                  >
+                                    <option value="">列表({validation.loraAvailable.length})</option>
+                                    {validation.loraAvailable.map((opt) => (
+                                      <option key={opt} value={opt}>
+                                        {opt}
+                                      </option>
+                                    ))}
+                                  </select>
+                                )}
+
+                                <div className="flex items-center gap-1 shrink-0 tabular-nums">
+                                  <input
+                                    type="number"
+                                    min={LORA_WEIGHT_MIN}
+                                    max={LORA_WEIGHT_MAX}
+                                    step={0.05}
+                                    value={lora.model}
+                                    title={`model 权重 (${LORA_WEIGHT_MIN} ~ ${LORA_WEIGHT_MAX})`}
+                                    onChange={(e) => {
+                                      const parsed = parseFloat(e.target.value);
+                                      handleUpdateLora(idx, {
+                                        model: Number.isFinite(parsed)
+                                          ? clampLoraWeight(parsed, 0)
+                                          : 0,
+                                      });
+                                    }}
+                                    className="w-14 rounded-[7px] border border-[#E2E3EA] bg-white px-1.5 py-1 text-[11px] font-mono text-center text-[#1E2028] focus:border-[#7C5CFC] focus:outline-none"
+                                  />
+                                  <span className="text-[11px] text-[#949AA8]">/</span>
+                                  <input
+                                    type="number"
+                                    min={LORA_WEIGHT_MIN}
+                                    max={LORA_WEIGHT_MAX}
+                                    step={0.05}
+                                    value={lora.clip}
+                                    title={`clip 权重 (${LORA_WEIGHT_MIN} ~ ${LORA_WEIGHT_MAX})`}
+                                    onChange={(e) => {
+                                      const parsed = parseFloat(e.target.value);
+                                      handleUpdateLora(idx, {
+                                        clip: Number.isFinite(parsed)
+                                          ? clampLoraWeight(parsed, 0)
+                                          : 0,
+                                      });
+                                    }}
+                                    className="w-14 rounded-[7px] border border-[#E2E3EA] bg-white px-1.5 py-1 text-[11px] font-mono text-center text-[#1E2028] focus:border-[#7C5CFC] focus:outline-none"
+                                  />
+                                </div>
+
+                                <label className="inline-flex items-center gap-1 text-[11px] text-[#5A6072] shrink-0 cursor-pointer select-none px-1">
+                                  <input
+                                    type="checkbox"
+                                    checked={lora.condition === 'ibuki_only'}
+                                    onChange={(e) =>
+                                      handleUpdateLora(idx, {
+                                        condition: e.target.checked ? 'ibuki_only' : null,
+                                      })
+                                    }
+                                    className="w-3 h-3 accent-[#7C5CFC] rounded"
+                                  />
+                                  <span>仅伊启用</span>
+                                </label>
+
+                                <div className="flex items-center gap-0.5 shrink-0">
+                                  <button
+                                    type="button"
+                                    disabled={idx === 0}
+                                    onClick={() => handleMoveLora(idx, 'up')}
+                                    title="上移"
+                                    className="p-1 rounded-[6px] text-[#686E7E] hover:bg-white hover:text-[#7C5CFC] disabled:opacity-30 cursor-pointer"
+                                  >
+                                    <ArrowUp className="w-3 h-3" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={idx === activeProfile.loras.length - 1}
+                                    onClick={() => handleMoveLora(idx, 'down')}
+                                    title="下移"
+                                    className="p-1 rounded-[6px] text-[#686E7E] hover:bg-white hover:text-[#7C5CFC] disabled:opacity-30 cursor-pointer"
+                                  >
+                                    <ArrowDown className="w-3 h-3" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleRemoveLora(idx)}
+                                    title="移除此 LoRA"
+                                    className="p-1 rounded-[6px] text-[#686E7E] hover:bg-[#FFF1F3] hover:text-[#E85D75] cursor-pointer"
+                                  >
+                                    <X className="w-3 h-3" />
+                                  </button>
+                                </div>
+                              </div>
+
+                              <div className="flex flex-wrap sm:flex-nowrap items-center gap-1.5 pl-6">
+                                <input
+                                  type="text"
+                                  value={lora.triggerWords ?? ''}
+                                  onChange={(e) =>
+                                    handleUpdateLora(idx, { triggerWords: e.target.value })
+                                  }
+                                  placeholder="可选触发词（英文 tag，启用时自动合并去重）"
+                                  className="flex-1 min-w-[160px] rounded-[6px] border border-[#EAEAEF] bg-white px-2 py-1 text-[11px] font-mono text-[#373C4B] focus:border-[#7C5CFC] focus:outline-none"
+                                />
+                                <input
+                                  type="text"
+                                  value={lora.note ?? ''}
+                                  onChange={(e) =>
+                                    handleUpdateLora(idx, { note: e.target.value })
+                                  }
+                                  placeholder="备注（如画风/光影/角色）"
+                                  className="w-full sm:w-[155px] rounded-[6px] border border-[#EAEAEF] bg-white px-2 py-1 text-[11px] text-[#4C5264] focus:border-[#7C5CFC] focus:outline-none"
+                                />
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
                   </div>
-                )}
-              </div>
+                );
+              })()}
 
               {/* 改动 4：采样参数与恢复默认 */}
               <div className="pt-3 border-t border-[#EAEAEF] space-y-2.5">

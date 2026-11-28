@@ -1,6 +1,8 @@
 import {
+  CharacterConfig,
   ComfyProfile,
   ExtractedCardGenerationParams,
+  ExtractedCardLoraItem,
   WorkflowCollectionCard,
   WorkflowJsonFormat,
   WorkflowPromptNodeCandidate,
@@ -8,6 +10,7 @@ import {
 } from '../types/studio';
 import { CHARACTER_FORBIDDEN_FEATURES } from '../data/presets';
 import {
+  clampLoraWeight,
   clampWeight,
   formatWeightedText,
   isDollPlasticTextureTag,
@@ -1292,6 +1295,7 @@ export async function sendWorkflowCardToComfyUI(params: {
   fallbackProfile: ComfyProfile;
   characterName: string;
   preferStudioProfile?: boolean;
+  enableFourthLora?: boolean;
   seedModeOverride?: 'workflow' | 'fixed' | 'random';
   fixedSeedOverride?: number;
 }): Promise<RunWorkflowCardResult> {
@@ -1474,7 +1478,7 @@ export async function sendWorkflowCardToComfyUI(params: {
     characterName: `${card.title || params.characterName}`,
     positivePrompt: posPrompt,
     negativePrompt: negPrompt,
-    enableFourthLora: false,
+    enableFourthLora: Boolean(params.enableFourthLora),
   });
 
   return {
@@ -3597,7 +3601,7 @@ function stripTokenWeightForClassify(raw: string): string {
     .trim()
     .replace(/^\((.+):[0-9.]+\)$/g, '$1')
     .replace(/[()[\]]/g, '')
-    .replace(/:[0-9.]+/g, '')
+    .replace(/(?<=[^\s:;]):[0-9]+(?:\.[0-9]+)?/g, '')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -3777,25 +3781,348 @@ export function extractCardGenerationParams(
   return result;
 }
 
+function pickLoraNumericWeight(val: unknown, fallback = 1.0): number {
+  if (typeof val === 'number' && Number.isFinite(val)) {
+    return clampLoraWeight(val, fallback);
+  }
+  if (typeof val === 'string' && val.trim()) {
+    const parsed = Number(val.trim());
+    if (Number.isFinite(parsed)) {
+      return clampLoraWeight(parsed, fallback);
+    }
+  }
+  return fallback;
+}
+
+export function extractCardLoras(card: WorkflowCollectionCard): ExtractedCardLoraItem[] {
+  const results: ExtractedCardLoraItem[] = [];
+  const seen = new Set<string>();
+
+  const pushLora = (
+    rawName: unknown,
+    modelWeight: unknown,
+    clipWeight: unknown,
+    source: string
+  ) => {
+    if (typeof rawName !== 'string') return;
+    const name = rawName.trim();
+    if (!name || /^(?:none|null|undefined)$/i.test(name)) return;
+    const key = name.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    const model = pickLoraNumericWeight(modelWeight, 1.0);
+    const clip =
+      clipWeight !== undefined && clipWeight !== null
+        ? pickLoraNumericWeight(clipWeight, model)
+        : model;
+    results.push({
+      id: `orig-lora-${results.length}-${key}`,
+      name,
+      model,
+      clip,
+      source,
+    });
+  };
+
+  const inspectGraph = (graph: ComfyApiGraph, prefix: string) => {
+    for (const [nodeId, node] of Object.entries(graph)) {
+      if (!node || typeof node !== 'object') continue;
+      const ctype = node.class_type || '';
+      const inp = node.inputs ?? {};
+      if (!/lora/i.test(ctype)) continue;
+
+      if (typeof inp.lora_name === 'string') {
+        const modelW = inp.strength_model ?? inp.model_weight ?? inp.strength ?? 1.0;
+        const clipW =
+          /ModelOnly/i.test(ctype)
+            ? 0
+            : inp.strength_clip ?? inp.clip_weight ?? modelW;
+        pushLora(inp.lora_name, modelW, clipW, `${ctype} #${nodeId}`);
+      }
+
+      // Power Lora Loader (rgthree) & multi-slot LoRA stackers
+      for (const [k, v] of Object.entries(inp)) {
+        if (v && typeof v === 'object' && !Array.isArray(v)) {
+          const obj = v as Record<string, unknown>;
+          if (obj.on !== false && typeof obj.lora === 'string') {
+            const m = obj.strength ?? obj.strength_model ?? 1.0;
+            const c = obj.strengthTwo ?? obj.strength_clip ?? m;
+            pushLora(obj.lora, m, c, `${ctype} #${nodeId}`);
+          }
+        }
+        const multiMatch = k.match(/^lora(?:_name)?[_-]?(\d+)$/i);
+        if (multiMatch && typeof v === 'string') {
+          const idx = multiMatch[1];
+          const switchVal = inp[`switch_${idx}`] ?? inp[`enabled_${idx}`];
+          if (switchVal === false || switchVal === 'Off') continue;
+          const m =
+            inp[`model_weight_${idx}`] ??
+            inp[`strength_model_${idx}`] ??
+            inp[`strength_${idx}`] ??
+            inp[`lora_wt_${idx}`] ??
+            1.0;
+          const c =
+            inp[`clip_weight_${idx}`] ??
+            inp[`strength_clip_${idx}`] ??
+            m;
+          pushLora(v, m, c, `${prefix}${ctype} #${nodeId}`);
+        }
+      }
+    }
+  };
+
+  if (card.rawWorkflowJson) {
+    try {
+      const parsedRaw = JSON.parse(card.rawWorkflowJson) as Record<string, unknown>;
+      if (isUiWorkflowObject(parsedRaw)) {
+        for (const node of parsedRaw.nodes) {
+          if (!node || node.mode === 2 || node.mode === 4) continue;
+          if (!/lora/i.test(node.type || '')) continue;
+          const named = node.widgets_values_named ?? {};
+          if (typeof named.lora_name === 'string') {
+            pushLora(
+              named.lora_name,
+              named.strength_model ?? named.strength ?? 1.0,
+              /ModelOnly/i.test(node.type) ? 0 : named.strength_clip ?? named.strength_model ?? 1.0,
+              `${node.type} #${node.id}`
+            );
+          }
+          if (Array.isArray(node.widgets_values)) {
+            if (
+              /LoraLoader/i.test(node.type) &&
+              typeof node.widgets_values[0] === 'string'
+            ) {
+              const m = node.widgets_values[1] ?? 1.0;
+              const c = /ModelOnly/i.test(node.type) ? 0 : node.widgets_values[2] ?? m;
+              pushLora(node.widgets_values[0], m, c, `${node.type} #${node.id}`);
+            }
+            for (const item of node.widgets_values) {
+              if (item && typeof item === 'object' && !Array.isArray(item)) {
+                const obj = item as Record<string, unknown>;
+                if (obj.on !== false && typeof obj.lora === 'string') {
+                  const m = obj.strength ?? obj.strength_model ?? 1.0;
+                  const c = obj.strengthTwo ?? obj.strength_clip ?? m;
+                  pushLora(obj.lora, m, c, `${node.type} #${node.id}`);
+                }
+              }
+            }
+          }
+          for (const [k, v] of Object.entries(named)) {
+            const multiMatch = k.match(/^lora(?:_name)?[_-]?(\d+)$/i);
+            if (multiMatch && typeof v === 'string') {
+              const idx = multiMatch[1];
+              const switchVal = named[`switch_${idx}`] ?? named[`enabled_${idx}`];
+              if (switchVal === false || switchVal === 'Off') continue;
+              const m =
+                named[`model_weight_${idx}`] ??
+                named[`strength_model_${idx}`] ??
+                named[`strength_${idx}`] ??
+                1.0;
+              const c = named[`clip_weight_${idx}`] ?? named[`strength_clip_${idx}`] ?? m;
+              pushLora(v, m, c, `${node.type} #${node.id}`);
+            }
+          }
+        }
+        const uiAsApi = convertUiWorkflowToApiPrompt(parsedRaw);
+        if (uiAsApi) inspectGraph(uiAsApi, '');
+      } else if (isApiPromptDict(parsedRaw)) {
+        inspectGraph(parsedRaw, '');
+      } else if (
+        parsedRaw &&
+        typeof parsedRaw === 'object' &&
+        parsedRaw.chibiprompt &&
+        typeof parsedRaw.chibiprompt === 'object'
+      ) {
+        const chibi = parsedRaw.chibiprompt as { loras?: unknown[] };
+        if (Array.isArray(chibi.loras)) {
+          for (const entry of chibi.loras) {
+            if (entry && typeof entry === 'object') {
+              const obj = entry as Record<string, unknown>;
+              pushLora(obj.name, obj.model, obj.clip, 'PNG 元数据');
+            }
+          }
+        }
+      }
+    } catch {
+      // ignore invalid JSON
+    }
+  }
+
+  if (card.apiPromptJson) {
+    try {
+      const parsedApi = JSON.parse(card.apiPromptJson);
+      if (isApiPromptDict(parsedApi)) {
+        inspectGraph(parsedApi, '');
+      }
+    } catch {
+      // ignore invalid API JSON
+    }
+  }
+
+  const inlineSources = [card.fineTunedPositive, card.extractedPositive]
+    .filter(Boolean)
+    .join('\n');
+  if (inlineSources) {
+    const inlineRe = /<lora:([^:>]+):(-?\d+(?:\.\d+)?)(?::(-?\d+(?:\.\d+)?))?>/gi;
+    let m: RegExpExecArray | null;
+    while ((m = inlineRe.exec(inlineSources)) !== null) {
+      pushLora(m[1], m[2], m[3] ?? m[2], '提示词 <lora>');
+    }
+  }
+
+  return results;
+}
+
 const STUDIO_BOILERPLATE_TOKEN_RE =
-  /^(?:solo|1girl|2girls|3girls|multiple girls|1boy|2boys|masterpiece|best quality|high quality|amazing quality|very aesthetic|aesthetic|newest|recent|absurdres|highres|ultra detailed|extremely detailed|detailed|anime style|anime illustration|anime coloring|flat color|cell shading|source_anime|safe|general|sensitive|questionable|explicit|nsfw|sfw|upper body|cowboy shot|half body|full body|portrait|chibi|flat chest|small breasts|slender|narrow waist|petite|small stature|short legs|stubby legs|childlike proportions|small body|baby|loli|toddlercon|lolicon|pedo|narrow shoulders|toddling|looking at viewer)$/i;
+  /^(?:solo|1girl|2girls|3girls|multiple girls|1boy|2boys|masterpiece|best quality|high quality|amazing quality|very aesthetic|aesthetic|newest|recent|absurdres|highres|ultra detailed|extremely detailed|detailed|anime style|anime illustration|anime coloring|flat color|cell shading|source_anime|safe|general|sensitive|questionable|explicit|nsfw|sfw|upper body|cowboy shot|half body|full body|portrait|chibi|flat chest|small breasts|slender|narrow waist|petite|small stature|short legs|stubby legs|childlike proportions|small body|baby|loli|toddlercon|lolicon|pedo|narrow shoulders|toddling)$/i;
 
 const META_PREFIX_TOKEN_RE = /^(?:rating:|score_|year\s+\d{4}|20\d{2}s?$|by\s+|@|<lora:)/i;
 
+const IRON_RULE_1_FACE_TERMS_RE =
+  /^(?:detailed|beautiful|intricate|pretty|gorgeous|cute|anime|expressive)\s+(?:face|eyes|facial\s+features)$/i;
+
 const SERIES_CHARACTER_TAG_RE =
-  /\(\s*(?:blue archive|genshin impact|honkai[^)]*|arknights|fate[^)]*|hololive|azur lane|uma musume|princess connect[^)]*|touhou|vocaloid)\s*\)$/i;
+  /(?:\(\s*|\b)(?:blue archive|genshin impact|honkai(?:\s*(?:impact|star rail))?|arknights|fate\/[a-z\s]+|hololive|azur lane|uma musume|princess connect(?:\s*re:?\s*dive)?|touhou|vocaloid)(?:\s*\)|\b)/i;
 
 const IDENTITY_HAIR_EYES_SPECIES_RE =
-  /\b(?:(?:black|blonde|golden|silver|white|grey|gray|pink|blue|red|green|purple|lavender|orange|brown|aqua|cyan|mint|dark|light|two-tone|gradient|multicolored|streaked)\s+hair|(?:long|short|medium|very\s+long|shoulder\s+length|waist\s+length|floor\s+length)\s+hair|twintails?|low\s+twintails?|twin\s+braids?|ponytail|side\s+ponytail|high\s+ponytail|hair\s+bun|double\s+bun|bob\s+cut|hime\s+cut|ahoge|hair\s+over\s+one\s+eye|(?:blunt|parted|swept|crossed|side|asymmetrical)\s+bangs|bangs|sidelocks|messy\s+hair|wavy\s+hair|curly\s+hair|straight\s+hair|braided\s+hair|braids|(?:blue|red|pink|purple|violet|yellow|golden|amber|green|emerald|brown|black|orange|silver|grey|gray|gradient)\s+eyes?|heterochromia|cat\s+ears?|fox\s+ears?|animal\s+ears?|bunny\s+ears?|rabbit\s+ears?|dog\s+ears?|wolf\s+ears?|elf\s+ears?|pointy\s+ears?|demon\s+horns?|devil\s+horns?|horns|angel\s+wings?|bat\s+wings?|demon\s+wings?|wings|devil\s+tail|cat\s+tail|fox\s+tail|tail|halo)\b/i;
+  /\b(?:(?:black|blonde|golden|silver|white|grey|gray|pink|blue|red|green|purple|lavender|orange|brown|aqua|cyan|mint|dark|light|two-tone|gradient|multicolored|streaked)\s+hair|(?:long|short|medium|very\s+long|shoulder\s+length|waist\s+length|floor\s+length)\s+hair|twintails?|low\s+twintails?|very\s+long\s+low\s+twintails?|twin\s+braids?|ponytail|side\s+ponytail|high\s+ponytail|ponytail\s+on\s+side|tied\s+low\s+at\s+the\s+nape|hair\s+bun|double\s+bun|bob\s+cut|hime\s+cut|half\s+updo|hair\s+down|ahoge|hair\s+over\s+one\s+eye|hair\s+between\s+eyes|loose\s+hair\s+strands(?:\s+framing\s+face)?|face[- ]framing\s+(?:hair|sidelocks|strands)|(?:blunt|parted|swept|crossed|side|asymmetrical|wispy|thick\s+side[- ]swept|short)\s+bangs|bangs|sidelocks|messy\s+hair|wavy\s+hair|curly\s+hair|straight\s+hair|braided\s+hair|braids|(?:blue|red|pink|purple|violet|yellow|golden|amber|green|emerald|brown|black|orange|silver|grey|gray|gradient)\s+eyes?|heterochromia|tareme|tsurime|sanpaku|(?:long\s+)?eyelashes|(?:pale|fair|tan|tanned|dark|white|porcelain)\s+skin|cat\s+ears?|fox\s+ears?|animal\s+ears?|bunny\s+ears?|rabbit\s+ears?|dog\s+ears?|wolf\s+ears?|elf\s+ears?|(?:pointy|pointed)\s+ears?|demon\s+horns?|devil\s+horns?|horns|angel\s+wings?|bat\s+wings?|demon\s+wings?|wings|devil\s+tail|cat\s+tail|fox\s+tail|heart\s+shaped\s+(?:demon\s+)?tail|tail|(?:golden\s+(?:spiked\s+)?)?halo)\b/i;
+
+const HAIR_ACCESSORY_BLEED_RE =
+  /\b(?:hair\s*bows?|hair\s*ribbons?|hairclips?|hair\s*ornaments?|hair\s*ties?|scrunchies?|headbands?|hairbands?|two\s+hair\s+bows|multiple\s+hair\s+bows|bow\s+tying\s+.*ponytail|ponytail\s+tied\s+with\s+.*bow|bow\s+on\s+(?:top\s+of\s+)?head|hair\s+without\s+hairbow|lace[- ]trimmed\s+bow)\b|^(?:black|blonde|white|blue|pink|orange|yellow)\s+(?:hair\s+)?(?:bow|ribbon)s?$/i;
 
 const APPLY_BG_TOKEN_RE =
-  /\b(?:background|indoors?|outdoors?|classroom|bedroom|living room|park|garden|street|beach|poolside|sky|clouds|window|sunlight|moonlight|curtains|desk|sofa|couch|chair|table|floor|wooden floor|wall|trees|sakura|cherry blossom|night|starry|cafe|library|backdrop|depth of field|scenery|bokeh|room|balcony|hallway|kitchen|meadow|forest|snow|rain)\b/i;
+  /\b(?:background|indoors?|outdoors?|classroom|bedroom|living room|park|garden|street|beach|poolside|sky|clouds|window|sunlight|moonlight|curtains|desk|sofa|couch|chair|table|floor|wooden floor|wall|trees|sakura|cherry blossom|night|starry\s+(?:sky|night|background|backdrop)|cafe|library|backdrop|depth of field|scenery|bokeh|room|balcony|hallway|kitchen|meadow|forest|snow|rain|lighting|daylight|sunset|dusk|dawn|rooftop|veranda|tatami|futon)\b/i;
+
+const APPLY_EXPR_EMOTICON_RE =
+  /(?:^|[\s,(])(?:[:;][dpo3<>qtv]|uwu|owo|x_x|o_o|o\.o|=_=|-\_-|t_t|q_q|u_u|v_v|;_;|>_<|\^o\^|\^_\^|@_@|><)(?:$|[\s,)])/i;
 
 const APPLY_EXPR_TOKEN_RE =
-  /\b(?:smile|smiling|grin|laugh|laughing|blush|blushing|rosy cheeks|wink|winking|closed eyes|eyes closed|half-closed|open mouth|closed mouth|parted lips|pout|pouting|tears|crying|happy|cheerful|shy|embarrassed|surprised|shocked|sleepy|drowsy|yawn|smug|playful|stare|gaze|looking away|looking back|looking down|looking up|tongue out|blep|sparkles in eyes|heart-shaped pupils|star-shaped pupils|expression|frown|nervous|flustered)\b|>_<|:3|\^_\^/i;
+  /\b(?:smile|smiling|grin|grinning|smirk|smirking|sneer|scoff|laugh|laughing|blush|blushing|full[- ]face\s+blush|nose\s+blush|ear\s+blush|blush\s+stickers|rosy\s+cheeks|wink|winking|one\s+eye\s+closed|closed\s+eyes|eyes\s+closed|closed[- ]eye|half[- ]closed(?:\s+eyes)?|half[- ]open(?:\s+eyes)?|droopy\s+eyes|narrowed\s+eyes|squinting|wide\s+eyes|wide[- ]eyed|jitome|sparkling\s+eyes|shiny\s+eyes|glowing\s+eyes|starry\s+eyes|watery\s+eyes|teary\s+eyes|glistening\s+eyes|empty\s+eyes|blank\s+eyes|dizzy\s+eyes|spiral\s+eyes|open\s+mouth|closed\s+mouth|parted\s+lips|wavy\s+mouth|cat\s+mouth|dot\s+mouth|triangle\s+mouth|chestnut\s+mouth|mouth\s+hold|clenched\s+teeth|gritting\s+teeth|saliva|drooling|licking\s+lips|biting\s+lip|pout|pouting|puffed\s+cheeks|cheek\s+puff|cheek\s+bulge|tears|tearing\s+up|crying|happy|cheerful|delighted|excited|bliss|shy|shyly|bashful|timid|embarrassed|surprised|shocked|sleepy|drowsy|yawn|yawning|smug|playful|mischievous|teasing|sulking|tsundere|kuudere|dandere|yandere|stare|blank\s+stare|gaze|looking\s+at\s+viewer|looking\s+away|looking\s+aside|looking\s+to\s+the\s+side|looking\s+straight|averted\s+gaze|sideways\s+glance|glancing\s+away|eye\s+contact|looking\s+back\s+at\s+viewer|looking\s+down|looking\s+up|tongue\s+out|tongue|blep|sparkles\s+in\s+eyes|heart[- ]shaped\s+(?:pupils|eyes)|star[- ]shaped\s+(?:pupils|eyes)|expression|expressionless|emotionless|deadpan|spaced\s+out|dumbfounded|dazed|dizzy|frown|frowning|scowl|scowling|glare|glaring|angry|annoyed|irritated|bored|unamused|disappointed|sad|gloomy|depressed|melancholy|worried|troubled|scared|frightened|panicking|panic|nervous|flustered|serene|calm|peaceful|confused|puzzled|fang|sweatdrop|anger\s+vein|tick\s+mark|shaded\s+face|quivering|trembling|raised\s+eyebrow|raised\s+eyebrows|furrowed\s+brows?|v[- ]shaped\s+eyebrows|upturned\s+eyebrows|uplifted\s+eyebrows|relaxed\s+eyebrows|peeking\s+eyes|peeking\s+through\s+fingers|covering\s+lower\s+face(?:\s+with\s+hands)?|covering\s+mouth|hand\s+over\s+mouth)\b/i;
 
 const APPLY_POSE_TOKEN_RE =
   /\b(?:standing|sitting|seated|kneeling|crouching|squatting|lying|leaning|jumping|running|walking|tilting head|head tilt|hand|hands|arm|arms|finger|fingers|peace sign|v sign|double peace|wave|waving|pointing|hugging|hug|holding|crossed|behind back|on hip|on cheek|chin|skirt lift|twirling|pose|posture|dynamic|facing|turned|tiptoes|one leg|salute|fists|outstretched|reaching|clasped|resting|peeking)\b/i;
+
+function expandParenthesizedMultiTagTokens(tokens: string[]): string[] {
+  const expanded: string[] = [];
+  for (const raw of tokens) {
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    const weightedMatch = trimmed.match(/^\((.+):([0-9]+(?:\.[0-9]+)?)\)$/);
+    const bareMatch = !weightedMatch ? trimmed.match(/^\((.+)\)$/) : null;
+    const inner = weightedMatch?.[1] ?? bareMatch?.[1] ?? '';
+    const weightSuffix = weightedMatch?.[2];
+    if (inner && /,\s*[a-zA-Z0-9:;^>_<]/.test(inner)) {
+      const subParts = splitPromptTags(inner);
+      if (subParts.length > 1) {
+        for (const sub of subParts) {
+          const cleanSub = sub.trim();
+          if (!cleanSub) continue;
+          expanded.push(
+            weightSuffix && !/^\(.+:[0-9.]+\)$/.test(cleanSub)
+              ? `(${cleanSub}:${weightSuffix})`
+              : cleanSub
+          );
+        }
+        continue;
+      }
+    }
+    expanded.push(trimmed);
+  }
+  return expanded;
+}
+
+function buildTargetForbiddenMatchers(targetCharacter?: CharacterConfig): RegExp[] {
+  if (!targetCharacter) return [];
+  const rawTerms: string[] = [];
+  if (targetCharacter.forbiddenTags?.trim()) {
+    for (const part of splitPromptTags(targetCharacter.forbiddenTags)) {
+      const clean = stripTokenWeightForClassify(part).toLowerCase();
+      if (clean) rawTerms.push(clean);
+    }
+  }
+  if (targetCharacter.id === 'char-lan') {
+    rawTerms.push(
+      'black hair bow',
+      'hair bow',
+      'hair bow on the side',
+      'black bow tying side ponytail',
+      'side ponytail',
+      'ponytail',
+      'ibuki',
+      'mari',
+      'hoshino',
+      'pointed ears',
+      'demon horns',
+      'halo',
+      'bat wings',
+      'heart shaped tail',
+      'heart shaped demon tail'
+    );
+  }
+  const unique = Array.from(new Set(rawTerms));
+  return unique.map((term) => {
+    const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return /[\u4e00-\u9fa5]/.test(term)
+      ? new RegExp(escaped, 'i')
+      : new RegExp(`\\b${escaped}\\b`, 'i');
+  });
+}
+
+export function sanitizeSlotTextForTargetCharacter(
+  rawText: string,
+  targetCharacter?: CharacterConfig,
+  options?: { knownCharacterHints?: string[]; preserveAppearanceTokens?: boolean }
+): string {
+  const antiTex = stripForbiddenAntiTextureFullText(rawText);
+  const tokens = splitPromptTags(antiTex.cleanedText);
+  const targetForbiddenMatchers = buildTargetForbiddenMatchers(targetCharacter);
+  const targetAppearanceSet = new Set(
+    splitPromptTags(targetCharacter?.appearance.text ?? '')
+      .map((t) => stripTokenWeightForClassify(t).toLowerCase())
+      .filter(Boolean)
+  );
+  const hintMatchers: RegExp[] = [];
+  for (const rawHint of options?.knownCharacterHints ?? []) {
+    const cleanHint = rawHint.trim().toLowerCase();
+    if (!cleanHint) continue;
+    const baseName = cleanHint.replace(/\s*\([^)]*\)\s*/g, '').trim();
+    if (baseName.length >= 2) {
+      const escapedBase = baseName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      hintMatchers.push(
+        /[\u4e00-\u9fa5]/.test(baseName)
+          ? new RegExp(escapedBase, 'i')
+          : new RegExp(`\\b${escapedBase}\\b`, 'i')
+      );
+    }
+  }
+
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const token of tokens) {
+    const bare = stripTokenWeightForClassify(token);
+    if (!bare) continue;
+    const lower = bare.toLowerCase();
+    const classifyText = lower.replace(/_/g, ' ');
+    if (isDollPlasticTextureTag(token)) continue;
+    if (IRON_RULE_1_FACE_TERMS_RE.test(classifyText)) continue;
+    if (targetForbiddenMatchers.some((re) => re.test(classifyText))) continue;
+    if (
+      !options?.preserveAppearanceTokens &&
+      (SERIES_CHARACTER_TAG_RE.test(classifyText) ||
+        IDENTITY_HAIR_EYES_SPECIES_RE.test(classifyText) ||
+        HAIR_ACCESSORY_BLEED_RE.test(classifyText) ||
+        targetAppearanceSet.has(lower) ||
+        targetAppearanceSet.has(classifyText) ||
+        hintMatchers.some((re) => re.test(classifyText)))
+    ) {
+      continue;
+    }
+    if (seen.has(lower)) continue;
+    seen.add(lower);
+    out.push(token.trim());
+  }
+  return out.join(', ');
+}
 
 export interface PreparedCardPromptsForApply {
   rawPositive: string;
@@ -3815,10 +4142,12 @@ export function prepareCardPromptsForCharacterApply(
     knownCharacterHints?: string[];
     preserveIdentityAndHair?: boolean;
     sourceScope?: 'effective' | 'extracted';
+    targetCharacter?: CharacterConfig;
   }
 ): PreparedCardPromptsForApply {
   const preserveIdentity = options?.preserveIdentityAndHair ?? true;
   const useExtractedOnly = options?.sourceScope === 'extracted';
+  const targetCharacter = options?.targetCharacter;
   const rawPositive = (
     useExtractedOnly
       ? card.extractedPositive
@@ -3855,9 +4184,15 @@ export function prepareCardPromptsForCharacterApply(
     const escaped = feat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     return new RegExp(`\\b${escaped}\\b`, 'i');
   });
+  const targetForbiddenMatchers = buildTargetForbiddenMatchers(targetCharacter);
+  const targetAppearanceSet = new Set(
+    splitPromptTags(targetCharacter?.appearance.text ?? '')
+      .map((t) => stripTokenWeightForClassify(t).toLowerCase())
+      .filter(Boolean)
+  );
 
   const posAntiTex = stripForbiddenAntiTextureFullText(rawPositive);
-  const posTokens = splitPromptTags(posAntiTex.cleanedText);
+  const posTokens = expandParenthesizedMultiTagTokens(splitPromptTags(posAntiTex.cleanedText));
   const strippedIdentityTags: string[] = [...posAntiTex.removedTerms];
 
   const outfitList: string[] = [];
@@ -3870,23 +4205,32 @@ export function prepareCardPromptsForCharacterApply(
     const bare = stripTokenWeightForClassify(token);
     if (!bare) continue;
     const lower = bare.toLowerCase();
+    const classifyText = lower.replace(/_/g, ' ');
 
     if (isDollPlasticTextureTag(token)) {
       strippedIdentityTags.push(bare);
       continue;
     }
 
-    if (STUDIO_BOILERPLATE_TOKEN_RE.test(lower) || META_PREFIX_TOKEN_RE.test(lower)) {
+    if (
+      STUDIO_BOILERPLATE_TOKEN_RE.test(classifyText) ||
+      META_PREFIX_TOKEN_RE.test(lower) ||
+      IRON_RULE_1_FACE_TERMS_RE.test(classifyText)
+    ) {
       strippedIdentityTags.push(bare);
       continue;
     }
 
     if (preserveIdentity) {
       const isIdentityHit =
-        SERIES_CHARACTER_TAG_RE.test(lower) ||
-        IDENTITY_HAIR_EYES_SPECIES_RE.test(lower) ||
-        forbiddenFeatureMatchers.some((re) => re.test(lower)) ||
-        hintMatchers.some((re) => re.test(lower));
+        SERIES_CHARACTER_TAG_RE.test(classifyText) ||
+        IDENTITY_HAIR_EYES_SPECIES_RE.test(classifyText) ||
+        HAIR_ACCESSORY_BLEED_RE.test(classifyText) ||
+        targetAppearanceSet.has(lower) ||
+        targetAppearanceSet.has(classifyText) ||
+        targetForbiddenMatchers.some((re) => re.test(classifyText)) ||
+        forbiddenFeatureMatchers.some((re) => re.test(classifyText)) ||
+        hintMatchers.some((re) => re.test(classifyText));
       if (isIdentityHit) {
         strippedIdentityTags.push(bare);
         continue;
@@ -3896,11 +4240,15 @@ export function prepareCardPromptsForCharacterApply(
     if (seenKeys.has(lower)) continue;
     seenKeys.add(lower);
 
-    if (APPLY_BG_TOKEN_RE.test(lower)) {
+    if (APPLY_BG_TOKEN_RE.test(classifyText)) {
       backgroundList.push(token);
-    } else if (APPLY_EXPR_TOKEN_RE.test(lower)) {
+    } else if (
+      APPLY_EXPR_EMOTICON_RE.test(lower) ||
+      (APPLY_EXPR_TOKEN_RE.test(classifyText) &&
+        !/\b(?:looking down at pages|looking back over shoulder)\b/i.test(classifyText))
+    ) {
       expressionList.push(token);
-    } else if (APPLY_POSE_TOKEN_RE.test(lower)) {
+    } else if (APPLY_POSE_TOKEN_RE.test(classifyText)) {
       poseList.push(token);
     } else {
       outfitList.push(token);
@@ -3921,7 +4269,13 @@ export function prepareCardPromptsForCharacterApply(
       strippedNegativeTags.push(bare);
       continue;
     }
-    if (forbiddenFeatureMatchers.some((re) => re.test(lower))) {
+    if (
+      forbiddenFeatureMatchers.some((re) => re.test(lower)) ||
+      IDENTITY_HAIR_EYES_SPECIES_RE.test(lower) ||
+      HAIR_ACCESSORY_BLEED_RE.test(lower) ||
+      targetForbiddenMatchers.some((re) => re.test(lower)) ||
+      hintMatchers.some((re) => re.test(lower))
+    ) {
       strippedNegativeTags.push(bare);
       continue;
     }

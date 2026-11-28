@@ -41,19 +41,24 @@ import {
   buildCopyAllOutput,
   buildNegativePromptWithMeta,
   buildWorkflowSnippet,
+  clampLoraWeight,
   detectConflicts,
   exportComfyProfilePayload,
   fetchComfyNodeOptions,
   getActiveLoaderKeys,
   inferYiHairstyleFromAppearance,
   LOADER_NODE_META,
+  MAX_COMFY_LORAS,
   parseComfyProfileImport,
   sanitizeFilenamePrefix,
   splitPromptTags,
   stripForbiddenAntiTextureFullText,
   stripLegacyExpressionTokensFromAppearance,
 } from './utils/promptBuilder';
-import { mergePromptSlotTexts } from './utils/workflowLibrary';
+import {
+  mergePromptSlotTexts,
+  sanitizeSlotTextForTargetCharacter,
+} from './utils/workflowLibrary';
 import { CharacterSidebar } from './components/CharacterSidebar';
 import { CharacterEditorPanel } from './components/CharacterEditorPanel';
 import { SharedLayerPanel } from './components/SharedLayerPanel';
@@ -144,12 +149,15 @@ function normalizeProfile(raw: Partial<ComfyProfile>, fallbackIndex = 0): ComfyP
       ...(raw.loaders ?? {}),
     },
     loras: Array.isArray(raw.loras)
-      ? raw.loras.slice(0, 8).map((l, idx) => ({
+      ? raw.loras.slice(0, MAX_COMFY_LORAS).map((l, idx) => ({
           id: l.id || `lora-${idx}-${Date.now()}`,
           name: l.name ?? '',
-          model: typeof l.model === 'number' && Number.isFinite(l.model) ? l.model : 1.0,
-          clip: typeof l.clip === 'number' && Number.isFinite(l.clip) ? l.clip : 1.0,
+          model: clampLoraWeight(typeof l.model === 'number' ? l.model : 1.0, 1.0),
+          clip: clampLoraWeight(typeof l.clip === 'number' ? l.clip : 1.0, 1.0),
           condition: l.condition === 'ibuki_only' ? 'ibuki_only' : null,
+          enabled: l.enabled !== false,
+          triggerWords: typeof l.triggerWords === 'string' ? l.triggerWords : '',
+          note: typeof l.note === 'string' ? l.note : '',
         }))
       : DEFAULT_ANIMA_LORAS.map((l) => ({ ...l })),
     sampling: {
@@ -342,8 +350,45 @@ function normalizeStudioConfig(raw: Partial<StudioConfig>): StudioConfig {
         : defaults.characters,
     customBackgrounds: Array.isArray(raw.customBackgrounds)
       ? raw.customBackgrounds
+          .filter(
+            (bg) =>
+              bg &&
+              typeof bg === 'object' &&
+              typeof bg.zhName === 'string' &&
+              typeof bg.tags === 'string' &&
+              bg.zhName.trim().length > 0 &&
+              bg.tags.trim().length > 0
+          )
+          .map((bg, idx) => ({
+            id: bg.id || `custom-bg-${Date.now()}-${idx}`,
+            zhName: bg.zhName.trim(),
+            note: typeof bg.note === 'string' ? bg.note.trim() : '',
+            tags: bg.tags.trim(),
+            isCustom: true,
+          }))
       : [],
     customPresets: Array.isArray(raw.customPresets) ? raw.customPresets : [],
+    customLoras: Array.isArray(raw.customLoras)
+      ? raw.customLoras
+          .filter(
+            (l) =>
+              l &&
+              typeof l === 'object' &&
+              typeof l.name === 'string' &&
+              l.name.trim().length > 0
+          )
+          .slice(0, MAX_COMFY_LORAS * 2)
+          .map((l, idx) => ({
+            id: l.id || `custom-lora-${idx}-${Date.now()}`,
+            name: l.name.trim(),
+            model: clampLoraWeight(typeof l.model === 'number' ? l.model : 1.0, 1.0),
+            clip: clampLoraWeight(typeof l.clip === 'number' ? l.clip : 1.0, 1.0),
+            condition: null,
+            enabled: l.enabled !== false,
+            triggerWords: typeof l.triggerWords === 'string' ? l.triggerWords : '',
+            note: typeof l.note === 'string' ? l.note : '',
+          }))
+      : [],
   };
 }
 
@@ -632,206 +677,259 @@ export default function App() {
 
       setSelectedCharId(payload.targetCharacterId);
 
-      if (payload.persistToCharacter) {
-        pushHistory(
-          `永久套用卡片「${payload.cardTitle}」到「${targetChar.name}」前`,
-          config
-        );
+      pushHistory(
+        `${payload.persistToCharacter ? '永久' : ''}套用卡片「${payload.cardTitle}」到「${targetChar.name}」前`,
+        config
+      );
 
-        const cleanPosSlot = (raw: string): string =>
-          stripForbiddenAntiTextureFullText(raw).cleanedText;
+      const cleanPosSlot = (raw: string): string =>
+        sanitizeSlotTextForTargetCharacter(raw, targetChar, {
+          knownCharacterHints,
+        });
 
-        const cleanSafeNegative = (raw: string): string => {
-          const strippedAntiTex = stripForbiddenAntiTextureFullText(raw).cleanedText;
-          const forbiddenMatchers = CHARACTER_FORBIDDEN_FEATURES.map((feat) => {
-            const escaped = feat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            return new RegExp(`\\b${escaped}\\b`, 'i');
+      const cleanSafeNegative = (raw: string): string => {
+        const strippedAntiTex = stripForbiddenAntiTextureFullText(raw).cleanedText;
+        const forbiddenMatchers = CHARACTER_FORBIDDEN_FEATURES.map((feat) => {
+          const escaped = feat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          return new RegExp(`\\b${escaped}\\b`, 'i');
+        });
+        return splitPromptTags(strippedAntiTex)
+          .filter((token) => !forbiddenMatchers.some((re) => re.test(token)))
+          .join(', ');
+      };
+
+      updateConfig((prev) => {
+        const nextCharacters = prev.characters.map((ch) => {
+          if (ch.id !== payload.targetCharacterId) return ch;
+          const nextOutfitText =
+            payload.applyOutfit && payload.outfitText.trim()
+              ? mergePromptSlotTexts(
+                  ch.outfit.text,
+                  cleanPosSlot(payload.outfitText),
+                  payload.outfitMode
+                )
+              : ch.outfit.text;
+          const nextPoseText =
+            payload.applyPose && payload.poseText.trim()
+              ? mergePromptSlotTexts(
+                  ch.pose.text,
+                  cleanPosSlot(payload.poseText),
+                  payload.poseMode
+                )
+              : ch.pose.text;
+          const nextExprText = payload.applyExpression
+            ? payload.expressionMode === 'replace'
+              ? cleanPosSlot(payload.expressionText)
+              : payload.expressionText.trim()
+              ? mergePromptSlotTexts(
+                  ch.expression.text,
+                  cleanPosSlot(payload.expressionText),
+                  'append'
+                )
+              : ch.expression.text
+            : ch.expression.text;
+
+          // 严格锁定目标角色的身份外貌、发型、发饰与第4层LoRA开关，不被收藏卡覆盖
+          return {
+            ...ch,
+            outfit: { ...ch.outfit, text: nextOutfitText },
+            pose: { ...ch.pose, text: nextPoseText },
+            expression: { ...ch.expression, text: nextExprText },
+          };
+        });
+
+        let nextShared = prev.shared;
+        if (payload.applyBackground && payload.backgroundText.trim()) {
+          const nextBgText = mergePromptSlotTexts(
+            nextShared.background.text,
+            cleanPosSlot(payload.backgroundText),
+            payload.backgroundMode
+          );
+          const nextBgName =
+            payload.backgroundMode === 'append' && nextShared.selectedBackgroundName?.trim()
+              ? `${nextShared.selectedBackgroundName.trim()} + 来自收藏卡 · ${payload.cardTitle}`
+              : `来自收藏卡 · ${payload.cardTitle}`;
+          nextShared = {
+            ...nextShared,
+            background: { ...nextShared.background, text: nextBgText },
+            selectedBackgroundId: null,
+            selectedBackgroundName: nextBgName,
+          };
+          patchUiCache({
+            selectedBackgroundId: null,
+            selectedBackgroundName: nextBgName,
           });
-          return splitPromptTags(strippedAntiTex)
-            .filter((token) => !forbiddenMatchers.some((re) => re.test(token)))
-            .join(', ');
-        };
+        }
 
-        updateConfig((prev) => {
-          const nextCharacters = prev.characters.map((ch) => {
-            if (ch.id !== payload.targetCharacterId) return ch;
-            const nextOutfitText =
-              payload.applyOutfit && payload.outfitText.trim()
-                ? mergePromptSlotTexts(
-                    ch.outfit.text,
-                    cleanPosSlot(payload.outfitText),
-                    payload.outfitMode
-                  )
-                : ch.outfit.text;
-            const nextPoseText =
-              payload.applyPose && payload.poseText.trim()
-                ? mergePromptSlotTexts(
-                    ch.pose.text,
-                    cleanPosSlot(payload.poseText),
-                    payload.poseMode
-                  )
-                : ch.pose.text;
-            const nextExprText =
-              payload.applyExpression && payload.expressionText.trim()
-                ? mergePromptSlotTexts(
-                    ch.expression.text,
-                    cleanPosSlot(payload.expressionText),
-                    payload.expressionMode
-                  )
-                : ch.expression.text;
-
-            return {
-              ...ch,
-              outfit: { ...ch.outfit, text: nextOutfitText },
-              pose: { ...ch.pose, text: nextPoseText },
-              expression: { ...ch.expression, text: nextExprText },
-            };
-          });
-
-          let nextShared = prev.shared;
-          if (payload.applyBackground && payload.backgroundText.trim()) {
-            const nextBgText = mergePromptSlotTexts(
-              nextShared.background.text,
-              cleanPosSlot(payload.backgroundText),
-              payload.backgroundMode
-            );
-            nextShared = {
-              ...nextShared,
-              background: { ...nextShared.background, text: nextBgText },
-              selectedBackgroundId: null,
-              selectedBackgroundName: `来自收藏卡 · ${payload.cardTitle}`,
-            };
-          }
-
-          if (payload.applyNegative && payload.negativeText.trim()) {
-            const safeNeg = cleanSafeNegative(payload.negativeText);
-            if (safeNeg) {
-              if (payload.negativeMode === 'replace-override') {
+        if (payload.applyNegative && payload.negativeText.trim()) {
+          const safeNeg = cleanSafeNegative(payload.negativeText);
+          if (safeNeg) {
+            if (payload.negativeMode === 'replace-override') {
+              nextShared = {
+                ...nextShared,
+                manualNegativeOverride: safeNeg,
+              };
+            } else if (nextShared.manualNegativeOverride !== null) {
+              nextShared = {
+                ...nextShared,
+                manualNegativeOverride: mergePromptSlotTexts(
+                  nextShared.manualNegativeOverride,
+                  safeNeg,
+                  'append'
+                ),
+              };
+            } else {
+              const incomingTags = splitPromptTags(safeNeg);
+              const existingAll = new Set(
+                nextShared.negativeGroups.flatMap((g) =>
+                  g.tags.map((t) => t.text.trim().toLowerCase())
+                )
+              );
+              const toAppend = incomingTags.filter(
+                (tag) => !existingAll.has(tag.trim().toLowerCase())
+              );
+              if (toAppend.length > 0) {
+                const targetGroupExists = nextShared.negativeGroups.some(
+                  (g) => g.id === 'general-quality'
+                );
                 nextShared = {
                   ...nextShared,
-                  manualNegativeOverride: safeNeg,
+                  negativeGroups: nextShared.negativeGroups.map((g, idx) => {
+                    const isTarget = targetGroupExists
+                      ? g.id === 'general-quality'
+                      : idx === nextShared.negativeGroups.length - 1;
+                    if (!isTarget) return g;
+                    return {
+                      ...g,
+                      enabled: true,
+                      tags: [
+                        ...g.tags,
+                        ...toAppend.map((text, tIdx) => ({
+                          id: `card-neg-${Date.now()}-${tIdx}`,
+                          text,
+                          weight: 1.0,
+                        })),
+                      ],
+                    };
+                  }),
                 };
-              } else if (nextShared.manualNegativeOverride !== null) {
-                nextShared = {
-                  ...nextShared,
-                  manualNegativeOverride: mergePromptSlotTexts(
-                    nextShared.manualNegativeOverride,
-                    safeNeg,
-                    'append'
-                  ),
-                };
-              } else {
-                const incomingTags = splitPromptTags(safeNeg);
-                const existingAll = new Set(
-                  nextShared.negativeGroups.flatMap((g) =>
-                    g.tags.map((t) => t.text.trim().toLowerCase())
-                  )
-                );
-                const toAppend = incomingTags.filter(
-                  (tag) => !existingAll.has(tag.trim().toLowerCase())
-                );
-                if (toAppend.length > 0) {
-                  const targetGroupExists = nextShared.negativeGroups.some(
-                    (g) => g.id === 'general-quality'
-                  );
-                  nextShared = {
-                    ...nextShared,
-                    negativeGroups: nextShared.negativeGroups.map((g, idx) => {
-                      const isTarget = targetGroupExists
-                        ? g.id === 'general-quality'
-                        : idx === nextShared.negativeGroups.length - 1;
-                      if (!isTarget) return g;
-                      return {
-                        ...g,
-                        enabled: true,
-                        tags: [
-                          ...g.tags,
-                          ...toAppend.map((text, tIdx) => ({
-                            id: `card-neg-${Date.now()}-${tIdx}`,
-                            text,
-                            weight: 1.0,
-                          })),
-                        ],
-                      };
-                    }),
-                  };
-                }
               }
             }
           }
+        }
 
-          let nextProfiles = prev.comfyProfiles;
-          if (payload.applySamplingParams && payload.samplingParams) {
-            const sp = payload.samplingParams;
-            const baseList =
-              prev.comfyProfiles && prev.comfyProfiles.length > 0
-                ? prev.comfyProfiles
-                : DEFAULT_COMFY_PROFILES;
-            const activeId = prev.activeComfyProfileId ?? baseList[0].id;
-            nextProfiles = baseList.map((profile) => {
-              if (profile.id !== activeId) return profile;
-              const manualSet = new Set<keyof ComfySamplingParams>(
-                profile.manualSamplingFields ?? []
-              );
-              const nextSampling: ComfySamplingParams = { ...profile.sampling };
-              if (typeof sp.width === 'number' && sp.width >= 64) {
-                nextSampling.width = sp.width;
-                manualSet.add('width');
-              }
-              if (typeof sp.height === 'number' && sp.height >= 64) {
-                nextSampling.height = sp.height;
-                manualSet.add('height');
-              }
-              if (typeof sp.steps === 'number' && sp.steps >= 1) {
-                nextSampling.steps = sp.steps;
-                manualSet.add('steps');
-              }
-              if (typeof sp.cfg === 'number' && sp.cfg > 0) {
-                nextSampling.cfg = sp.cfg;
-                manualSet.add('cfg');
-              }
-              if (typeof sp.sampler === 'string' && sp.sampler.trim()) {
-                nextSampling.sampler = sp.sampler.trim();
-                manualSet.add('sampler');
-              }
-              if (typeof sp.scheduler === 'string' && sp.scheduler.trim()) {
-                nextSampling.scheduler = sp.scheduler.trim();
-                manualSet.add('scheduler');
-              }
-              if (typeof sp.denoise === 'number' && sp.denoise > 0 && sp.denoise <= 1) {
-                nextSampling.denoise = sp.denoise;
-                manualSet.add('denoise');
-              }
-              if (typeof sp.seed === 'number' && sp.seed >= 0) {
-                nextSampling.seedMode = 'fixed';
-                nextSampling.seed = sp.seed;
-                manualSet.add('seedMode');
-                manualSet.add('seed');
-              }
-              return {
-                ...profile,
-                sampling: nextSampling,
-                manualSamplingFields: Array.from(manualSet),
-              };
-            });
-          }
+        let nextProfiles = prev.comfyProfiles;
+        if (payload.applySamplingParams && payload.samplingParams) {
+          const sp = payload.samplingParams;
+          const baseList =
+            prev.comfyProfiles && prev.comfyProfiles.length > 0
+              ? prev.comfyProfiles
+              : DEFAULT_COMFY_PROFILES;
+          const activeId = prev.activeComfyProfileId ?? baseList[0].id;
+          nextProfiles = baseList.map((profile) => {
+            if (profile.id !== activeId) return profile;
+            const manualSet = new Set<keyof ComfySamplingParams>(
+              profile.manualSamplingFields ?? []
+            );
+            const nextSampling: ComfySamplingParams = { ...profile.sampling };
+            if (typeof sp.width === 'number' && sp.width >= 64) {
+              nextSampling.width = sp.width;
+              manualSet.add('width');
+            }
+            if (typeof sp.height === 'number' && sp.height >= 64) {
+              nextSampling.height = sp.height;
+              manualSet.add('height');
+            }
+            if (typeof sp.steps === 'number' && sp.steps >= 1) {
+              nextSampling.steps = sp.steps;
+              manualSet.add('steps');
+            }
+            if (typeof sp.cfg === 'number' && sp.cfg > 0) {
+              nextSampling.cfg = sp.cfg;
+              manualSet.add('cfg');
+            }
+            if (typeof sp.sampler === 'string' && sp.sampler.trim()) {
+              nextSampling.sampler = sp.sampler.trim();
+              manualSet.add('sampler');
+            }
+            if (typeof sp.scheduler === 'string' && sp.scheduler.trim()) {
+              nextSampling.scheduler = sp.scheduler.trim();
+              manualSet.add('scheduler');
+            }
+            if (typeof sp.denoise === 'number' && sp.denoise > 0 && sp.denoise <= 1) {
+              nextSampling.denoise = sp.denoise;
+              manualSet.add('denoise');
+            }
+            // 若当前模型方案开启了「每次随机 Seed」，保留随机策略不被覆盖
+            if (
+              (profile.sampling.seedMode ?? 'fixed') !== 'random' &&
+              typeof sp.seed === 'number' &&
+              sp.seed >= 0
+            ) {
+              nextSampling.seedMode = 'fixed';
+              nextSampling.seed = sp.seed;
+              manualSet.add('seedMode');
+              manualSet.add('seed');
+            }
+            return {
+              ...profile,
+              sampling: nextSampling,
+              manualSamplingFields: Array.from(manualSet),
+            };
+          });
+        }
 
-          return {
-            ...prev,
-            shared: nextShared,
-            characters: nextCharacters,
-            comfyProfiles: nextProfiles,
-          };
-        });
-      }
+        if (payload.syncLorasToProfile && Array.isArray(payload.lorasOverride)) {
+          const baseList =
+            nextProfiles && nextProfiles.length > 0
+              ? nextProfiles
+              : prev.comfyProfiles && prev.comfyProfiles.length > 0
+              ? prev.comfyProfiles
+              : DEFAULT_COMFY_PROFILES;
+          const activeId = prev.activeComfyProfileId ?? baseList[0].id;
+          nextProfiles = baseList.map((profile) => {
+            if (profile.id !== activeId) return profile;
+            return {
+              ...profile,
+              loras: payload.lorasOverride!.slice(0, MAX_COMFY_LORAS).map((l, idx) => ({
+                id: l.id || `lora-sync-${Date.now()}-${idx}`,
+                name: l.name.trim(),
+                model: clampLoraWeight(l.model, 1.0),
+                clip: clampLoraWeight(l.clip, 1.0),
+                condition: l.condition === 'ibuki_only' ? 'ibuki_only' : null,
+                enabled: l.enabled !== false,
+                triggerWords: typeof l.triggerWords === 'string' ? l.triggerWords : '',
+                note: typeof l.note === 'string' ? l.note : '',
+              })),
+            };
+          });
+        }
+
+        return {
+          ...prev,
+          shared: nextShared,
+          characters: nextCharacters,
+          comfyProfiles: nextProfiles,
+        };
+      });
 
       if (payload.switchAndClose && !payload.runDirectly) {
         setWorkbenchOpen(false);
+        if (applyCardToastTimerRef.current !== null) {
+          window.clearTimeout(applyCardToastTimerRef.current);
+        }
+        setApplyCardToast(
+          `已切换至「${targetChar.name}」并同步收藏图「${payload.cardTitle}」内容（身份与发型已锁定）`
+        );
+        applyCardToastTimerRef.current = window.setTimeout(() => {
+          setApplyCardToast(null);
+          applyCardToastTimerRef.current = null;
+        }, 4200);
       }
 
       return { ok: true };
     },
-    [config, pushHistory, setSelectedCharId, updateConfig]
+    [config, knownCharacterHints, pushHistory, setSelectedCharId, updateConfig]
   );
 
   useEffect(() => {
@@ -965,6 +1063,7 @@ export default function App() {
       includeAppearance,
       customPresets: config.customPresets ?? [],
       customBackgrounds: config.customBackgrounds ?? [],
+      activeProfile,
     });
     await copyToClipboard(text);
     setCopiedAll(true);
@@ -978,6 +1077,7 @@ export default function App() {
       includeAppearance,
       customPresets: config.customPresets ?? [],
       customBackgrounds: config.customBackgrounds ?? [],
+      activeProfile,
     });
     await copyToClipboard(text);
     setCopiedSnippet(true);
@@ -1472,6 +1572,7 @@ export default function App() {
             characters={config.characters}
             selectedCharId={activeCharacter?.id ?? ''}
             includeAppearance={includeAppearance}
+            activeProfile={activeProfile}
             customPresets={config.customPresets ?? []}
             customBackgrounds={config.customBackgrounds ?? []}
             onSelectCharacter={setSelectedCharId}
@@ -1649,6 +1750,18 @@ export default function App() {
         characters={config.characters}
         selectedCharId={activeCharacter?.id ?? ''}
         knownCharacterHints={knownCharacterHints}
+        shared={config.shared}
+        customPresets={config.customPresets ?? []}
+        customBackgrounds={config.customBackgrounds ?? []}
+        onUpdateCustomBackgrounds={(items) =>
+          updateConfig((prev) => ({ ...prev, customBackgrounds: items }))
+        }
+        availableLoras={validation.loraAvailable}
+        customLoras={config.customLoras ?? []}
+        onUpdateCustomLoras={(items) =>
+          updateConfig((prev) => ({ ...prev, customLoras: items }))
+        }
+        onRefreshAvailableLoras={() => probeComfyLoaders()}
         onOpenSettings={handleOpenSettingsFromWorkbench}
         onApplyCardToCharacter={handleApplyWorkflowCardToCharacter}
       />
