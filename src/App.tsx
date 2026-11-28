@@ -51,6 +51,7 @@ import {
   LOADER_NODE_META,
   MAX_COMFY_LORAS,
   parseComfyProfileImport,
+  removeNegativeTagFromShared,
   sanitizeFilenamePrefix,
   splitPromptTags,
   stripForbiddenAntiTextureFullText,
@@ -1214,26 +1215,10 @@ export default function App() {
     }
 
     if (conflict.fixType === 'remove-negative-tag' && conflict.targetTag) {
-      const targetLower = conflict.targetTag.toLowerCase();
+      const targetTag = conflict.targetTag;
       updateConfig((prev) => ({
         ...prev,
-        shared: {
-          ...prev.shared,
-          manualNegativeOverride:
-            prev.shared.manualNegativeOverride !== null
-              ? prev.shared.manualNegativeOverride
-                  .split(',')
-                  .map((s) => s.trim())
-                  .filter((s) => !s.toLowerCase().includes(targetLower))
-                  .join(', ')
-              : null,
-          negativeGroups: prev.shared.negativeGroups.map((g) => ({
-            ...g,
-            tags: g.tags.filter(
-              (t) => t.text.trim().toLowerCase() !== targetLower
-            ),
-          })),
-        },
+        shared: removeNegativeTagFromShared(prev.shared, targetTag),
       }));
       return;
     }
@@ -1913,6 +1898,13 @@ export default function App() {
         selectedCharId={activeCharacter?.id ?? ''}
         knownCharacterHints={knownCharacterHints}
         shared={config.shared}
+        onRemoveGlobalNegativeTag={(tag) => {
+          pushHistory('弹窗移除负向冲突词前', config);
+          updateConfig((prev) => ({
+            ...prev,
+            shared: removeNegativeTagFromShared(prev.shared, tag),
+          }));
+        }}
         customPresets={config.customPresets ?? []}
         customBackgrounds={config.customBackgrounds ?? []}
         onUpdateCustomBackgrounds={(items) =>

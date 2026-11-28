@@ -122,16 +122,44 @@ export function formatWeightedText(text: string, weight: number): string {
   return `(${trimmed}:${formatWeightNumber(w)})`;
 }
 
+function findBalancedDelimiterIndices(raw: string): Set<number> {
+  const paired = new Set<number>();
+  const parenStack: number[] = [];
+  const bracketStack: number[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (ch === '(') {
+      parenStack.push(i);
+    } else if (ch === ')') {
+      const openIdx = parenStack.pop();
+      if (openIdx !== undefined) {
+        paired.add(openIdx);
+        paired.add(i);
+      }
+    } else if (ch === '[') {
+      bracketStack.push(i);
+    } else if (ch === ']') {
+      const openIdx = bracketStack.pop();
+      if (openIdx !== undefined) {
+        paired.add(openIdx);
+        paired.add(i);
+      }
+    }
+  }
+  return paired;
+}
+
 export function splitPromptTags(raw: string): string[] {
+  const paired = findBalancedDelimiterIndices(raw);
   const result: string[] = [];
   let current = '';
   let depth = 0;
   for (let i = 0; i < raw.length; i++) {
     const ch = raw[i];
-    if (ch === '(' || ch === '[') {
+    if ((ch === '(' || ch === '[') && paired.has(i)) {
       depth += 1;
       current += ch;
-    } else if (ch === ')' || ch === ']') {
+    } else if ((ch === ')' || ch === ']') && paired.has(i)) {
       depth = Math.max(0, depth - 1);
       current += ch;
     } else if ((ch === ',' || ch === '，' || ch === '\n') && depth === 0) {
@@ -1377,6 +1405,13 @@ export function buildNegativePromptWithMeta(
     appendedTags.push(tag.trim());
   };
 
+  const positiveCleanSet = new Set(
+    splitPromptTags(combinedPositive)
+      .map((t) => stripWeightSyntax(t).replace(/_/g, ' ').replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+  );
+  const hasExplicitBedPose = /\b(?:on bed|lying on bed|sitting on bed)\b/i.test(combinedPositive);
+
   if (hasExplicitPlush) {
     ANTI_DUPLICATE_ONLY_TAGS.forEach(pushUnique);
   } else {
@@ -1384,7 +1419,14 @@ export function buildNegativePromptWithMeta(
   }
 
   if (hasPajama) {
-    PAJAMA_BED_GUARD_TAGS.forEach(pushUnique);
+    PAJAMA_BED_GUARD_TAGS.forEach((tag) => {
+      const cleanTag = stripWeightSyntax(tag).replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
+      if (positiveCleanSet.has(cleanTag)) return;
+      if (hasExplicitBedPose && (cleanTag === 'bed' || cleanTag === 'on bed' || cleanTag === 'lying on bed')) {
+        return;
+      }
+      pushUnique(tag);
+    });
     if (!hasExplicitPlush) {
       PAJAMA_PLUSH_GUARD_TAGS.forEach(pushUnique);
     }
@@ -1396,7 +1438,11 @@ export function buildNegativePromptWithMeta(
   }
 
   if (hasExplicitStandingPose) {
-    ANTI_SITTING_GUARD_TAGS.forEach(pushUnique);
+    ANTI_SITTING_GUARD_TAGS.forEach((tag) => {
+      const cleanTag = stripWeightSyntax(tag).replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
+      if (positiveCleanSet.has(cleanTag)) return;
+      pushUnique(tag);
+    });
   }
 
   const yiChar = includeAppearance
@@ -1596,28 +1642,120 @@ function stripWeightSyntax(raw: string): string {
     .toLowerCase();
 }
 
+function normalizeTagForMatch(raw: string): string {
+  return stripWeightSyntax(raw).replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function unwrapMultiTagGroup(token: string): {
+  inner: string;
+  weightSuffix: string;
+  wrapped: boolean;
+} | null {
+  const trimmed = token.trim();
+  if (!trimmed.startsWith('(') || !trimmed.endsWith(')')) return null;
+  const weightedMatch = trimmed.match(/^\(([\s\S]+):([0-9.]+)\)$/);
+  if (weightedMatch && /[,，\n]/.test(weightedMatch[1])) {
+    return {
+      inner: weightedMatch[1].trim(),
+      weightSuffix: `:${weightedMatch[2]}`,
+      wrapped: true,
+    };
+  }
+  const plainInner = trimmed.slice(1, -1).trim();
+  if (/[,，\n]/.test(plainInner)) {
+    return {
+      inner: plainInner,
+      weightSuffix: '',
+      wrapped: true,
+    };
+  }
+  return null;
+}
+
 function splitCleanTerms(raw: string): string[] {
   return splitPromptTags(raw)
-    .map((part) => stripWeightSyntax(part))
+    .flatMap((part) => {
+      const unwrapped = unwrapMultiTagGroup(part);
+      return unwrapped ? splitPromptTags(unwrapped.inner) : [part];
+    })
+    .map((part) => normalizeTagForMatch(part))
     .filter((t) => t.length >= 2);
 }
 
 export function stripTagFromSlotText(slotText: string, targetTag: string): string {
-  const cleanTarget = stripWeightSyntax(targetTag).replace(/\s+/g, ' ').trim();
+  const cleanTarget = normalizeTagForMatch(targetTag);
   if (!cleanTarget || !slotText.trim()) return slotText;
   const escaped = cleanTarget.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const wordRe = /[\u4e00-\u9fa5]/.test(cleanTarget)
     ? new RegExp(escaped, 'i')
     : new RegExp(`^${escaped}$|\\b${escaped}\\b`, 'i');
 
-  return splitPromptTags(slotText)
-    .filter((token) => {
-      const bare = stripWeightSyntax(token).replace(/\s+/g, ' ').trim();
-      if (!bare) return false;
-      if (bare === cleanTarget) return false;
-      return !wordRe.test(bare);
-    })
-    .join(', ');
+  const out: string[] = [];
+  for (const token of splitPromptTags(slotText)) {
+    const bare = normalizeTagForMatch(token);
+    if (!bare) continue;
+    if (bare === cleanTarget) continue;
+
+    const unwrapped = unwrapMultiTagGroup(token);
+    if (unwrapped) {
+      const innerStripped = stripTagFromSlotText(unwrapped.inner, cleanTarget);
+      if (innerStripped.trim()) {
+        out.push(
+          unwrapped.weightSuffix
+            ? `(${innerStripped}${unwrapped.weightSuffix})`
+            : `(${innerStripped})`
+        );
+      }
+      continue;
+    }
+
+    if (wordRe.test(bare)) continue;
+    out.push(token);
+  }
+  return out.join(', ');
+}
+
+export function removeNegativeTagFromShared(
+  shared: SharedConfig,
+  targetTag: string
+): SharedConfig {
+  const cleanTarget = normalizeTagForMatch(targetTag);
+  if (!cleanTarget) return shared;
+  const escaped = cleanTarget.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const exactOrPhraseRe = /[\u4e00-\u9fa5]/.test(cleanTarget)
+    ? new RegExp(escaped, 'i')
+    : new RegExp(`^${escaped}$|\\b${escaped}\\b`, 'i');
+
+  const nextManualOverride =
+    shared.manualNegativeOverride !== null
+      ? stripTagFromSlotText(shared.manualNegativeOverride, cleanTarget)
+      : null;
+
+  const nextNegativeGroups = shared.negativeGroups.map((group) => ({
+    ...group,
+    tags: group.tags
+      .map((tag) => {
+        const bare = normalizeTagForMatch(tag.text);
+        if (!bare || bare === cleanTarget) {
+          return null;
+        }
+        if (/[,，\n]/.test(tag.text)) {
+          const stripped = stripTagFromSlotText(tag.text, cleanTarget);
+          return stripped.trim() ? { ...tag, text: stripped } : null;
+        }
+        if (exactOrPhraseRe.test(bare)) {
+          return null;
+        }
+        return tag;
+      })
+      .filter((t): t is NonNullable<typeof t> => t !== null),
+  }));
+
+  return {
+    ...shared,
+    manualNegativeOverride: nextManualOverride,
+    negativeGroups: nextNegativeGroups,
+  };
 }
 
 interface TaggedSlotToken {
@@ -1638,7 +1776,20 @@ function collectTaggedSlotTokens(
 ): TaggedSlotToken[] {
   const out: TaggedSlotToken[] = [];
   for (const part of splitPromptTags(text)) {
-    const clean = stripWeightSyntax(part).replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
+    const unwrapped = unwrapMultiTagGroup(part);
+    if (unwrapped) {
+      out.push(
+        ...collectTaggedSlotTokens(
+          unwrapped.inner,
+          slot,
+          scope,
+          characterId,
+          characterName
+        )
+      );
+      continue;
+    }
+    const clean = normalizeTagForMatch(part);
     if (!clean) continue;
     out.push({
       raw: part.trim(),
@@ -1659,13 +1810,19 @@ export function detectConflicts(
 ): ConflictItem[] {
   const conflicts: ConflictItem[] = [];
   const negativeString = buildSharedNegativePrompt(shared);
-  const negativeRawTerms = negativeString
-    .split(/[,，\n]+/)
-    .map((part) => ({
-      raw: part.trim(),
-      clean: stripWeightSyntax(part),
-    }))
-    .filter((item) => item.clean.length >= 2);
+  const parseNegativeTerms = (rawNeg: string) =>
+    splitPromptTags(rawNeg)
+      .flatMap((part) => {
+        const unwrapped = unwrapMultiTagGroup(part);
+        return unwrapped ? splitPromptTags(unwrapped.inner) : [part];
+      })
+      .map((part) => ({
+        raw: part.trim(),
+        clean: normalizeTagForMatch(part),
+      }))
+      .filter((item) => item.clean.length >= 2);
+  const negativeRawTerms = parseNegativeTerms(negativeString);
+  const sharedNegCleanSet = new Set(negativeRawTerms.map((item) => item.clean));
 
   // 1. 多人场景检测 solo
   if (characters.length > 1) {
@@ -1708,10 +1865,17 @@ export function detectConflicts(
 
   // 2. 正向与负向冲突检测（包含共用负向与单角色实际护栏负向）
   const seenCollisionKeys = new Set<string>();
-  const sharedPositiveEntries = [
+  const sharedPositiveTokens: TaggedSlotToken[] = [
+    ...collectTaggedSlotTokens(shared.styleAnchor.text, 'styleAnchor', 'shared'),
+    ...collectTaggedSlotTokens(shared.background.text, 'background', 'shared'),
+    ...collectTaggedSlotTokens(shared.composition.text, 'composition', 'shared'),
+  ];
+
+  const positiveCollisionEntries = [
     {
       source: '共享层',
-      text: `${shared.styleAnchor.text}, ${shared.background.text}, ${shared.composition.text}, ${shared.bodyType?.text ?? ''}`,
+      characterId: undefined as string | undefined,
+      tokens: sharedPositiveTokens,
       negTerms: negativeRawTerms,
     },
     ...characters.map((c) => {
@@ -1719,25 +1883,37 @@ export function detectConflicts(
         ...options,
         includeAppearance: options.includeAppearance ?? true,
       }).negativePrompt;
-      const charNegTerms = charNegStr
-        .split(/[,，\n]+/)
-        .map((part) => ({
-          raw: part.trim(),
-          clean: stripWeightSyntax(part),
-        }))
-        .filter((item) => item.clean.length >= 2);
+      const charNegTerms = parseNegativeTerms(charNegStr);
       return {
         source: c.name,
-        characterId: c.id,
-        text: `${resolveEffectiveAppearanceSlot(c).text}, ${c.outfit.text}, ${c.pose.text}, ${c.expression.text}`,
+        characterId: c.id as string | undefined,
+        tokens: [
+          ...collectTaggedSlotTokens(
+            resolveEffectiveAppearanceSlot(c).text,
+            'appearance',
+            'character',
+            c.id,
+            c.name
+          ),
+          ...collectTaggedSlotTokens(c.outfit.text, 'outfit', 'character', c.id, c.name),
+          ...collectTaggedSlotTokens(c.pose.text, 'pose', 'character', c.id, c.name),
+          ...collectTaggedSlotTokens(
+            c.expression.text,
+            'expression',
+            'character',
+            c.id,
+            c.name
+          ),
+        ],
         negTerms: charNegTerms.length > 0 ? charNegTerms : negativeRawTerms,
       };
     }),
   ];
 
-  for (const entry of sharedPositiveEntries) {
-    const posTerms = splitCleanTerms(entry.text);
-    for (const posTerm of posTerms) {
+  for (const entry of positiveCollisionEntries) {
+    for (const posTok of entry.tokens) {
+      const posTerm = posTok.clean;
+      if (posTerm.length < 2) continue;
       for (const negItem of entry.negTerms) {
         if (!negItem.clean) continue;
         // 完全相等，或正向词包含更短的负向压制词（避免 "standing" 误报撞车 "standing on bed"）
@@ -1751,14 +1927,25 @@ export function detectConflicts(
           if (seenCollisionKeys.has(dedupeKey)) continue;
           seenCollisionKeys.add(dedupeKey);
 
+          const isInSharedNeg = sharedNegCleanSet.has(negItem.clean);
+          const fixType: ConflictItem['fixType'] = isInSharedNeg
+            ? 'remove-negative-tag'
+            : posTok.scope === 'shared'
+            ? 'remove-shared-tag'
+            : posTok.slot !== 'appearance'
+            ? 'remove-character-tag'
+            : undefined;
+          const targetTag = isInSharedNeg ? negItem.clean : posTok.clean;
+
           conflicts.push({
             id: `conflict-neg-${dedupeKey}`,
             severity: isExact ? 'error' : 'warning',
             title: `正向与负向存在冲突词 "${negItem.clean}"`,
             detail: `「${entry.source}」正向包含 "${posTerm}"，但负向/护栏同时压制了 "${negItem.raw}"。`,
-            characterId: 'characterId' in entry ? entry.characterId : undefined,
-            fixType: 'remove-negative-tag',
-            targetTag: negItem.clean,
+            characterId: entry.characterId,
+            slot: isInSharedNeg ? undefined : posTok.slot,
+            fixType,
+            targetTag,
           });
         }
       }
@@ -1991,15 +2178,21 @@ export function detectConflicts(
       (t) => t.scope === 'shared' || t.slot !== 'appearance'
     );
     const indoorTok = nonAppearanceCombinedTokens.find((t) =>
-      /\b(?:indoors?|classroom|bedroom|living room|kitchen|hallway|tatami)\b/i.test(t.clean)
+      /\b(?:indoors?|classroom|bedroom|living room|kitchen|hallway|tatami|cafe interior)\b/i.test(
+        t.clean
+      )
     );
-    const outdoorTok = nonAppearanceCombinedTokens.find((t) =>
-      /\b(?:outdoors?|park|street|beach|forest|meadow|rooftop|night sky)\b/i.test(t.clean)
+    const outdoorTok = nonAppearanceCombinedTokens.find(
+      (t) =>
+        !/\b(?:street view|outside window|window view|view of)\b/i.test(t.clean) &&
+        /\b(?:outdoors?|park|street|beach|forest|meadow|rooftop|night sky)\b/i.test(t.clean)
     );
     if (indoorTok && outdoorTok) {
       const fixTok = outdoorTok.scope === 'character' ? outdoorTok : indoorTok;
+      const scopeId =
+        indoorTok.scope === 'shared' && outdoorTok.scope === 'shared' ? 'shared' : char.id;
       pushSemanticConflict({
-        id: `conflict-bg-inout-${char.id}-${indoorTok.clean}-${outdoorTok.clean}`,
+        id: `conflict-bg-inout-${scopeId}-${indoorTok.clean}-${outdoorTok.clean}`,
         severity: 'warning',
         title: `背景室内外冲突："${indoorTok.clean}" vs "${outdoorTok.clean}"`,
         detail: `提示词中同时存在室内场景词 "${indoorTok.raw}" 与室外场景词 "${outdoorTok.raw}"，可能造成背景撕裂。`,
@@ -2022,8 +2215,10 @@ export function detectConflicts(
     );
     if (simpleBgTok && richBgTok) {
       const fixTok = simpleBgTok.scope === 'character' ? simpleBgTok : richBgTok;
+      const scopeId =
+        simpleBgTok.scope === 'shared' && richBgTok.scope === 'shared' ? 'shared' : char.id;
       pushSemanticConflict({
-        id: `conflict-bg-detail-${char.id}-${simpleBgTok.clean}-${richBgTok.clean}`,
+        id: `conflict-bg-detail-${scopeId}-${simpleBgTok.clean}-${richBgTok.clean}`,
         severity: 'warning',
         title: `纯色背景与精细背景冲突："${simpleBgTok.clean}"`,
         detail: `提示词中同时出现纯色/简洁背景 "${simpleBgTok.raw}" 与细节场景 "${richBgTok.raw}"。`,

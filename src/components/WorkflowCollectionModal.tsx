@@ -154,6 +154,7 @@ interface WorkflowCollectionModalProps {
   onUpdateCustomLoras?: (items: ComfyLoraItem[]) => void;
   onRefreshAvailableLoras?: () => Promise<void> | void;
   onOpenSettings: () => void;
+  onRemoveGlobalNegativeTag?: (tag: string) => void;
   onApplyCardToCharacter?: (
     payload: CardApplyToCharacterPayload
   ) => { ok: boolean; error?: string };
@@ -389,6 +390,7 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
   onUpdateCustomLoras,
   onRefreshAvailableLoras,
   onOpenSettings,
+  onRemoveGlobalNegativeTag,
   onApplyCardToCharacter,
 }) => {
   const [draft, setDraft] = useState<DraftImportState>(EMPTY_DRAFT);
@@ -1371,17 +1373,27 @@ export const WorkflowCollectionModal: React.FC<WorkflowCollectionModalProps> = (
       }
 
       if (conflict.fixType === 'remove-negative-tag') {
-        if (applyNegative && applyNegativeText.trim()) {
-          setApplyNegativeText((prev) => stripTagFromSlotText(prev, tag));
+        const strippedNeg =
+          applyNegative && applyNegativeText.trim()
+            ? stripTagFromSlotText(applyNegativeText, tag)
+            : applyNegativeText;
+        const removedFromCardNeg =
+          applyNegative &&
+          applyNegativeText.trim().length > 0 &&
+          strippedNeg.trim() !== applyNegativeText.trim();
+        if (removedFromCardNeg) {
+          setApplyNegativeText(strippedNeg);
+        } else if (onRemoveGlobalNegativeTag) {
+          onRemoveGlobalNegativeTag(tag);
         } else {
-          // 若冲突源于全局负向或护栏，提示可在角色拉取槽位中清理对应正向词
+          // 若冲突源于全局负向且未提供全局回调，则从角色拉取槽位中清理对应正向词
           setApplyOutfitText((prev) => stripTagFromSlotText(prev, tag));
           setApplyPoseText((prev) => stripTagFromSlotText(prev, tag));
           setApplyExpressionText((prev) => stripTagFromSlotText(prev, tag));
         }
       }
     },
-    [applyNegative, applyNegativeText]
+    [applyNegative, applyNegativeText, onRemoveGlobalNegativeTag]
   );
 
   const populateApplyPreparedFields = useCallback(
